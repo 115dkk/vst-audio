@@ -45,6 +45,16 @@ pub struct ClassInfo {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct Parameter {
+    pub id: u32,
+    pub name: String,
+    pub unit: String,
+    pub value: f64,
+    pub default: Option<f64>,
+    pub steps: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum Message {
     Hello {
         magic: [u8; 4],
@@ -69,6 +79,22 @@ pub enum Message {
     GetState,
     OpenEditor,
     CloseEditor,
+    ListParameters {
+        start: u32,
+        count: u16,
+    },
+    Parameters {
+        total: u32,
+        entries: Vec<Parameter>,
+    },
+    SetParameter {
+        id: u32,
+        value: f64,
+    },
+    RequestError {
+        code: u32,
+        text: String,
+    },
     Shutdown,
     Scan {
         path: String,
@@ -120,6 +146,10 @@ impl Message {
             Self::GetState => 6,
             Self::OpenEditor => 7,
             Self::CloseEditor => 18,
+            Self::ListParameters { .. } => 19,
+            Self::Parameters { .. } => 20,
+            Self::SetParameter { .. } => 21,
+            Self::RequestError { .. } => 22,
             Self::Shutdown => 8,
             Self::Scan { .. } => 9,
             Self::Loaded { .. } => 10,
@@ -363,7 +393,42 @@ fn encode_message(message: &Message, out: &mut Vec<u8>) -> Result<(), CodecError
             }
         }
         Message::LatencyChanged { frames } => put_u32(out, *frames),
-        Message::Fault { code, text } => {
+        Message::ListParameters { start, count } => {
+            if *count == 0 || *count > 32 {
+                return Err(CodecError::InvalidValue);
+            }
+            put_u32(out, *start);
+            put_u16(out, *count);
+        }
+        Message::SetParameter { id, value } => {
+            if !value.is_finite() || !(0.0..=1.0).contains(value) {
+                return Err(CodecError::InvalidValue);
+            }
+            put_u32(out, *id);
+            put_u64(out, value.to_bits());
+        }
+        Message::Parameters { total, entries } => {
+            if entries.len() > 32 || *total > 16384 {
+                return Err(CodecError::InvalidValue);
+            }
+            put_u32(out, *total);
+            put_u16(out, entries.len() as u16);
+            for entry in entries {
+                put_u32(out, entry.id);
+                put_string(out, &entry.name)?;
+                put_string(out, &entry.unit)?;
+                put_u64(out, entry.value.to_bits());
+                out.push(u8::from(entry.default.is_some()));
+                if let Some(value) = entry.default {
+                    put_u64(out, value.to_bits());
+                }
+                out.push(u8::from(entry.steps.is_some()));
+                if let Some(steps) = entry.steps {
+                    put_u32(out, steps);
+                }
+            }
+        }
+        Message::RequestError { code, text } | Message::Fault { code, text } => {
             put_u32(out, *code);
             put_string(out, text)?;
         }
@@ -461,6 +526,55 @@ fn decode_message(kind: u16, body: &[u8]) -> Result<Option<Message>, CodecError>
         16 => Message::Ack,
         17 => Message::EditorClosed,
         18 => Message::CloseEditor,
+        19 => {
+            let start = cursor.u32()?;
+            let count = cursor.u16()?;
+            if count == 0 || count > 32 {
+                return Err(CodecError::InvalidValue);
+            }
+            Message::ListParameters { start, count }
+        }
+        20 => {
+            let total = cursor.u32()?;
+            let count = cursor.u16()?;
+            if total > 16384 || count > 32 {
+                return Err(CodecError::InvalidValue);
+            }
+            let mut entries = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                let id = cursor.u32()?;
+                let name = cursor.string()?;
+                let unit = cursor.string()?;
+                let value = cursor.normalized()?;
+                let default = match cursor.u8()? {
+                    0 => None,
+                    1 => Some(cursor.normalized()?),
+                    _ => return Err(CodecError::InvalidValue),
+                };
+                let steps = match cursor.u8()? {
+                    0 => None,
+                    1 => Some(cursor.u32()?),
+                    _ => return Err(CodecError::InvalidValue),
+                };
+                entries.push(Parameter {
+                    id,
+                    name,
+                    unit,
+                    value,
+                    default,
+                    steps,
+                });
+            }
+            Message::Parameters { total, entries }
+        }
+        21 => Message::SetParameter {
+            id: cursor.u32()?,
+            value: cursor.normalized()?,
+        },
+        22 => Message::RequestError {
+            code: cursor.u32()?,
+            text: cursor.string()?,
+        },
         _ => return Ok(None),
     };
     if !matches!(kind, 5 | 13) && cursor.remaining() != 0 {
@@ -538,6 +652,14 @@ impl<'a> Cursor<'a> {
     }
     fn u64(&mut self) -> Result<u64, CodecError> {
         Ok(u64::from_le_bytes(self.array()?))
+    }
+    fn normalized(&mut self) -> Result<f64, CodecError> {
+        let value = f64::from_bits(self.u64()?);
+        if value.is_finite() && (0.0..=1.0).contains(&value) {
+            Ok(value)
+        } else {
+            Err(CodecError::InvalidValue)
+        }
     }
     fn string(&mut self) -> Result<String, CodecError> {
         let length = self.u16()? as usize;

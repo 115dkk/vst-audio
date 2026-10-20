@@ -93,8 +93,11 @@ impl Control<'_> {
         unsafe { dispatch(self.0.effect(), opcode, index, value, pointer, option) }
     }
     fn text(&self, opcode: i32) -> String {
+        self.text_at(opcode, 0)
+    }
+    fn text_at(&self, opcode: i32, index: i32) -> String {
         let mut buffer = [0u8; 256];
-        self.call(opcode, 0, 0, buffer.as_mut_ptr().cast(), 0.0);
+        self.call(opcode, index, 0, buffer.as_mut_ptr().cast(), 0.0);
         let length = buffer
             .iter()
             .position(|byte| *byte == 0)
@@ -124,6 +127,7 @@ pub struct Vst2Plugin {
     editor: Option<EditorWindow>,
     closed: bool,
     configured: bool,
+    parameter_count: u32,
     processor_taken: bool,
     _main: std::marker::PhantomData<std::rc::Rc<()>>,
 }
@@ -161,6 +165,7 @@ impl Vst2Plugin {
         }
         // Parameter and bus counts are frozen at load; unsupported IO changes
         // are reported for replacement rather than silently resizing RT buffers.
+        let parameter_count = fields.num_params as u32;
         let inputs = fields.num_inputs as u16;
         let outputs = fields.num_outputs as u16;
         let shared = Arc::new(Shared {
@@ -225,6 +230,7 @@ impl Vst2Plugin {
             editor: None,
             closed: false,
             configured: false,
+            parameter_count,
             processor_taken: false,
             _main: std::marker::PhantomData,
         })
@@ -290,6 +296,54 @@ impl Vst2Plugin {
             outputs: self.info.outputs as usize,
             max_frames: self.shared.callback.frames.load(Ordering::Relaxed) as usize,
         })
+    }
+    pub fn parameters(
+        &mut self,
+        start: u32,
+        count: u16,
+    ) -> Result<(u32, Vec<vst_audio_protocol::Parameter>), PluginError> {
+        if count == 0 || count > 32 || start > self.parameter_count {
+            return Err(PluginError("invalid parameter page".into()));
+        }
+        let control = self.shared.control();
+        let get = control
+            .effect()
+            .get_parameter
+            .ok_or_else(|| PluginError("no parameter getter".into()))?;
+        let mut entries = Vec::new();
+        for id in start
+            ..start
+                .saturating_add(u32::from(count))
+                .min(self.parameter_count)
+        {
+            // SAFETY: cached validated parameter index, serialized plugin call.
+            let value = f64::from(unsafe { get(self.shared.effect(), id) });
+            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                return Err(PluginError("invalid parameter value".into()));
+            }
+            entries.push(vst_audio_protocol::Parameter {
+                id,
+                name: control.text_at(PARAM_NAME, id as i32),
+                unit: control.text_at(6, id as i32),
+                value,
+                default: None,
+                steps: None,
+            });
+        }
+        Ok((self.parameter_count, entries))
+    }
+    pub fn set_parameter(&mut self, id: u32, value: f64) -> Result<(), PluginError> {
+        if id >= self.parameter_count || !value.is_finite() || !(0.0..=1.0).contains(&value) {
+            return Err(PluginError("invalid parameter edit".into()));
+        }
+        let control = self.shared.control();
+        let set = control
+            .effect()
+            .set_parameter
+            .ok_or_else(|| PluginError("no parameter setter".into()))?;
+        // SAFETY: validated index/value, admission excludes audio during the call.
+        unsafe { set(self.shared.effect(), id, value as f32) };
+        Ok(())
     }
     pub fn get_state(&mut self) -> Result<Vec<u8>, PluginError> {
         let control = self.shared.control();

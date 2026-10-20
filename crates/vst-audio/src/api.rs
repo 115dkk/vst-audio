@@ -126,6 +126,8 @@ pub struct RequestId(pub u64);
 pub enum Command {
     OpenEditor,
     CloseEditor,
+    ListParameters { start: u32, count: u16 },
+    SetParameter { id: u32, value: f64 },
     SaveState,
     RestoreState(Vec<u8>),
     Shutdown,
@@ -138,6 +140,11 @@ pub enum HostEvent {
     State {
         request: Option<RequestId>,
         bytes: Vec<u8>,
+    },
+    Parameters {
+        request: RequestId,
+        total: u32,
+        entries: Vec<vst_audio_protocol::Parameter>,
     },
     EditorClosed,
     ParametersChanged,
@@ -324,6 +331,8 @@ fn supervise(
             let result = match command {
                 Command::OpenEditor => control.open_editor(),
                 Command::CloseEditor => control.request_close_editor(),
+                Command::ListParameters { start, count } => control.parameters(start, count),
+                Command::SetParameter { id, value } => control.set_parameter(id, value),
                 Command::SaveState => control.get_state(),
                 Command::RestoreState(bytes) => control.set_state(&bytes),
                 Command::Shutdown => {
@@ -372,6 +381,31 @@ fn supervise(
                         Message::Ack => {
                             if let Some(request) = request {
                                 emit(&events, &shared, HostEvent::Completed { request });
+                            }
+                        }
+                        Message::Parameters { total, entries } => {
+                            if let Some(request) = request {
+                                emit(
+                                    &events,
+                                    &shared,
+                                    HostEvent::Parameters {
+                                        request,
+                                        total,
+                                        entries,
+                                    },
+                                );
+                            }
+                        }
+                        Message::RequestError { text, .. } => {
+                            if let Some(request) = request {
+                                emit(
+                                    &events,
+                                    &shared,
+                                    HostEvent::RequestFailed {
+                                        request,
+                                        reason: text,
+                                    },
+                                );
                             }
                         }
                         Message::EditorClosed => emit(&events, &shared, HostEvent::EditorClosed),

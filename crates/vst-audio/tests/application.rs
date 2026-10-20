@@ -55,7 +55,8 @@ fn crash_a_preserves_parent_and_processing_b_without_allocating() {
         let mut refs: Vec<_> = samples.iter_mut().map(|p| &mut p[..]).collect();
         audio_a.process(&[&left, &right], &mut refs);
         let mut processed = 0;
-        for _ in 0..60 {
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while Instant::now() < deadline {
             let result =
                 assert_no_alloc::assert_no_alloc(|| audio_b.process(&[&left, &right], &mut refs));
             if result == AudioStatus::Processed {
@@ -64,6 +65,9 @@ fn crash_a_preserves_parent_and_processing_b_without_allocating() {
                     assert!((refs[0][100] - 0.25).abs() < 1e-6);
                     assert!((refs[5][100] - 0.0625).abs() < 1e-6);
                 }
+            }
+            if processed > 30 && a.status() == Status::Failed {
+                break;
             }
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -145,4 +149,65 @@ fn gui_contract_is_only_requests_and_events() {
         std::thread::sleep(Duration::from_millis(5));
     }
     assert_eq!(instance.status(), Status::Running);
+}
+
+#[test]
+#[ignore = "native fixtures required"]
+fn parameter_pages_and_invalid_edits_do_not_kill_instances() {
+    for format in [PluginFormat::Vst2, PluginFormat::Vst3] {
+        let instance = host()
+            .spawn(&descriptor(format), &Configuration::default(), None)
+            .unwrap();
+        let control = instance.controller();
+        let wait = |request| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(event) = instance.try_next_event() {
+                    let id = match &event {
+                        HostEvent::Parameters { request, .. }
+                        | HostEvent::Completed { request }
+                        | HostEvent::RequestFailed { request, .. } => Some(*request),
+                        _ => None,
+                    };
+                    if id == Some(request) {
+                        break event;
+                    }
+                }
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        let page = control
+            .request(Command::ListParameters {
+                start: 0,
+                count: 16,
+            })
+            .unwrap();
+        let HostEvent::Parameters { total, entries, .. } = wait(page) else {
+            panic!("missing parameter page");
+        };
+        assert_eq!(total, 1);
+        assert_eq!(entries[0].name, "Width");
+        assert_eq!(entries[0].value, 1.0);
+        let id = entries[0].id;
+        let edit = control
+            .request(Command::SetParameter { id, value: 0.25 })
+            .unwrap();
+        assert!(matches!(wait(edit), HostEvent::Completed { .. }));
+        let invalid = control
+            .request(Command::SetParameter {
+                id: u32::MAX,
+                value: 0.5,
+            })
+            .unwrap();
+        assert!(matches!(wait(invalid), HostEvent::RequestFailed { .. }));
+        assert_eq!(instance.status(), Status::Running);
+        let page = control
+            .request(Command::ListParameters { start: 0, count: 1 })
+            .unwrap();
+        let HostEvent::Parameters { entries, .. } = wait(page) else {
+            panic!("missing updated page");
+        };
+        assert!((entries[0].value - 0.25).abs() < 1e-6);
+    }
 }

@@ -39,6 +39,16 @@ pub trait Plugin {
     fn deactivate(&mut self);
     /// Transfer the unique audio handle after configuration.
     fn take_processor(&mut self) -> Result<Box<dyn Processor>, PluginError>;
+    fn parameters(
+        &mut self,
+        _start: u32,
+        _count: u16,
+    ) -> Result<(u32, Vec<vst_audio_protocol::Parameter>), PluginError> {
+        Err(PluginError("parameters unsupported".into()))
+    }
+    fn set_parameter(&mut self, _id: u32, _value: f64) -> Result<(), PluginError> {
+        Err(PluginError("parameters unsupported".into()))
+    }
     fn get_state(&mut self) -> Result<Vec<u8>, PluginError>;
     fn set_state(&mut self, blob: &[u8]) -> Result<(), PluginError>;
     fn open_editor(&mut self) -> Result<(), PluginError>;

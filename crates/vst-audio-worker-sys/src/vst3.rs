@@ -583,6 +583,80 @@ impl Vst3Plugin {
             processing: false,
         })
     }
+    pub fn parameters(
+        &mut self,
+        start: u32,
+        count: u16,
+    ) -> Result<(u32, Vec<vst_audio_protocol::Parameter>), PluginError> {
+        let Some(controller) = &self.controller else {
+            return Ok((0, Vec::new()));
+        };
+        // SAFETY: live initialized controller on its creating main thread.
+        let total = unsafe { controller.getParameterCount() };
+        if !(0..=16384).contains(&total) || start > total as u32 || count == 0 || count > 32 {
+            return Err(PluginError("invalid parameter page".into()));
+        }
+        let mut entries = Vec::new();
+        for index in start..start.saturating_add(u32::from(count)).min(total as u32) {
+            // SAFETY: ParameterInfo is a plain fixed-array/integer/float SDK record.
+            let mut info: ParameterInfo = unsafe { std::mem::zeroed() };
+            check(
+                // SAFETY: queried parameter index and writable SDK output.
+                unsafe { controller.getParameterInfo(index as i32, &mut info) },
+                "getParameterInfo",
+            )?;
+            // SAFETY: ID returned by this controller's parameter enumeration.
+            let value = unsafe { controller.getParamNormalized(info.id) };
+            if !value.is_finite()
+                || !(0.0..=1.0).contains(&value)
+                || !info.defaultNormalizedValue.is_finite()
+                || !(0.0..=1.0).contains(&info.defaultNormalizedValue)
+                || info.stepCount < 0
+            {
+                return Err(PluginError("invalid parameter metadata".into()));
+            }
+            let wide = |s: &[u16]| {
+                String::from_utf16_lossy(&s[..s.iter().position(|c| *c == 0).unwrap_or(s.len())])
+            };
+            entries.push(vst_audio_protocol::Parameter {
+                id: info.id,
+                name: wide(&info.title),
+                unit: wide(&info.units),
+                value,
+                default: Some(info.defaultNormalizedValue),
+                steps: Some(info.stepCount as u32),
+            });
+        }
+        Ok((total as u32, entries))
+    }
+    pub fn set_parameter(&mut self, id: u32, value: f64) -> Result<(), PluginError> {
+        if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+            return Err(PluginError("invalid parameter value".into()));
+        }
+        let (total, first) = self.parameters(0, 32)?;
+        let mut found = first.iter().any(|p| p.id == id);
+        let mut start = 32;
+        while !found && start < total {
+            found = self.parameters(start, 32)?.1.iter().any(|p| p.id == id);
+            start += 32;
+        }
+        if !found {
+            return Err(PluginError("unknown parameter".into()));
+        }
+        let controller = self
+            .controller
+            .as_ref()
+            .ok_or_else(|| PluginError("no controller".into()))?;
+        check(
+            // SAFETY: main-thread live controller, validated ID and normalized value.
+            unsafe { controller.setParamNormalized(id, value) },
+            "setParamNormalized",
+        )?;
+        if !self.shared.edits.push(id, value) {
+            return Err(PluginError("parameter queue full".into()));
+        }
+        Ok(())
+    }
     pub fn get_state(&mut self) -> Result<(Vec<u8>, Vec<u8>), PluginError> {
         // IComponent documents getState in Processing state: do NOT close admission.
         let component = Stream::new(Vec::new());

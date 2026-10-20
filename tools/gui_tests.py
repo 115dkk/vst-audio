@@ -3,21 +3,15 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from fixtures import prepare
 
 ROOT = Path(__file__).resolve().parents[1]
-subprocess.run(["cargo", "build", "--locked", "-p", "vst-audio-worker",
-                "-p", "vst-audio-testplugin"], cwd=ROOT, check=True)
+worker, vst2, vst3 = prepare()
 subprocess.run(["cargo", "build", "--locked", "--manifest-path",
                 "examples/gui/Cargo.toml", "--workspace"], cwd=ROOT, check=True)
-target = Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "target")) / "debug"
 gui_target = Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "examples/gui/target")) / "debug"
 extension = ".exe" if sys.platform == "win32" else ""
-library = {"win32": "vst_audio_testplugin.dll", "darwin": "libvst_audio_testplugin.dylib"}.get(sys.platform, "libvst_audio_testplugin.so")
-worker = target / ("vst-audio-worker" + extension)
-fixtures = [target / library, target / "vst_audio_testplugin.vst3"]
-# The VST3 filename selects its format; do not require proprietary fixtures.
-import shutil
-shutil.copyfile(fixtures[0], fixtures[1])
+fixtures = [vst2, vst3]
 output = ROOT / "test-results"
 output.mkdir(exist_ok=True)
 for gui in ["egui", "iced"]:

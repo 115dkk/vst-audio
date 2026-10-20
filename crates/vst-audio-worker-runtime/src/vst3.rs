@@ -66,6 +66,16 @@ impl Plugin for Vst3 {
     fn take_processor(&mut self) -> Result<Box<dyn Processor>, PluginError> {
         Vst3::take_processor(self)
     }
+    fn parameters(
+        &mut self,
+        start: u32,
+        count: u16,
+    ) -> Result<(u32, Vec<vst_audio_protocol::Parameter>), PluginError> {
+        self.inner.parameters(start, count).map_err(error)
+    }
+    fn set_parameter(&mut self, id: u32, value: f64) -> Result<(), PluginError> {
+        self.inner.set_parameter(id, value).map_err(error)
+    }
     fn get_state(&mut self) -> Result<Vec<u8>, PluginError> {
         let (component, controller) = self.inner.get_state().map_err(error)?;
         state::encode(&component, &controller)

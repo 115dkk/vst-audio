@@ -110,6 +110,16 @@ impl Plugin for Vst2 {
             .map(|processor| Box::new(processor) as Box<dyn Processor>)
             .ok_or_else(|| PluginError("processor already taken".into()))
     }
+    fn parameters(
+        &mut self,
+        start: u32,
+        count: u16,
+    ) -> Result<(u32, Vec<vst_audio_protocol::Parameter>), PluginError> {
+        self.inner.parameters(start, count).map_err(plugin_error)
+    }
+    fn set_parameter(&mut self, id: u32, value: f64) -> Result<(), PluginError> {
+        self.inner.set_parameter(id, value).map_err(plugin_error)
+    }
     fn get_state(&mut self) -> Result<Vec<u8>, PluginError> {
         self.inner.get_state().map_err(plugin_error)
     }
@@ -154,7 +164,7 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
         },
     )
     .map_err(error)?;
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(8);
     thread::spawn(move || {
         let mut input = input;
         loop {
@@ -201,6 +211,13 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
                 Ok(Ok(Some(DecodedFrame::Known(frame)))) => {
                     let request = frame.request;
                     let shutdown = matches!(frame.message, Message::Shutdown);
+                    let recoverable = matches!(
+                        &frame.message,
+                        Message::ListParameters { .. }
+                            | Message::SetParameter { .. }
+                            | Message::OpenEditor
+                            | Message::CloseEditor
+                    );
                     let reply: Result<Message, StartError> = (|| match frame.message {
                         Message::Scan { path } => {
                             if Path::new(&path)
@@ -375,14 +392,39 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
                                 .map_err(error)?;
                             Ok(Message::Ack)
                         }
+                        Message::ListParameters { start, count } => {
+                            let (total, entries) = plugin
+                                .as_mut()
+                                .ok_or_else(|| StartError("Load required".into()))?
+                                .parameters(start, count)
+                                .map_err(error)?;
+                            Ok(Message::Parameters { total, entries })
+                        }
+                        Message::SetParameter { id, value } => {
+                            plugin
+                                .as_mut()
+                                .ok_or_else(|| StartError("Load required".into()))?
+                                .set_parameter(id, value)
+                                .map_err(error)?;
+                            Ok(Message::Ack)
+                        }
                         Message::Shutdown => Ok(Message::Ack),
                         _ => Err(StartError("invalid host request".into())),
                     })();
                     let scan = matches!(&reply, Ok(Message::Classes { .. }));
-                    let fault = reply.is_err();
-                    let message = reply.unwrap_or_else(|error| Message::Fault {
-                        code: 1,
-                        text: error.to_string(),
+                    let fault = reply.is_err() && !recoverable;
+                    let message = reply.unwrap_or_else(|error| {
+                        if recoverable {
+                            Message::RequestError {
+                                code: 1,
+                                text: error.to_string(),
+                            }
+                        } else {
+                            Message::Fault {
+                                code: 1,
+                                text: error.to_string(),
+                            }
+                        }
                     });
                     write_frame(
                         &mut output,

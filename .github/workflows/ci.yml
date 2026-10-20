@@ -74,7 +74,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y xvfb xauth libxkbcommon-dev libwayland-dev libegl1-mesa-dev libgl1-mesa-dev mesa-vulkan-drivers
+          sudo apt-get install -y xvfb xauth libxkbcommon-dev libxkbcommon-x11-0 libwayland-dev libegl1-mesa-dev libgl1-mesa-dev mesa-vulkan-drivers
       - run: cargo fmt --manifest-path examples/gui/Cargo.toml --all -- --check
       - run: cargo clippy --locked --manifest-path examples/gui/Cargo.toml --workspace --all-targets -- -D warnings
       - name: GUI and editor lifecycle (Windows, macOS)

@@ -6,3 +6,4 @@
 *.dll
 *.dylib
 *.so
+__pycache__/

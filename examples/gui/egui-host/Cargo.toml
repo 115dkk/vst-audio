@@ -5,4 +5,7 @@ edition = "2024"
 publish = false
 [dependencies]
 vst-audio-gui-example.workspace = true
+[target.'cfg(windows)'.dependencies]
+eframe = { version = "=0.34.1", default-features = false, features = ["default_fonts", "wgpu"] }
+[target.'cfg(not(windows))'.dependencies]
 eframe = { version = "=0.34.1", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }

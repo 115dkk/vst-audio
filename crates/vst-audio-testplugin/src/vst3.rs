@@ -579,19 +579,49 @@ impl IPluginFactory2Trait for Factory {
         kResultOk
     }
 }
-// SAFETY: unique Windows SDK module initialization export; no external state required.
+static MODULE_READY: AtomicBool = AtomicBool::new(false);
+// SAFETY: unique Windows SDK module initialization export.
 #[unsafe(no_mangle)]
 pub extern "system" fn InitDll() -> bool {
+    MODULE_READY.store(true, Ordering::SeqCst);
     true
 }
 // SAFETY: unique Windows SDK module shutdown export; objects already released.
 #[unsafe(no_mangle)]
 pub extern "system" fn ExitDll() -> bool {
+    MODULE_READY.store(false, Ordering::SeqCst);
+    true
+}
+// SAFETY: unique Linux SDK module entry, context is only checked, not dereferenced.
+#[unsafe(no_mangle)]
+pub extern "system" fn ModuleEntry(context: *mut c_void) -> bool {
+    MODULE_READY.store(!context.is_null(), Ordering::SeqCst);
+    !context.is_null()
+}
+// SAFETY: unique Linux SDK module exit.
+#[unsafe(no_mangle)]
+pub extern "system" fn ModuleExit() -> bool {
+    MODULE_READY.store(false, Ordering::SeqCst);
+    true
+}
+// SAFETY: unique macOS SDK module entry; requires the real CFBundle context.
+#[unsafe(no_mangle)]
+pub extern "system" fn bundleEntry(context: *mut c_void) -> bool {
+    MODULE_READY.store(!context.is_null(), Ordering::SeqCst);
+    !context.is_null()
+}
+// SAFETY: unique macOS SDK module exit.
+#[unsafe(no_mangle)]
+pub extern "system" fn bundleExit() -> bool {
+    MODULE_READY.store(false, Ordering::SeqCst);
     true
 }
 // SAFETY: unique SDK factory export returning one owned COM reference.
 #[unsafe(no_mangle)]
 pub extern "system" fn GetPluginFactory() -> *mut IPluginFactory {
+    if !MODULE_READY.load(Ordering::SeqCst) {
+        return std::ptr::null_mut();
+    }
     ComWrapper::new(Factory)
         .to_com_ptr::<IPluginFactory>()
         .expect("factory interface")

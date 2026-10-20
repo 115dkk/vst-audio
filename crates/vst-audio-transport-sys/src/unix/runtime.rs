@@ -12,7 +12,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub fn suppress_error_dialogs() {}
+pub fn suppress_error_dialogs() {
+    let limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: process-local limit, readable initialized structure. Expected plugin
+    // failures must not dump unbounded memory/state or delay worker termination.
+    unsafe { libc::setrlimit(libc::RLIMIT_CORE, &limit) };
+}
 
 pub fn duplicate_value(value: usize, _: bool) -> io::Result<OwnedFd> {
     let fd = i32::try_from(value)

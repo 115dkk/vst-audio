@@ -12,3 +12,5 @@ pub use api::{
     AudioEndpoint, AudioStatus, Command, Configuration, Controller, Fallback, Host, HostEvent,
     Instance, LoadTask, PluginDescriptor, RequestId, Status,
 };
+
+pub use vst_audio_protocol::Parameter;

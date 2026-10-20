@@ -29,7 +29,7 @@ impl Edits {
             flags: AtomicU32::new(0),
         }
     }
-    fn push(&self, id: u32, value: f64) -> bool {
+    pub(crate) fn push(&self, id: u32, value: f64) -> bool {
         let write = self.write.load(Ordering::Relaxed);
         if write.wrapping_sub(self.read.load(Ordering::Acquire)) == CAPACITY {
             return false;

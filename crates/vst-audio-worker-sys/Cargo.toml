@@ -19,6 +19,7 @@ missing_safety_doc = "deny"
 dbg_macro = "deny"
 
 [dependencies]
+vst-audio-protocol.workspace = true
 vst3.workspace = true
 vst-audio-ring.workspace = true
 thiserror.workspace = true

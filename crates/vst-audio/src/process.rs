@@ -84,7 +84,9 @@ impl Transport {
                 return Err(StartError("host closed control pipe".into()));
             };
             if let DecodedFrame::Known(frame) = frame {
-                if let Message::Fault { code, text } = &frame.message {
+                if let Message::Fault { code, text } | Message::RequestError { code, text } =
+                    &frame.message
+                {
                     return Err(StartError(format!("host fault {code}: {text}")));
                 }
                 if frame.request == request {
@@ -154,6 +156,21 @@ impl PluginControl {
         self.transport.send(id, message)?;
         self.watch.request(self.now(), id, kind);
         Ok(id)
+    }
+    pub fn parameters(&mut self, start: u32, count: u16) -> Result<u32, StartError> {
+        if count == 0 || count > 32 {
+            return Err(StartError("parameter page size must be 1..=32".into()));
+        }
+        self.request(
+            Message::ListParameters { start, count },
+            RequestKind::StateSave,
+        )
+    }
+    pub fn set_parameter(&mut self, id: u32, value: f64) -> Result<u32, StartError> {
+        if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+            return Err(StartError("invalid normalized parameter".into()));
+        }
+        self.request(Message::SetParameter { id, value }, RequestKind::StateSave)
     }
     pub fn get_state(&mut self) -> Result<u32, StartError> {
         self.request(Message::GetState, RequestKind::StateSave)
