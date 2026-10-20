@@ -54,9 +54,25 @@ impl Edits {
         Some(edit)
     }
 }
-pub(crate) struct Host;
+pub(crate) struct Host {
+    #[cfg(target_os = "linux")]
+    pub run_loop: Rc<crate::linux_runloop::RunLoop>,
+}
+impl Host {
+    pub fn new() -> Self {
+        Self {
+            #[cfg(target_os = "linux")]
+            run_loop: Rc::new(crate::linux_runloop::RunLoop::default()),
+        }
+    }
+}
+#[cfg(target_os = "linux")]
+crate::linux_runloop::implement!(Host, run_loop);
 impl Class for Host {
+    #[cfg(not(target_os = "linux"))]
     type Interfaces = (IHostApplication,);
+    #[cfg(target_os = "linux")]
+    type Interfaces = (IHostApplication, Linux::IRunLoop);
 }
 impl IHostApplicationTrait for Host {
     unsafe fn getName(&self, name: *mut String128) -> tresult {
@@ -66,10 +82,7 @@ impl IHostApplicationTrait for Host {
         // SAFETY: SDK supplies one writable String128 for this synchronous call.
         let name = unsafe { &mut *name };
         name.fill(0);
-        for (dst, src) in name
-            .iter_mut()
-            .zip("Spatial SoftReceiver plug-in host".encode_utf16())
-        {
+        for (dst, src) in name.iter_mut().zip("vst-audio".encode_utf16()) {
             *dst = src;
         }
         kResultOk
@@ -296,9 +309,18 @@ impl IParameterChangesTrait for Changes {
     }
 }
 
-pub(crate) struct Frame(pub Rc<EditorWindow>);
+pub(crate) struct Frame {
+    pub window: Rc<EditorWindow>,
+    #[cfg(target_os = "linux")]
+    pub run_loop: Rc<crate::linux_runloop::RunLoop>,
+}
+#[cfg(target_os = "linux")]
+crate::linux_runloop::implement!(Frame, run_loop);
 impl Class for Frame {
+    #[cfg(not(target_os = "linux"))]
     type Interfaces = (IPlugFrame,);
+    #[cfg(target_os = "linux")]
+    type Interfaces = (IPlugFrame, Linux::IRunLoop);
 }
 impl IPlugFrameTrait for Frame {
     unsafe fn resizeView(&self, view: *mut IPlugView, rect: *mut ViewRect) -> tresult {
@@ -320,7 +342,7 @@ impl IPlugFrameTrait for Frame {
         let Some(view) = (unsafe { ComRef::from_raw(view) }) else {
             return kInvalidArgument;
         };
-        if self.0.resize(width, height).is_err() {
+        if self.window.resize(width, height).is_err() {
             return kResultFalse;
         }
         // SAFETY: main-thread callback, rectangle remains valid; window has been resized first.

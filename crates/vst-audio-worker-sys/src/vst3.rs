@@ -81,6 +81,8 @@ unsafe impl Sync for ModuleLibrary {}
 pub struct Vst3Module {
     factory: ComPtr<IPluginFactory>,
     host: ComPtr<FUnknown>,
+    #[cfg(target_os = "linux")]
+    run_loop: Rc<crate::linux_runloop::RunLoop>,
     library: Arc<ModuleLibrary>,
 }
 impl std::fmt::Debug for Vst3Module {
@@ -176,7 +178,10 @@ impl Vst3Module {
         // SAFETY: adopt the reference returned by GetPluginFactory, checking null.
         let factory = unsafe { ComPtr::from_raw(pointer) }
             .ok_or_else(|| PluginError("null VST 3 factory".into()))?;
-        let host = ComWrapper::new(Host)
+        let host_object = Host::new();
+        #[cfg(target_os = "linux")]
+        let run_loop = host_object.run_loop.clone();
+        let host = ComWrapper::new(host_object)
             .to_com_ptr::<FUnknown>()
             .expect("host interface");
         if let Some(factory3) = factory.cast::<IPluginFactory3>() {
@@ -186,6 +191,8 @@ impl Vst3Module {
         Ok(Self {
             factory,
             host,
+            #[cfg(target_os = "linux")]
+            run_loop,
             library,
         })
     }
@@ -752,9 +759,13 @@ impl Vst3Plugin {
             EditorWindow::open(&self.info.class.name, width, height)
                 .map_err(|e| PluginError(e.to_string()))?,
         );
-        let frame = ComWrapper::new(Frame(window.clone()))
-            .to_com_ptr::<IPlugFrame>()
-            .expect("frame interface");
+        let frame = ComWrapper::new(Frame {
+            window: window.clone(),
+            #[cfg(target_os = "linux")]
+            run_loop: self.module.run_loop.clone(),
+        })
+        .to_com_ptr::<IPlugFrame>()
+        .expect("frame interface");
         // SAFETY: retained frame and main-thread view; frame owns the window lifetime.
         check(unsafe { view.setFrame(frame.as_ptr()) }, "setFrame")?;
         // SAFETY: live host-owned HWND, platform type matches support query.
@@ -786,6 +797,8 @@ impl Vst3Plugin {
         Ok(())
     }
     pub fn idle(&mut self) {
+        #[cfg(target_os = "linux")]
+        self.module.run_loop.poll();
         if self
             .editor
             .as_ref()
@@ -953,5 +966,12 @@ impl Vst3Processor {
             self.processing = false;
         }
         self.shared.busy.store(false, Ordering::SeqCst);
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Vst3Module {
+    fn drop(&mut self) {
+        self.run_loop.clear();
     }
 }

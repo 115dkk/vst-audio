@@ -85,7 +85,17 @@ impl Class for Matrix {
     type Interfaces = (IComponent, IAudioProcessor, IEditController);
 }
 impl IPluginBaseTrait for Matrix {
-    unsafe fn initialize(&self, _: *mut FUnknown) -> tresult {
+    unsafe fn initialize(&self, _context: *mut FUnknown) -> tresult {
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: host initialize supplies its live context for this call.
+            let Some(context) = (unsafe { ComRef::from_raw(_context) }) else {
+                return kInvalidArgument;
+            };
+            if context.cast::<Linux::IRunLoop>().is_none() {
+                return kNoInterface;
+            }
+        }
         kResultOk
     }
     unsafe fn terminate(&self) -> tresult {
@@ -490,7 +500,15 @@ impl IPlugViewTrait for View {
     unsafe fn onFocus(&self, _: TBool) -> tresult {
         kResultOk
     }
-    unsafe fn setFrame(&self, _: *mut IPlugFrame) -> tresult {
+    unsafe fn setFrame(&self, _frame: *mut IPlugFrame) -> tresult {
+        #[cfg(target_os = "linux")]
+        if !_frame.is_null() {
+            // SAFETY: setFrame provides a live frame, or null during detach.
+            let frame = unsafe { ComRef::from_raw(_frame) }.expect("checked frame");
+            if frame.cast::<Linux::IRunLoop>().is_none() {
+                return kNoInterface;
+            }
+        }
         kResultOk
     }
     unsafe fn canResize(&self) -> tresult {
