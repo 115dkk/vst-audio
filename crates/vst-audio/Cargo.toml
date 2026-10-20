@@ -16,3 +16,6 @@ vst-audio-protocol.workspace = true
 thiserror.workspace = true
 
 vst-audio-transport-sys.workspace = true
+
+[dev-dependencies]
+assert_no_alloc.workspace = true

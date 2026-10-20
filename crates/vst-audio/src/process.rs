@@ -6,7 +6,7 @@ use std::{
     path::Path,
     sync::{
         Arc,
-        mpsc::{self, Receiver, Sender},
+        mpsc::{self, Receiver, SyncSender},
     },
     thread,
     time::{Duration, Instant},
@@ -29,7 +29,7 @@ fn error(error: impl std::fmt::Display) -> StartError {
 
 struct Transport {
     pending: std::cell::RefCell<std::collections::VecDeque<Frame>>,
-    send: Sender<Frame>,
+    send: SyncSender<Frame>,
     receive: Receiver<Result<Option<DecodedFrame>, CodecError>>,
 }
 impl std::fmt::Debug for Transport {
@@ -39,8 +39,8 @@ impl std::fmt::Debug for Transport {
 }
 impl Transport {
     fn new(mut input: impl Read + Send + 'static, mut output: impl Write + Send + 'static) -> Self {
-        let (tx, rx) = mpsc::channel();
-        let (frames, received) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(8);
+        let (frames, received) = mpsc::sync_channel(2);
         thread::spawn(move || {
             loop {
                 let result = read_frame(&mut input);
@@ -65,7 +65,7 @@ impl Transport {
     }
     fn send(&self, request: u32, message: Message) -> Result<(), StartError> {
         self.send
-            .send(Frame {
+            .try_send(Frame {
                 flags: 0,
                 request,
                 message,
@@ -89,6 +89,9 @@ impl Transport {
                 }
                 if frame.request == request {
                     return Ok(frame);
+                }
+                if self.pending.borrow().len() >= 64 {
+                    return Err(StartError("too many unsolicited startup messages".into()));
                 }
                 self.pending.borrow_mut().push_back(frame);
             }
@@ -148,14 +151,17 @@ impl PluginControl {
             .next_request
             .checked_add(1)
             .ok_or_else(|| StartError("request number exhausted".into()))?;
-        self.watch.request(self.now(), id, kind);
         self.transport.send(id, message)?;
+        self.watch.request(self.now(), id, kind);
         Ok(id)
     }
     pub fn get_state(&mut self) -> Result<u32, StartError> {
         self.request(Message::GetState, RequestKind::StateSave)
     }
     pub fn set_state(&mut self, blob: &[u8]) -> Result<u32, StartError> {
+        if blob.len() > vst_audio_protocol::MAX_STATE_BYTES - 8 {
+            return Err(StartError("state too large".into()));
+        }
         self.request(
             Message::SetState {
                 blob: blob.to_vec(),
@@ -172,8 +178,10 @@ impl PluginControl {
     pub fn elapsed_ms(&self) -> u64 {
         self.now()
     }
-    #[doc(hidden)]
-    pub fn close_editor_for_test(&mut self) -> Result<(), StartError> {
+    pub fn request_close_editor(&mut self) -> Result<u32, StartError> {
+        self.request(Message::CloseEditor, RequestKind::Editor)
+    }
+    pub fn close_editor(&mut self) -> Result<(), StartError> {
         self.request(Message::CloseEditor, RequestKind::Editor)
             .map(|_| ())
     }
@@ -185,7 +193,7 @@ impl PluginControl {
     }
     pub fn poll(&mut self, now_ms: u64) -> Vec<ControlEvent> {
         let mut events = Vec::new();
-        loop {
+        for _ in 0..64 {
             let pending = self.transport.pending.borrow_mut().pop_front();
             let frame = if let Some(frame) = pending {
                 Ok(Some(DecodedFrame::Known(frame)))
@@ -282,7 +290,7 @@ impl PluginControl {
         self.watch = watch;
     }
     pub fn shutdown(&mut self) -> Result<(), StartError> {
-        self.get_state()?;
+        let _ = self.get_state();
         self.watch.shutdown(self.now());
         self.transport.send(self.next_request, Message::Shutdown)?;
         self.work.signal();
@@ -302,12 +310,24 @@ impl PluginProcess {
         rate: u32,
         state: Option<&[u8]>,
     ) -> Result<Started, StartError> {
+        Self::start_with_frames(exe, plugin, format, class, rate, rate / 100, state)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_with_frames(
+        exe: &Path,
+        plugin: &Path,
+        format: PluginFormat,
+        class: Option<[u8; 16]>,
+        rate: u32,
+        frames: u32,
+        state: Option<&[u8]>,
+    ) -> Result<Started, StartError> {
         let origin = Instant::now();
         let maximum = Geometry {
             lanes: 1,
             input_channels: 32,
             output_channels: 32,
-            max_frames: rate / 100,
+            max_frames: frames,
             sample_rate: rate,
             latency_bound_frames: rate
                 .checked_mul(2)
@@ -323,7 +343,10 @@ impl PluginProcess {
         transport.send(
             1,
             Message::Load {
-                path: plugin.to_string_lossy().into_owned(),
+                path: plugin
+                    .to_str()
+                    .ok_or_else(|| StartError("plugin path must be UTF-8".into()))?
+                    .into(),
                 format,
                 class_id: class,
             },
@@ -455,7 +478,10 @@ impl PluginProcess {
         transport.send(
             1,
             Message::Scan {
-                path: path.to_string_lossy().into_owned(),
+                path: path
+                    .to_str()
+                    .ok_or_else(|| StartError("plugin path must be UTF-8".into()))?
+                    .into(),
             },
         )?;
         let reply = transport.response(1, Duration::from_secs(60))?;

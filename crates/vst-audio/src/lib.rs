@@ -6,3 +6,9 @@ pub use vst_audio_protocol::{Bus, ClassInfo, PluginFormat, layout, state};
 mod process;
 pub use process::{ControlEvent, PluginControl, PluginProcess, StartError, Started};
 pub use vst_audio_transport_sys::{Event, SharedEvent, SharedRegion};
+
+mod api;
+pub use api::{
+    AudioEndpoint, AudioStatus, Command, Configuration, Controller, Fallback, Host, HostEvent,
+    Instance, LoadTask, PluginDescriptor, RequestId, Status,
+};

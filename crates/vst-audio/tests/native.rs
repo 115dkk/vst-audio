@@ -163,7 +163,7 @@ macro_rules! format_tests {
                         assert!((slot.read(4, 100) - 0.25 * left).abs() < 1e-6);
                     }));
                 }
-                started.control.close_editor_for_test().unwrap();
+                started.control.close_editor().unwrap();
                 let deadline = Instant::now() + Duration::from_secs(5);
                 loop {
                     assert!(Instant::now() < deadline, "EditorClosed not received");

@@ -29,3 +29,5 @@ run("cargo", "test", "--locked", "-p", "vst-audio", "--test", "native",
     "--", "--ignored", "--test-threads=1", "--skip", "third_party_vst3", env=env)
 run("cargo", "test", "--locked", "-p", "vst-audio-worker-sys", "--test", "lifecycle",
     "--", "--ignored", "--test-threads=1", env=env)
+run("cargo", "test", "--locked", "-p", "vst-audio", "--test", "application",
+    "--", "--ignored", "--test-threads=1", env=env)
