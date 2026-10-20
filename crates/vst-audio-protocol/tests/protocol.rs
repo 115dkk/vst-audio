@@ -53,6 +53,7 @@ fn codec_round_trips_every_message() {
         },
         Message::GetState,
         Message::OpenEditor,
+        Message::CloseEditor,
         Message::Shutdown,
         Message::Scan {
             path: "plugin.dll".into(),

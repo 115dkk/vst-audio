@@ -7,6 +7,12 @@ use std::fmt;
 use std::io::{self, Read, Write};
 use std::time::Duration;
 
+pub mod layout;
+pub mod state;
+#[derive(Clone, Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct PluginError(pub String);
+
 pub const MAGIC: [u8; 4] = *b"SSRP";
 pub const PROTOCOL_MAJOR: u16 = 1;
 pub const PROTOCOL_MINOR: u16 = 0;
@@ -62,6 +68,7 @@ pub enum Message {
     },
     GetState,
     OpenEditor,
+    CloseEditor,
     Shutdown,
     Scan {
         path: String,
@@ -112,6 +119,7 @@ impl Message {
             Self::SetState { .. } => 5,
             Self::GetState => 6,
             Self::OpenEditor => 7,
+            Self::CloseEditor => 18,
             Self::Shutdown => 8,
             Self::Scan { .. } => 9,
             Self::Loaded { .. } => 10,
@@ -321,6 +329,7 @@ fn encode_message(message: &Message, out: &mut Vec<u8>) -> Result<(), CodecError
         }
         Message::Activate
         | Message::GetState
+        | Message::CloseEditor
         | Message::OpenEditor
         | Message::Shutdown
         | Message::ParamsChanged
@@ -451,6 +460,7 @@ fn decode_message(kind: u16, body: &[u8]) -> Result<Option<Message>, CodecError>
         },
         16 => Message::Ack,
         17 => Message::EditorClosed,
+        18 => Message::CloseEditor,
         _ => return Ok(None),
     };
     if !matches!(kind, 5 | 13) && cursor.remaining() != 0 {

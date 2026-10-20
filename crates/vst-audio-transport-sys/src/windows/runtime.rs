@@ -151,6 +151,7 @@ pub fn spawn_handles(
     exe: &Path,
     args: &[OsString],
     values: &[usize],
+    _parent: OwnedHandle,
 ) -> windows::core::Result<ChildProcess> {
     let handles: Vec<HANDLE> = values
         .iter()
@@ -292,4 +293,8 @@ impl Drop for Mmcss {
         // SAFETY: registration was created on this thread and the guard is not Send.
         let _ = unsafe { AvRevertMmThreadCharacteristics(self.handle) };
     }
+}
+
+pub fn parent_value(parent: &OwnedHandle) -> usize {
+    parent.as_raw_handle() as usize
 }

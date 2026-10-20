@@ -1,0 +1,17 @@
+[package]
+name = "vst-audio-worker-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+[lints]
+workspace = true
+[dependencies]
+vst-audio-ring.workspace = true
+vst-audio-protocol.workspace = true
+clap.workspace = true
+thiserror.workspace = true
+vst-audio-worker-sys.workspace = true
+vst-audio-transport-sys.workspace = true

@@ -1,3 +1,5 @@
+// The generated C++ enum constants are i32 on Windows and u32 on Unix.
+#![allow(clippy::unnecessary_cast)]
 #![allow(unsafe_code)]
 //! VST 3 isolation. Lifecycle/controller/editor/state run on the creating main
 //! thread. Only process/setProcessing run on the sole audio thread. getState is
@@ -90,23 +92,44 @@ fn binary(path: &Path) -> Result<PathBuf, PluginError> {
     if !path.is_dir() {
         return Ok(path.to_owned());
     }
-    let name = path
-        .file_name()
-        .ok_or_else(|| PluginError("invalid VST 3 bundle".into()))?;
-    #[cfg(target_arch = "aarch64")]
-    let architectures = ["arm64-win", "arm64ec-win"];
-    #[cfg(not(target_arch = "aarch64"))]
-    let architectures = ["x86_64-win"];
-    architectures
-        .iter()
-        .map(|arch| path.join("Contents").join(arch).join(name))
-        .find(|file| file.is_file())
-        .ok_or_else(|| PluginError("VST 3 bundle has no binary for this architecture".into()))
+    #[cfg(target_os = "macos")]
+    {
+        return Ok(path.to_owned());
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let name = path
+            .file_name()
+            .ok_or_else(|| PluginError("invalid VST3 bundle".into()))?;
+        #[cfg(all(windows, target_arch = "aarch64"))]
+        let architectures = ["arm64-win", "arm64ec-win"];
+        #[cfg(all(windows, not(target_arch = "aarch64")))]
+        let architectures = ["x86_64-win"];
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        let architectures = ["x86_64-linux"];
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        let architectures = ["aarch64-linux"];
+        #[cfg(windows)]
+        let filename = name.to_os_string();
+        #[cfg(target_os = "linux")]
+        let filename = Path::new(name).with_extension("so").into_os_string();
+        architectures
+            .iter()
+            .map(|arch| path.join("Contents").join(arch).join(&filename))
+            .find(|file| file.is_file())
+            .ok_or_else(|| PluginError("VST3 bundle has no binary for this architecture".into()))
+    }
 }
 impl Vst3Module {
     pub fn load(path: &Path) -> Result<Self, PluginError> {
         let library = Library::load(&binary(path)?).map_err(|e| PluginError(e.to_string()))?;
-        let exit = library.symbol(c"ExitDll").map(|symbol| {
+        #[cfg(windows)]
+        let exit_name = c"ExitDll";
+        #[cfg(target_os = "linux")]
+        let exit_name = c"ModuleExit";
+        #[cfg(target_os = "macos")]
+        let exit_name = c"bundleExit";
+        let exit = library.symbol(exit_name).map(|symbol| {
             // SAFETY: SDK Windows module exit export has this exact ABI.
             unsafe {
                 std::mem::transmute::<
@@ -115,12 +138,29 @@ impl Vst3Module {
                 >(symbol)
             }
         });
+        #[cfg(windows)]
         if let Some(symbol) = library.symbol(c"InitDll") {
             // SAFETY: SDK Windows module initialization export has this exact ABI.
             let init: unsafe extern "system" fn() -> bool = unsafe { std::mem::transmute(symbol) };
             // SAFETY: DLL is loaded; initialization precedes all factory calls.
             if !unsafe { init() } {
                 return Err(PluginError("VST 3 InitDll failed".into()));
+            }
+        }
+        #[cfg(unix)]
+        {
+            #[cfg(target_os = "linux")]
+            let entry_name = c"ModuleEntry";
+            #[cfg(target_os = "macos")]
+            let entry_name = c"bundleEntry";
+            if let Some(symbol) = library.symbol(entry_name) {
+                // SAFETY: VST3 platform entry accepts the retained dlopen/CFBundle context.
+                let entry: unsafe extern "system" fn(*mut c_void) -> bool =
+                    unsafe { std::mem::transmute(symbol) };
+                // SAFETY: native module is loaded and remains owned through module exit.
+                if !unsafe { entry(library.module_context()) } {
+                    return Err(PluginError("VST3 module initialization failed".into()));
+                }
             }
         }
         let library = Arc::new(ModuleLibrary { library, exit });
@@ -372,8 +412,8 @@ impl Vst3Plugin {
                 check(unsafe { b.connect(a.as_ptr()) }, "controller connect")?;
             }
         }
-        let input = plugin.arrangements(BusDirections_::kInput)?;
-        let output = plugin.arrangements(BusDirections_::kOutput)?;
+        let input = plugin.arrangements(BusDirections_::kInput as i32)?;
+        let output = plugin.arrangements(BusDirections_::kOutput as i32)?;
         if input.is_empty() || output.is_empty() {
             return Err(PluginError("VST 3 missing main audio bus".into()));
         }
@@ -390,19 +430,22 @@ impl Vst3Plugin {
             )
         };
         // Always read back: rejection may retain or select a default arrangement.
-        let input = plugin.arrangements(BusDirections_::kInput)?;
-        let output = plugin.arrangements(BusDirections_::kOutput)?;
+        let input = plugin.arrangements(BusDirections_::kInput as i32)?;
+        let output = plugin.arrangements(BusDirections_::kOutput as i32)?;
         plugin.info.input = input[0];
         plugin.info.output = output[0];
-        plugin.info.inputs = plugin.bus_channels(BusDirections_::kInput)?;
-        plugin.info.outputs = plugin.bus_channels(BusDirections_::kOutput)?;
+        plugin.info.inputs = plugin.bus_channels(BusDirections_::kInput as i32)?;
+        plugin.info.outputs = plugin.bus_channels(BusDirections_::kOutput as i32)?;
         // SAFETY: initialized audio processor; latency queried on main thread.
         plugin.info.latency = unsafe { plugin.shared.processor.getLatencySamples() };
         Ok(plugin)
     }
     fn arrangements(&self, direction: i32) -> Result<Vec<u64>, PluginError> {
         // SAFETY: main-thread initialized component; audio media and valid direction.
-        let count = unsafe { self.component.getBusCount(MediaTypes_::kAudio, direction) };
+        let count = unsafe {
+            self.component
+                .getBusCount(MediaTypes_::kAudio as i32, direction)
+        };
         if !(1..=32).contains(&count) {
             return Err(PluginError("VST 3 invalid audio bus count".into()));
         }
@@ -427,11 +470,11 @@ impl Vst3Plugin {
             // SAFETY: main bus index exists per arrangements, output struct has correct layout.
             unsafe {
                 self.component
-                    .getBusInfo(MediaTypes_::kAudio, direction, 0, &mut bus)
+                    .getBusInfo(MediaTypes_::kAudio as i32, direction, 0, &mut bus)
             },
             "getBusInfo",
         )?;
-        if bus.busType != BusTypes_::kMain || !(0..=32).contains(&bus.channelCount) {
+        if bus.busType != BusTypes_::kMain as i32 || !(0..=32).contains(&bus.channelCount) {
             return Err(PluginError("VST 3 unsupported main bus".into()));
         }
         Ok(bus.channelCount as u16)
@@ -461,13 +504,13 @@ impl Vst3Plugin {
             unsafe {
                 self.shared
                     .processor
-                    .canProcessSampleSize(SymbolicSampleSizes_::kSample32)
+                    .canProcessSampleSize(SymbolicSampleSizes_::kSample32 as i32)
             },
             "canProcessSampleSize",
         )?;
         let mut setup = ProcessSetup {
-            processMode: ProcessModes_::kRealtime,
-            symbolicSampleSize: SymbolicSampleSizes_::kSample32,
+            processMode: ProcessModes_::kRealtime as i32,
+            symbolicSampleSize: SymbolicSampleSizes_::kSample32 as i32,
             maxSamplesPerBlock: frames as i32,
             sampleRate: f64::from(rate),
         };
@@ -476,15 +519,21 @@ impl Vst3Plugin {
             unsafe { self.shared.processor.setupProcessing(&mut setup) },
             "setupProcessing",
         )?;
-        for direction in [BusDirections_::kInput, BusDirections_::kOutput] {
+        for direction in [
+            BusDirections_::kInput as i32,
+            BusDirections_::kOutput as i32,
+        ] {
             // SAFETY: component is set up; query audio bus count on the main thread.
-            let count = unsafe { self.component.getBusCount(MediaTypes_::kAudio, direction) };
+            let count = unsafe {
+                self.component
+                    .getBusCount(MediaTypes_::kAudio as i32, direction)
+            };
             for index in 0..count {
                 check(
                     // SAFETY: main bus enabled, all auxiliary buses disabled; indices were queried.
                     unsafe {
                         self.component.activateBus(
-                            MediaTypes_::kAudio,
+                            MediaTypes_::kAudio as i32,
                             direction,
                             index,
                             u8::from(index == 0),
@@ -604,8 +653,8 @@ impl Vst3Plugin {
             .ok_or_else(|| PluginError("no VST 3 editor".into()))?;
         check(
             // SAFETY: live view, SDK Windows platform string, on main thread.
-            unsafe { view.isPlatformTypeSupported(kPlatformTypeHWND) },
-            "HWND support",
+            unsafe { view.isPlatformTypeSupported(crate::editor_platform().as_ptr()) },
+            "native editor support",
         )?;
         let mut size = ViewRect {
             left: 0,
@@ -635,8 +684,12 @@ impl Vst3Plugin {
         // SAFETY: retained frame and main-thread view; frame owns the window lifetime.
         check(unsafe { view.setFrame(frame.as_ptr()) }, "setFrame")?;
         // SAFETY: live host-owned HWND, platform type matches support query.
-        let result =
-            unsafe { view.attached(window.handle_value() as *mut c_void, kPlatformTypeHWND) };
+        let result = unsafe {
+            view.attached(
+                window.handle_value() as *mut c_void,
+                crate::editor_platform().as_ptr(),
+            )
+        };
         if result != kResultOk {
             // SAFETY: release installed frame before returning attachment error.
             let _ = unsafe { view.setFrame(std::ptr::null_mut()) };
@@ -647,6 +700,15 @@ impl Vst3Plugin {
             _frame: frame,
             window,
         });
+        Ok(())
+    }
+    pub fn request_editor_close(&self) -> Result<(), PluginError> {
+        if let Some(editor) = &self.editor {
+            editor
+                .window
+                .request_close()
+                .map_err(|e| PluginError(e.to_string()))?;
+        }
         Ok(())
     }
     pub fn idle(&mut self) {
@@ -781,8 +843,8 @@ impl Vst3Processor {
             },
         };
         let mut data = ProcessData {
-            processMode: ProcessModes_::kRealtime,
-            symbolicSampleSize: SymbolicSampleSizes_::kSample32,
+            processMode: ProcessModes_::kRealtime as i32,
+            symbolicSampleSize: SymbolicSampleSizes_::kSample32 as i32,
             numSamples: frames as i32,
             numInputs: 1,
             numOutputs: 1,

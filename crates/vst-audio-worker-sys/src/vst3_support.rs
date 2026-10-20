@@ -179,11 +179,9 @@ impl IBStreamTrait for Stream {
     }
     unsafe fn seek(&self, position: i64, mode: i32, actual: *mut i64) -> tresult {
         let from = match mode {
-            IBStream_::IStreamSeekMode_::kIBSeekSet if position >= 0 => {
-                SeekFrom::Start(position as u64)
-            }
-            IBStream_::IStreamSeekMode_::kIBSeekCur => SeekFrom::Current(position),
-            IBStream_::IStreamSeekMode_::kIBSeekEnd => SeekFrom::End(position),
+            0 if position >= 0 => SeekFrom::Start(position as u64),
+            1 => SeekFrom::Current(position),
+            2 => SeekFrom::End(position),
             _ => return kInvalidArgument,
         };
         let Ok(position) = self.0.borrow_mut().seek(from) else {

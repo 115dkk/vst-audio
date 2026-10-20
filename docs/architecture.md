@@ -22,8 +22,8 @@ The target dependency boundary is:
 - `vst-audio-worker-runtime`: worker lifecycle, main/audio coordination.
 - `vst-audio-worker`: packaged worker executable.
 
-The extraction initially retains the original combined packages. Splitting the
-application dependency graph from foreign-code loading is a release gate.
+The application dependency graph is checked by `tools/check_boundary.py`.
+It cannot depend on the worker runtime, foreign loader or GUI frameworks.
 
 ## GUI contract
 

@@ -172,17 +172,9 @@ impl AudioBuffer {
 }
 
 pub fn main() {
-    #[cfg(not(windows))]
-    {
-        eprintln!("vst-audio-worker runs on Windows only");
-        std::process::exit(2);
-    }
-    #[cfg(windows)]
-    {
-        if let Err(error) = crate::windows::host_main(Args::parse()) {
-            eprintln!("{error}");
-            std::process::exit(3);
-        }
+    if let Err(error) = crate::native::host_main(Args::parse()) {
+        eprintln!("{error}");
+        std::process::exit(3);
     }
 }
 

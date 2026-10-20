@@ -77,6 +77,9 @@ impl Plugin for Vst3 {
     fn open_editor(&mut self) -> Result<(), PluginError> {
         self.inner.open_editor().map_err(error)
     }
+    fn close_editor(&mut self) -> Result<(), PluginError> {
+        self.inner.request_editor_close().map_err(error)
+    }
     fn idle(&mut self) {
         self.inner.idle();
     }

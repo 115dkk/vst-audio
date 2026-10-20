@@ -22,6 +22,6 @@ multiple_unsafe_ops_per_block = "deny"
 missing_safety_doc = "deny"
 dbg_macro = "deny"
 
-[target.'cfg(windows)'.dependencies]
+[dependencies]
 vst-audio-worker-sys.workspace = true
 vst3.workspace = true

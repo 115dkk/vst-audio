@@ -1,5 +1,4 @@
 #![forbid(unsafe_code)]
-#![cfg(windows)]
 
 use std::{
     path::PathBuf,

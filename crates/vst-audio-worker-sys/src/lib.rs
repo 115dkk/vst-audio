@@ -1,28 +1,35 @@
 #![deny(unsafe_code)]
-
-//! Platform isolation for the out-of-process plugin host.
-
-pub mod state_buffer;
+//! Foreign plugin execution. Only the worker links this crate.
 #[cfg(windows)]
-pub mod vst3;
-#[cfg(windows)]
-mod vst3_support;
-
-#[cfg(windows)]
-pub mod events;
-#[cfg(windows)]
-pub mod mapping;
-#[cfg(windows)]
-pub mod vst2;
-#[cfg(windows)]
-pub use events::{Event, SharedEvent};
-#[cfg(windows)]
-pub use mapping::SharedRegion;
-#[cfg(windows)]
+pub mod editor;
+#[cfg(target_os = "linux")]
+#[path = "unix/editor_linux.rs"]
+pub mod editor;
+#[cfg(target_os = "macos")]
+#[path = "unix/editor_macos.rs"]
 pub mod editor;
 #[cfg(windows)]
 pub mod library;
-#[cfg(windows)]
+#[cfg(unix)]
+#[path = "unix/library.rs"]
+pub mod library;
 pub mod plugin;
-#[cfg(windows)]
-pub mod runtime;
+pub mod state_buffer;
+pub mod vst2;
+pub mod vst3;
+mod vst3_support;
+
+pub fn editor_platform() -> &'static std::ffi::CStr {
+    #[cfg(windows)]
+    {
+        c"HWND"
+    }
+    #[cfg(target_os = "linux")]
+    {
+        c"X11EmbedWindowID"
+    }
+    #[cfg(target_os = "macos")]
+    {
+        c"NSView"
+    }
+}

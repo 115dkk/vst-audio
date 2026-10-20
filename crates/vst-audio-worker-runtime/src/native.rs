@@ -1,0 +1,466 @@
+//! Executes foreign calls exclusively inside the worker.
+use crate::{
+    Plugin, PluginError, PluginEvents, PluginInfo, Processor,
+    host::{Args, AudioBuffer},
+    layout::{default_arrangement, vst2_arrangement},
+};
+use std::{
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    thread,
+    time::Duration,
+};
+use vst_audio_protocol::{
+    Bus, ClassInfo, DecodedFrame, Frame, Message, PluginFormat, read_frame, write_frame,
+};
+use vst_audio_ring::{Consumer, Geometry, Signal, State, Wait, Waited};
+use vst_audio_transport_sys::{
+    Event, SharedRegion,
+    runtime::{self, Mmcss},
+};
+use vst_audio_worker_sys::plugin::{Vst2Plugin, Vst2Processor};
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct StartError(pub String);
+fn error(error: impl std::fmt::Display) -> StartError {
+    StartError(error.to_string())
+}
+fn plugin_error(error: impl std::fmt::Display) -> PluginError {
+    PluginError(error.to_string())
+}
+
+#[derive(Debug)]
+struct Vst2 {
+    inner: Vst2Plugin,
+    processor: Option<Vst2ProcessorAdapter>,
+    info: PluginInfo,
+}
+impl Vst2 {
+    fn load(path: &Path) -> Result<Self, PluginError> {
+        let inner = Vst2Plugin::load(path).map_err(plugin_error)?;
+        let info = inner.info();
+        let arrangement = |types: Option<Vec<i32>>, count| {
+            types
+                .map_or_else(
+                    || default_arrangement(count),
+                    |types| vst2_arrangement(&types),
+                )
+                .map_err(plugin_error)
+        };
+        let info = PluginInfo {
+            name: info.name,
+            vendor: info.vendor,
+            latency_frames: info.latency,
+            inputs: vec![Bus {
+                channels: info.inputs,
+                arrangement: arrangement(info.input_types, info.inputs)?,
+            }],
+            outputs: vec![Bus {
+                channels: info.outputs,
+                arrangement: arrangement(info.output_types, info.outputs)?,
+            }],
+        };
+        let processor = Vst2ProcessorAdapter(inner.processor());
+        Ok(Self {
+            inner,
+            processor: Some(processor),
+            info,
+        })
+    }
+}
+impl Processor for Vst2ProcessorAdapter {
+    fn process(&mut self, planes: &mut [&mut [f32]], frames: usize) -> bool {
+        self.0.process(planes, frames)
+    }
+}
+#[derive(Debug)]
+struct Vst2ProcessorAdapter(Vst2Processor);
+impl Plugin for Vst2 {
+    fn info(&self) -> PluginInfo {
+        self.info.clone()
+    }
+    fn configure(
+        &mut self,
+        rate: u32,
+        frames: u32,
+        inputs: u16,
+        outputs: u16,
+    ) -> Result<(), PluginError> {
+        self.inner
+            .configure(rate, frames, inputs, outputs)
+            .map_err(plugin_error)?;
+        self.processor = Some(Vst2ProcessorAdapter(self.inner.processor()));
+        Ok(())
+    }
+    fn activate(&mut self) -> Result<(), PluginError> {
+        self.inner.activate();
+        Ok(())
+    }
+    fn deactivate(&mut self) {
+        self.inner.deactivate();
+    }
+    fn take_processor(&mut self) -> Result<Box<dyn Processor>, PluginError> {
+        self.processor
+            .take()
+            .map(|processor| Box::new(processor) as Box<dyn Processor>)
+            .ok_or_else(|| PluginError("processor already taken".into()))
+    }
+    fn get_state(&mut self) -> Result<Vec<u8>, PluginError> {
+        self.inner.get_state().map_err(plugin_error)
+    }
+    fn set_state(&mut self, blob: &[u8]) -> Result<(), PluginError> {
+        self.inner.set_state(blob).map_err(plugin_error)
+    }
+    fn open_editor(&mut self) -> Result<(), PluginError> {
+        self.inner.open_editor().map_err(plugin_error)
+    }
+    fn close_editor(&mut self) -> Result<(), PluginError> {
+        self.inner.request_editor_close().map_err(plugin_error)
+    }
+    fn idle(&mut self) {
+        self.inner.idle();
+    }
+    fn take_events(&mut self) -> PluginEvents {
+        let events = self.inner.take_events();
+        self.info.latency_frames = self.inner.info().latency;
+        PluginEvents {
+            params_changed: events.params,
+            latency_changed: events.latency.then_some(self.info.latency_frames),
+            editor_closed: events.closed,
+            fault: None,
+        }
+    }
+}
+
+pub fn host_main(args: Args) -> Result<(), StartError> {
+    runtime::suppress_error_dialogs();
+    #[cfg(target_os = "macos")]
+    vst_audio_worker_sys::editor::initialize().map_err(error)?;
+    let input = runtime::inherited_file(args.control_in).map_err(error)?;
+    let mut output = runtime::inherited_file(args.control_out).map_err(error)?;
+    // Main-thread writes are acceptable in the disposable host. The app's reader
+    // drains continuously; app-side writes use a dedicated thread.
+    write_frame(
+        &mut output,
+        &Frame {
+            flags: 0,
+            request: 0,
+            message: Message::hello(),
+        },
+    )
+    .map_err(error)?;
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut input = input;
+        loop {
+            let next = read_frame(&mut input);
+            let end = !matches!(next, Ok(Some(_)));
+            if tx.send(next).is_err() || end {
+                break;
+            }
+        }
+    });
+    let parent = Arc::new(runtime::duplicate_value(args.parent, false).map_err(error)?);
+    // Independent of the plugin's main/audio threads: even a hung foreign
+    // call must not leave a worker behind after the application exits.
+    let parent_watch = parent.clone();
+    thread::spawn(move || {
+        loop {
+            if runtime::process_gone(&parent_watch) {
+                std::process::exit(0);
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    });
+    let region = Arc::new(SharedRegion::open(args.region, args.region_bytes).map_err(error)?);
+    let work = Arc::new(
+        Event::open(args.work)
+            .map_err(error)?
+            .with_peer(parent.try_clone().map_err(error)?),
+    );
+    let done = Arc::new(Event::open(args.done).map_err(error)?);
+    let ready = Arc::new(Event::open(args.ready).map_err(error)?);
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut audio = None;
+    let mut plugin: Option<Box<dyn Plugin>> = None;
+    let mut configured = false;
+    let mut failed = false;
+    // Always join audio before lifecycle teardown, including malformed frames
+    // and broken control pipes (early ? returns must not detach the audio thread).
+    let result = (|| -> Result<(), StartError> {
+        loop {
+            if runtime::process_gone(&parent) {
+                break;
+            }
+            match rx.recv_timeout(Duration::from_millis(10)) {
+                Ok(Ok(Some(DecodedFrame::Known(frame)))) => {
+                    let request = frame.request;
+                    let shutdown = matches!(frame.message, Message::Shutdown);
+                    let reply: Result<Message, StartError> = (|| match frame.message {
+                        Message::Scan { path } => {
+                            if Path::new(&path)
+                                .extension()
+                                .is_some_and(|ext| ext.eq_ignore_ascii_case("vst3"))
+                            {
+                                let module =
+                                    vst_audio_worker_sys::vst3::Vst3Module::load(Path::new(&path))
+                                        .map_err(error)?;
+                                let entries = module
+                                    .scan()
+                                    .map_err(error)?
+                                    .into_iter()
+                                    .map(|class| ClassInfo {
+                                        id: class.id,
+                                        name: class.name,
+                                        vendor: class.vendor,
+                                        category: class.category,
+                                    })
+                                    .collect();
+                                return Ok(Message::Classes { entries });
+                            }
+                            let scanned = Vst2::load(Path::new(&path)).map_err(error)?;
+                            let info = scanned.info();
+                            Ok(Message::Classes {
+                                entries: vec![ClassInfo {
+                                    id: [0; 16],
+                                    name: info.name,
+                                    vendor: info.vendor,
+                                    category: "Audio Module".into(),
+                                }],
+                            })
+                        }
+                        Message::Load {
+                            path,
+                            format,
+                            class_id,
+                        } if plugin.is_none() => {
+                            let loaded: Box<dyn Plugin> = match format {
+                                PluginFormat::Vst2 => {
+                                    Box::new(Vst2::load(Path::new(&path)).map_err(error)?)
+                                }
+                                PluginFormat::Vst3 => Box::new(
+                                    crate::vst3::Vst3::load(Path::new(&path), class_id)
+                                        .map_err(error)?,
+                                ),
+                            };
+                            let info = loaded.info();
+                            plugin = Some(loaded);
+                            Ok(Message::Loaded {
+                                name: info.name,
+                                vendor: info.vendor,
+                                latency_frames: info.latency_frames,
+                                inputs: info.inputs,
+                                outputs: info.outputs,
+                            })
+                        }
+                        Message::Configure {
+                            rate,
+                            max_frames,
+                            in_channels,
+                            out_channels,
+                        } if !configured => {
+                            let plugin = plugin
+                                .as_mut()
+                                .ok_or_else(|| StartError("Load required".into()))?;
+                            let previous_latency = plugin.info().latency_frames;
+                            plugin
+                                .configure(rate, max_frames, in_channels, out_channels)
+                                .map_err(error)?;
+                            let latency = plugin.info().latency_frames;
+                            if latency != previous_latency {
+                                write_frame(
+                                    &mut output,
+                                    &Frame {
+                                        flags: 0,
+                                        request: 0,
+                                        message: Message::LatencyChanged { frames: latency },
+                                    },
+                                )
+                                .map_err(error)?;
+                            }
+                            let geometry = Geometry {
+                                lanes: 1,
+                                input_channels: in_channels.into(),
+                                output_channels: out_channels.into(),
+                                max_frames,
+                                sample_rate: rate,
+                                latency_bound_frames: region.latency_bound(),
+                            };
+                            region
+                                .region_for(geometry)
+                                .map_err(|e| error(format!("{e:?}")))?;
+                            let (validated, validation) = mpsc::sync_channel(1);
+                            let mut scratch =
+                                AudioBuffer::new(geometry).map_err(|e| error(format!("{e:?}")))?;
+                            let mut processor = plugin.take_processor().map_err(error)?;
+                            let region = region.clone();
+                            let work = work.clone();
+                            let done = done.clone();
+                            let ready = ready.clone();
+                            let stop = stop.clone();
+                            audio = Some(thread::spawn(move || {
+                                let _mmcss = Mmcss::pro_audio();
+                                let view = region.region();
+                                let mut consumer =
+                                    Consumer::new(view, &*ready, [Some(&*done), None]);
+                                let result = consumer.validate_and_ready(std::process::id());
+                                let valid = result == Ok(geometry);
+                                let _ = validated.send(valid);
+                                if !valid {
+                                    consumer.fault(1);
+                                    return;
+                                }
+                                while !stop.load(Ordering::Acquire) {
+                                    let wake = work.wait(Duration::from_millis(100));
+                                    consumer.beat();
+                                    if wake == Waited::PeerGone
+                                        || view.state() != Some(State::Ready)
+                                    {
+                                        break;
+                                    }
+                                    scratch.drain(&consumer, processor.as_mut());
+                                }
+                                processor.stop();
+                            }));
+                            if !validation
+                                .recv_timeout(Duration::from_secs(5))
+                                .map_err(error)?
+                            {
+                                return Err(StartError("ring validation failed".into()));
+                            }
+                            configured = true;
+                            Ok(Message::Ack)
+                        }
+                        Message::Activate if configured => {
+                            plugin
+                                .as_mut()
+                                .expect("configured plugin")
+                                .activate()
+                                .map_err(error)?;
+                            Ok(Message::Ack)
+                        }
+                        Message::SetState { blob } => {
+                            plugin
+                                .as_mut()
+                                .ok_or_else(|| StartError("Load required".into()))?
+                                .set_state(&blob)
+                                .map_err(error)?;
+                            Ok(Message::Ack)
+                        }
+                        Message::GetState => Ok(Message::State {
+                            blob: plugin
+                                .as_mut()
+                                .ok_or_else(|| StartError("Load required".into()))?
+                                .get_state()
+                                .map_err(error)?,
+                        }),
+                        Message::OpenEditor => {
+                            plugin
+                                .as_mut()
+                                .ok_or_else(|| StartError("Load required".into()))?
+                                .open_editor()
+                                .map_err(error)?;
+                            Ok(Message::Ack)
+                        }
+                        Message::CloseEditor => {
+                            plugin
+                                .as_mut()
+                                .ok_or_else(|| StartError("Load required".into()))?
+                                .close_editor()
+                                .map_err(error)?;
+                            Ok(Message::Ack)
+                        }
+                        Message::Shutdown => Ok(Message::Ack),
+                        _ => Err(StartError("invalid host request".into())),
+                    })();
+                    let scan = matches!(&reply, Ok(Message::Classes { .. }));
+                    let fault = reply.is_err();
+                    let message = reply.unwrap_or_else(|error| Message::Fault {
+                        code: 1,
+                        text: error.to_string(),
+                    });
+                    write_frame(
+                        &mut output,
+                        &Frame {
+                            flags: 0,
+                            request,
+                            message,
+                        },
+                    )
+                    .map_err(error)?;
+                    if shutdown || scan || fault {
+                        failed = fault;
+                        break;
+                    }
+                }
+                Ok(Ok(Some(DecodedFrame::Unknown(_)))) => {}
+                Ok(Ok(None)) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Ok(Err(error_value)) => {
+                    let _ = write_frame(
+                        &mut output,
+                        &Frame {
+                            flags: 0,
+                            request: 0,
+                            message: Message::Fault {
+                                code: 3,
+                                text: error_value.to_string(),
+                            },
+                        },
+                    );
+                    return Err(error(error_value));
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            if let Some(plugin) = plugin.as_mut() {
+                plugin.idle();
+                let events = plugin.take_events();
+                let mut send = |message| {
+                    write_frame(
+                        &mut output,
+                        &Frame {
+                            flags: 0,
+                            request: 0,
+                            message,
+                        },
+                    )
+                    .map_err(error)
+                };
+                if let Some(text) = events.fault {
+                    send(Message::Fault {
+                        code: 4,
+                        text: text.into(),
+                    })?;
+                    failed = true;
+                    break;
+                }
+                if events.params_changed {
+                    send(Message::ParamsChanged)?;
+                }
+                if let Some(frames) = events.latency_changed {
+                    send(Message::LatencyChanged { frames })?;
+                }
+                if events.editor_closed {
+                    send(Message::EditorClosed)?;
+                }
+            }
+        }
+        if failed {
+            Err(StartError("host request failed".into()))
+        } else {
+            Ok(())
+        }
+    })();
+    stop.store(true, Ordering::Release);
+    work.signal();
+    if let Some(audio) = audio {
+        let _ = audio.join();
+    }
+    if let Some(plugin) = plugin.as_mut() {
+        plugin.deactivate();
+    }
+    result
+}

@@ -3,8 +3,9 @@
 Work toward a GUI-independent Rust library for hosting VST2 and VST3 plugins
 in separate processes on Windows, macOS and Linux.
 
-**0.1.0 is in development.** The initial extraction is a Windows implementation;
-the cross-platform backends and public API are being developed and tested.
+**0.1.0 is in development.** Windows and Linux worker backends pass the native
+fixture tests locally. The macOS backend is being validated on GitHub runners;
+the public API and broader compatibility work are still in progress.
 This is not yet a crates.io release.
 
 The intended contract is one worker per plugin instance, safe application-side

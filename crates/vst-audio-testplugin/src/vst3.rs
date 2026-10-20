@@ -1,3 +1,5 @@
+// The generated C++ enum constants are i32 on Windows and u32 on Unix.
+#![allow(clippy::unnecessary_cast)]
 #![allow(unsafe_code, non_snake_case)]
 //! Test-only COM implementation using vst3 0.3.0's generated interfaces.
 use std::{
@@ -99,8 +101,11 @@ impl IComponentTrait for Matrix {
     }
     unsafe fn getBusCount(&self, media: i32, direction: i32) -> i32 {
         i32::from(
-            media == MediaTypes_::kAudio
-                && [{ BusDirections_::kInput }, { BusDirections_::kOutput }].contains(&direction),
+            media == MediaTypes_::kAudio as i32
+                && [{ BusDirections_::kInput as i32 }, {
+                    BusDirections_::kOutput as i32
+                }]
+                .contains(&direction),
         )
     }
     unsafe fn getBusInfo(
@@ -110,7 +115,7 @@ impl IComponentTrait for Matrix {
         index: i32,
         info: *mut BusInfo,
     ) -> tresult {
-        if media != MediaTypes_::kAudio || index != 0 || info.is_null() {
+        if media != MediaTypes_::kAudio as i32 || index != 0 || info.is_null() {
             return kInvalidArgument;
         }
         let channels = match direction {
@@ -123,7 +128,7 @@ impl IComponentTrait for Matrix {
         info.mediaType = media;
         info.direction = direction;
         info.channelCount = channels;
-        info.busType = BusTypes_::kMain;
+        info.busType = BusTypes_::kMain as i32;
         info.flags = BusInfo_::BusFlags_::kDefaultActive as u32;
         wide(
             if channels == 2 {
@@ -139,7 +144,7 @@ impl IComponentTrait for Matrix {
         kNotImplemented
     }
     unsafe fn activateBus(&self, media: i32, direction: i32, index: i32, _: TBool) -> tresult {
-        if media == MediaTypes_::kAudio && (0..=1).contains(&direction) && index == 0 {
+        if media == MediaTypes_::kAudio as i32 && (0..=1).contains(&direction) && index == 0 {
             kResultOk
         } else {
             kInvalidArgument
@@ -198,7 +203,7 @@ impl IAudioProcessorTrait for Matrix {
         kResultOk
     }
     unsafe fn canProcessSampleSize(&self, size: i32) -> tresult {
-        if size == SymbolicSampleSizes_::kSample32 {
+        if size == SymbolicSampleSizes_::kSample32 as i32 {
             kResultOk
         } else {
             kResultFalse
@@ -213,7 +218,7 @@ impl IAudioProcessorTrait for Matrix {
         }
         // SAFETY: caller provides a live ProcessSetup during inactive configuration.
         let setup = unsafe { &*setup };
-        if setup.symbolicSampleSize != SymbolicSampleSizes_::kSample32
+        if setup.symbolicSampleSize != SymbolicSampleSizes_::kSample32 as i32
             || setup.maxSamplesPerBlock <= 0
         {
             kInvalidArgument
@@ -231,7 +236,7 @@ impl IAudioProcessorTrait for Matrix {
         // SAFETY: sole processing thread receives a live ProcessData for this block.
         let data = unsafe { &*data };
         if !self.active.load(Ordering::Relaxed)
-            || data.symbolicSampleSize != SymbolicSampleSizes_::kSample32
+            || data.symbolicSampleSize != SymbolicSampleSizes_::kSample32 as i32
             || data.numInputs != 1
             || data.numOutputs != 1
             || data.inputs.is_null()
@@ -427,7 +432,7 @@ impl IPlugViewTrait for View {
             return kInvalidArgument;
         }
         // SAFETY: SDK platform string is null-terminated.
-        if unsafe { CStr::from_ptr(platform) } == c"HWND" {
+        if unsafe { CStr::from_ptr(platform) } == vst_audio_worker_sys::editor_platform() {
             kResultTrue
         } else {
             kResultFalse
@@ -522,7 +527,7 @@ impl IPluginFactoryTrait for Factory {
         // SAFETY: index zero output is a writable SDK class-info structure.
         let info = unsafe { &mut *info };
         info.cid = CID;
-        info.cardinality = PClassInfo_::ClassCardinality_::kManyInstances;
+        info.cardinality = PClassInfo_::ClassCardinality_::kManyInstances as i32;
         narrow("Audio Module Class", &mut info.category);
         narrow("Test matrix", &mut info.name);
         kResultOk
@@ -563,7 +568,7 @@ impl IPluginFactory2Trait for Factory {
         // SAFETY: writable extended class-info output for the only factory class.
         let info = unsafe { &mut *info };
         info.cid = CID;
-        info.cardinality = PClassInfo_::ClassCardinality_::kManyInstances;
+        info.cardinality = PClassInfo_::ClassCardinality_::kManyInstances as i32;
         info.classFlags = 0;
         narrow("Audio Module Class", &mut info.category);
         narrow("Test matrix", &mut info.name);

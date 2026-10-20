@@ -38,5 +38,8 @@ artifact. Only trusted release jobs receive signing credentials.
 
 ## Initial state
 
-P0: source extracted from spatial-audio-softdriver b6d4df9.
-P1–P7: pending. See commits and CI for subsequent evidence.
+P0: source extracted from spatial-audio-softdriver b6d4df9; independent repository
+and application/worker dependency boundary implemented.
+P1–P2: Windows and Linux locally pass 20 real worker tests (VST2/VST3 processing,
+state, editor, crash, hang and shutdown). macOS backend enters runner validation.
+P3–P7: pending. See commits and CI for subsequent evidence.
