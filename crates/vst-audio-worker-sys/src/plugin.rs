@@ -123,6 +123,8 @@ pub struct Vst2Plugin {
     info: Info,
     editor: Option<EditorWindow>,
     closed: bool,
+    configured: bool,
+    processor_taken: bool,
     _main: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 #[derive(Debug)]
@@ -222,6 +224,8 @@ impl Vst2Plugin {
             info,
             editor: None,
             closed: false,
+            configured: false,
+            processor_taken: false,
             _main: std::marker::PhantomData,
         })
     }
@@ -236,6 +240,7 @@ impl Vst2Plugin {
         outputs: u16,
     ) -> Result<(), PluginError> {
         if self.shared.active.load(Ordering::SeqCst)
+            || self.processor_taken
             || rate < 1000
             || frames == 0
             || frames > 65536
@@ -255,6 +260,7 @@ impl Vst2Plugin {
             std::ptr::null_mut(),
             0.0,
         );
+        self.configured = true;
         Ok(())
     }
     pub fn activate(&mut self) {
@@ -271,13 +277,19 @@ impl Vst2Plugin {
             control.call(MAINS_CHANGED, 0, 0, std::ptr::null_mut(), 0.0);
         }
     }
-    pub fn processor(&self) -> Vst2Processor {
-        Vst2Processor {
+    pub fn processor(&mut self) -> Result<Vst2Processor, PluginError> {
+        if !self.configured || self.processor_taken {
+            return Err(PluginError(
+                "processor requires a unique configured instance".into(),
+            ));
+        }
+        self.processor_taken = true;
+        Ok(Vst2Processor {
             shared: self.shared.clone(),
             inputs: self.info.inputs as usize,
             outputs: self.info.outputs as usize,
             max_frames: self.shared.callback.frames.load(Ordering::Relaxed) as usize,
-        }
+        })
     }
     pub fn get_state(&mut self) -> Result<Vec<u8>, PluginError> {
         let control = self.shared.control();

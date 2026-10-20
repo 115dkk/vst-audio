@@ -64,10 +64,9 @@ impl Vst2 {
                 arrangement: arrangement(info.output_types, info.outputs)?,
             }],
         };
-        let processor = Vst2ProcessorAdapter(inner.processor());
         Ok(Self {
             inner,
-            processor: Some(processor),
+            processor: None,
             info,
         })
     }
@@ -93,7 +92,9 @@ impl Plugin for Vst2 {
         self.inner
             .configure(rate, frames, inputs, outputs)
             .map_err(plugin_error)?;
-        self.processor = Some(Vst2ProcessorAdapter(self.inner.processor()));
+        self.processor = Some(Vst2ProcessorAdapter(
+            self.inner.processor().map_err(plugin_error)?,
+        ));
         Ok(())
     }
     fn activate(&mut self) -> Result<(), PluginError> {

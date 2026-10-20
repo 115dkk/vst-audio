@@ -32,6 +32,12 @@ impl SharedRegion {
                 "worker cannot create application mappings",
             ));
         }
+        if !(640..vst_audio_ring::MAX_REGION_BYTES).contains(&bytes) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid mapping length",
+            ));
+        }
         let file = tempfile::tempfile()?;
         file.set_len(bytes as u64)?;
         Self::map(file, bytes)

@@ -94,7 +94,7 @@ fn binary(path: &Path) -> Result<PathBuf, PluginError> {
     }
     #[cfg(target_os = "macos")]
     {
-        return Ok(path.to_owned());
+        Ok(path.to_owned())
     }
     #[cfg(not(target_os = "macos"))]
     {
