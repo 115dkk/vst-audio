@@ -1,5 +1,7 @@
 [package]
 name = "vst-audio-protocol"
+description = "Bounded control protocol and supervision state machines for vst-audio"
+readme.workspace = true
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

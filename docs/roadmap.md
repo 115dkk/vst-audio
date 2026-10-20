@@ -36,10 +36,26 @@ Keep bounded logs, test reports, native crash diagnostics and available editor
 captures on failure. No proprietary plugin, decrypted asset or secret is an
 artifact. Only trusted release jobs receive signing credentials.
 
-## Initial state
+## Development evidence
 
-P0: source extracted from spatial-audio-softdriver b6d4df9; independent repository
-and application/worker dependency boundary implemented.
-P1–P2: Windows and Linux locally pass 20 real worker tests (VST2/VST3 processing,
-state, editor, crash, hang and shutdown). macOS backend enters runner validation.
-P3–P7: pending. See commits and CI for subsequent evidence.
+- P0: extracted from spatial-audio-softdriver b6d4df9 into the independent
+  repository. `check_boundary.py` checks the application dependency graph.
+- P1–P2: native fixture processing, state, editor, crash and hang tests have run
+  on Windows x64, Linux x64, macOS ARM64 and macOS Intel GitHub runners.
+  Fixtures now use platform-native bundles and require module initialization.
+- P3: high-level API supervises without GUI polling. Application tests run a
+  healthy instance while another crashes, and check callback allocation freedom.
+  Control queues are bounded. Configuration cannot change under a VST2 processor.
+- P4: paged parameter metadata and normalized control edits implemented.
+  MIDI, multi-bus, f64 and transport/automation work remain.
+- P5: egui and iced consume the same API from separate example packages.
+  Floating editor open/close runs in native GUI jobs. Further editor commands,
+  visual evidence and manual accessibility/input testing remain.
+- P6: state history and failure notifications exist. High-level endpoint
+  replacement, independent third-party compatibility and extended testing remain.
+- P7: `package_check.py` constructs `.crate` archives in a copied workspace,
+  builds a packaged worker and a fresh consumer from extracted archives only.
+  Final distribution packaging and publication remain.
+
+See `support.md` for the release gaps. A green current test suite alone does not
+complete all of these milestones.

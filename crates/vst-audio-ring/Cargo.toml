@@ -1,5 +1,7 @@
 [package]
 name = "vst-audio-ring"
+description = "Bounded atomic shared-memory audio block ring for isolated plugin workers"
+readme.workspace = true
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

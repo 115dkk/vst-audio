@@ -1,5 +1,7 @@
 [package]
 name = "vst-audio-transport-sys"
+description = "Platform process and shared-memory ownership for vst-audio"
+readme.workspace = true
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -1,5 +1,7 @@
 [package]
 name = "vst-audio-testplugin"
+description = "Native fixtures for vst-audio integration tests (not distributed)"
+readme.workspace = true
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

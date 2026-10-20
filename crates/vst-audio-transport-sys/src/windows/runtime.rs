@@ -48,9 +48,23 @@ pub fn duplicate_value(value: usize, inheritable: bool) -> windows::core::Result
 }
 
 pub fn parent_handle() -> windows::core::Result<OwnedHandle> {
-    // SAFETY: pseudo handle is used only to duplicate into a real inheritable handle.
+    // SAFETY: obtains only the current process's pseudo handle.
     let current = unsafe { GetCurrentProcess() };
-    duplicate_value(current.0 as usize, true)
+    let mut handle = HANDLE::default();
+    // SAFETY: live current process, writable output, only wait/synchronize rights.
+    // The worker observes parent death but must not inherit a full-access handle.
+    unsafe {
+        DuplicateHandle(
+            current,
+            current,
+            current,
+            &mut handle,
+            PROCESS_SYNCHRONIZE.0,
+            true,
+            DUPLICATE_HANDLE_OPTIONS(0),
+        )
+    }?;
+    Ok(own(handle))
 }
 
 pub fn process_gone(handle: &OwnedHandle) -> bool {

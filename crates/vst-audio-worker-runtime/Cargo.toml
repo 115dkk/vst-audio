@@ -1,5 +1,7 @@
 [package]
 name = "vst-audio-worker-runtime"
+description = "Isolated VST2 and VST3 worker runtime for vst-audio"
+readme.workspace = true
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

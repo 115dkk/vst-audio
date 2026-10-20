@@ -16,7 +16,8 @@ Process isolation contains crashes and hangs; it is not a security sandbox for
 hostile code.
 
 See [architecture](docs/architecture.md), [implementation plan](docs/roadmap.md)
-and [source provenance](NOTICE).
+and [implemented/pending support](docs/support.md).
+Source and license provenance is recorded in [NOTICE](NOTICE).
 
 The application API has a nonblocking loading task, bounded control requests,
 polled events and an independent supervisor. Any GUI can use this contract:
@@ -42,11 +43,15 @@ Build and test:
 cargo test --workspace
 python tools/check_boundary.py
 python tools/native_tests.py
+python tools/package_check.py
 ```
 
 On headless Linux, run the last command under `xvfb-run -a`.
 The CLI `cargo run -p vst-audio --example editor -- <worker> <plugin>` opens an
 editor without a GUI framework.
+
+The independent [egui and iced consumers](examples/gui) demonstrate the same
+editor IPC contract. They are built and exercised separately in CI.
 
 VST is a registered trademark of Steinberg Media Technologies GmbH.
 This project is independent of Steinberg and is not endorsed by it.
