@@ -1,0 +1,8 @@
+[package]
+name = "vst-audio-egui-example"
+version = "0.1.0"
+edition = "2024"
+publish = false
+[dependencies]
+vst-audio-gui-example.workspace = true
+eframe = { version = "=0.34.1", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }

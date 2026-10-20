@@ -52,3 +52,42 @@ jobs:
           name: diagnostics-${{ matrix.os }}
           path: test-results/
           if-no-files-found: ignore
+  gui:
+    name: GUI consumers (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2025, ubuntu-24.04, macos-15, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - shell: bash
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          workspaces: |
+            . -> target
+            examples/gui -> target
+          shared-key: gui
+      - name: Linux graphics dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y xvfb xauth libxkbcommon-dev libwayland-dev libegl1-mesa-dev libgl1-mesa-dev mesa-vulkan-drivers
+      - run: cargo fmt --manifest-path examples/gui/Cargo.toml --all -- --check
+      - run: cargo clippy --locked --manifest-path examples/gui/Cargo.toml --workspace --all-targets -- -D warnings
+      - name: GUI and editor lifecycle (Windows, macOS)
+        if: runner.os != 'Linux'
+        run: python tools/gui_tests.py
+      - name: GUI and editor lifecycle (Linux)
+        if: runner.os == 'Linux'
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+        run: xvfb-run -a -s "-screen 0 1280x800x24" python3 tools/gui_tests.py
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: gui-${{ matrix.os }}
+          path: test-results/
+          if-no-files-found: warn

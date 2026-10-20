@@ -1,0 +1,8 @@
+[package]
+name = "vst-audio-iced-example"
+version = "0.1.0"
+edition = "2024"
+publish = false
+[dependencies]
+vst-audio-gui-example.workspace = true
+iced = { version = "=0.13.1", default-features = false, features = ["tiny-skia", "tokio"] }

@@ -1,0 +1,10 @@
+[workspace]
+resolver = "3"
+members = ["common", "egui-host", "iced-host"]
+
+[workspace.dependencies]
+vst-audio = { path = "../../crates/vst-audio" }
+vst-audio-gui-example = { path = "common" }
+
+[profile.dev]
+debug = 1
