@@ -1,0 +1,8 @@
+/target/
+*.dmp
+*.core
+/test-results/
+*.vst3
+*.dll
+*.dylib
+*.so
