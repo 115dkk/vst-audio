@@ -32,7 +32,20 @@ impl Library {
         // in the disposable worker; they are not assumed memory-safe.
         let handle = unsafe { libc::dlopen(name.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
         if handle.is_null() {
-            return Err(io::Error::other(format!("cannot load {}", path.display())));
+            // SAFETY: dlerror returns thread-local diagnostic storage after failed dlopen.
+            let pointer = unsafe { libc::dlerror() };
+            let detail = if pointer.is_null() {
+                "unknown loader error".into()
+            } else {
+                // SAFETY: non-null dlerror pointer is a terminated string until next loader call.
+                unsafe { CStr::from_ptr(pointer) }
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            return Err(io::Error::other(format!(
+                "cannot load {}: {detail}",
+                path.display()
+            )));
         }
         Ok(Self {
             handle,

@@ -17,10 +17,15 @@ def copy_fresh(source, target):
     shutil.copyfile(source,staged)
     os.replace(staged,target)
 
+def target_directory():
+    directory=Path(os.environ.get("CARGO_TARGET_DIR",ROOT/"target"))
+    target=os.environ.get("CARGO_BUILD_TARGET")
+    return directory/target if target else directory
+
 def prepare():
     subprocess.run(["cargo", "build", "--locked", "-p", "vst-audio-worker",
                     "-p", "vst-audio-testplugin", "-p", "vst-audio-test-advanced"], cwd=ROOT, check=True)
-    directory = Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "target")) / "debug"
+    directory = target_directory() / "debug"
     suffix = ".exe" if sys.platform == "win32" else ""
     source = directory / {
         "win32": "vst_audio_testplugin.dll",
@@ -67,6 +72,6 @@ def prepare():
     return worker, vst2, bundle
 
 def advanced_paths():
-    directory=Path(os.environ.get("CARGO_TARGET_DIR",ROOT/"target"))/"debug"
+    directory=target_directory()/"debug"
     source=directory/{"win32":"vst_audio_test_advanced.dll","darwin":"libvst_audio_test_advanced.dylib"}.get(sys.platform,"libvst_audio_test_advanced.so")
     return source,directory/"native-fixtures"/"Advanced.vst3"

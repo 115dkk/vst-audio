@@ -23,6 +23,8 @@ run("cargo", "test", "--locked", "-p", "vst-audio", "--test", "application",
 
 run("cargo", "test", "--locked", "-p", "vst-audio", "--test", "features", "--", "--ignored", "--test-threads=1", env=env)
 
+run("cargo", "test", "--locked", "-p", "vst-audio", "--test", "stress", "--", "--ignored", "--nocapture", "--test-threads=1", env=env)
+
 # Encode only our public fixture captures. No third-party pixels or binaries.
 import struct
 import zlib

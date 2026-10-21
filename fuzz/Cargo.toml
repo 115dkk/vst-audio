@@ -1,0 +1,30 @@
+[package]
+name = "vst-audio-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+vst-audio-protocol = { path = "../crates/vst-audio-protocol" }
+vst-audio-ring = { path = "../crates/vst-audio-ring" }
+
+[[bin]]
+name = "control"
+path = "fuzz_targets/control.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ring"
+path = "fuzz_targets/ring.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

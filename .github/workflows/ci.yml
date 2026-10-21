@@ -128,3 +128,33 @@ jobs:
             test-results/third-party/summary.json
             test-results/third-party/checks.log
           if-no-files-found: error
+
+  extended:
+    name: fuzz and AddressSanitizer (Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Install pinned sanitizer and fuzz toolchain
+        run: |
+          rustup toolchain install
+          rustup toolchain install nightly-2026-10-20 --profile minimal --component rust-src
+          cargo install cargo-fuzz --version 0.13.2 --locked
+          sudo apt-get update -qq
+          sudo apt-get install -y xvfb xauth
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          shared-key: extended
+      - name: Coverage-guided protocol and ring fuzzing
+        run: python3 tools/fuzz_tests.py
+      - name: Native worker and fixture memory checks
+        run: python3 tools/asan_tests.py
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: extended-test-evidence
+          path: |
+            test-results/fuzz/
+            test-results/asan/
+            fuzz/artifacts/
+          if-no-files-found: error
