@@ -13,7 +13,7 @@ corpus=ROOT/"fuzz/corpus/control"
 corpus.mkdir(parents=True,exist_ok=True)
 def frame(kind,body):
     return struct.pack("<IHHI",8+len(body),kind,0,1)+body
-seeds={"hello":frame(1,b"SSPH"+struct.pack("<HH",3,0)),"ack":frame(16,b""),
+seeds={"hello":frame(1,b"SSRP"+struct.pack("<HH",3,0)),"ack":frame(16,b""),
        "parameters":frame(20,struct.pack("<IH",0,0)),"image":frame(28,struct.pack("<II",1,1)+bytes([32,64,128,255])),
        "state":b"SSV3\1"+struct.pack("<I",2)+b"ab"+struct.pack("<I",2)+b"cd"}
 for name,data in seeds.items(): (corpus/name).write_bytes(data)

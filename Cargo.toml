@@ -8,7 +8,7 @@ edition = "2024"
 rust-version = "1.99"
 license = "MIT"
 repository = "https://github.com/115dkk/vst-audio"
-publish = false
+publish = true
 readme = "README.md"
 
 [workspace.lints.rust]

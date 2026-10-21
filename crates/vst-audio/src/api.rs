@@ -15,7 +15,7 @@ use std::{
 #[derive(Clone, Debug)]
 pub struct Configuration {
     pub sample_rate: u32,
-    /// Exact number of frames per realtime call.
+    /// Worker processing quantum; caller callbacks may have variable lengths.
     pub quantum: u32,
     pub fallback: Fallback,
     pub recovery: RecoveryPolicy,
