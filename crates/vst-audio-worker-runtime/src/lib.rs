@@ -66,6 +66,12 @@ pub trait Plugin {
     fn get_state(&mut self) -> Result<Vec<u8>, PluginError>;
     fn set_state(&mut self, blob: &[u8]) -> Result<(), PluginError>;
     fn open_editor(&mut self) -> Result<(), PluginError>;
+    fn editor_action(
+        &mut self,
+        _action: vst_audio_protocol::EditorAction,
+    ) -> Result<vst_audio_protocol::EditorReply, PluginError> {
+        Err(PluginError("editor operation unsupported".into()))
+    }
     fn close_editor(&mut self) -> Result<(), PluginError> {
         Ok(())
     }

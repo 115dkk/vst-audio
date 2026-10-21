@@ -7,8 +7,10 @@ use std::fmt;
 use std::io::{self, Read, Write};
 use std::time::Duration;
 
+pub mod editor;
 pub mod layout;
 pub mod processing;
+pub use editor::{EditorAction, EditorImage, EditorReply, EditorStatus};
 pub use processing::{BusConfiguration, Capabilities, ProcessingSetup, SampleFormat};
 pub mod state;
 #[derive(Clone, Debug, thiserror::Error)]
@@ -74,6 +76,9 @@ pub enum Message {
         in_channels: u16,
         out_channels: u16,
     },
+    Editor(EditorAction),
+    EditorStatus(EditorStatus),
+    EditorImage(EditorImage),
     Prepare(ProcessingSetup),
     Describe,
     Features(Capabilities),
@@ -146,6 +151,9 @@ impl Message {
             Self::Hello { .. } => 1,
             Self::Load { .. } => 2,
             Self::Configure { .. } => 3,
+            Self::Editor(_) => 26,
+            Self::EditorStatus(_) => 27,
+            Self::EditorImage(_) => 28,
             Self::Prepare(_) => 23,
             Self::Describe => 24,
             Self::Features(_) => 25,
@@ -300,6 +308,9 @@ fn map_eof(error: io::Error) -> CodecError {
 }
 
 fn length_limit(kind: u16) -> usize {
+    if kind == 28 {
+        return 16 * 1024 * 1024 + 16;
+    }
     if matches!(kind, 5 | 13) {
         MAX_STATE_BYTES
     } else {
@@ -402,6 +413,38 @@ fn encode_message(message: &Message, out: &mut Vec<u8>) -> Result<(), CodecError
             }
         }
         Message::LatencyChanged { frames } => put_u32(out, *frames),
+        Message::Editor(action) => match action {
+            EditorAction::Show => out.push(0),
+            EditorAction::Hide => out.push(1),
+            EditorAction::Focus => out.push(2),
+            EditorAction::Resize { width, height } => {
+                out.push(3);
+                put_u32(out, *width);
+                put_u32(out, *height);
+            }
+            EditorAction::Scale(scale) => {
+                out.push(4);
+                put_u32(out, scale.to_bits());
+            }
+            EditorAction::Inspect => out.push(5),
+            EditorAction::Capture => out.push(6),
+        },
+        Message::EditorStatus(status) => {
+            out.push(u8::from(status.visible));
+            put_u32(out, status.width);
+            put_u32(out, status.height);
+            put_u32(out, status.scale.to_bits());
+            out.push(u8::from(status.resize_supported));
+            out.push(u8::from(status.scale_supported));
+        }
+        Message::EditorImage(image) => {
+            if !image.valid() {
+                return Err(CodecError::InvalidValue);
+            }
+            put_u32(out, image.width);
+            put_u32(out, image.height);
+            out.extend_from_slice(&image.rgba);
+        }
         Message::Prepare(setup) => {
             if !setup.valid() {
                 return Err(CodecError::InvalidValue);
@@ -560,6 +603,45 @@ fn decode_message(kind: u16, body: &[u8]) -> Result<Option<Message>, CodecError>
         16 => Message::Ack,
         17 => Message::EditorClosed,
         18 => Message::CloseEditor,
+        26 => Message::Editor(match cursor.u8()? {
+            0 => EditorAction::Show,
+            1 => EditorAction::Hide,
+            2 => EditorAction::Focus,
+            3 => EditorAction::Resize {
+                width: cursor.u32()?,
+                height: cursor.u32()?,
+            },
+            4 => EditorAction::Scale(f32::from_bits(cursor.u32()?)),
+            5 => EditorAction::Inspect,
+            6 => EditorAction::Capture,
+            _ => return Err(CodecError::InvalidValue),
+        }),
+        27 => Message::EditorStatus(EditorStatus {
+            visible: cursor.boolean()?,
+            width: cursor.u32()?,
+            height: cursor.u32()?,
+            scale: f32::from_bits(cursor.u32()?),
+            resize_supported: cursor.boolean()?,
+            scale_supported: cursor.boolean()?,
+        }),
+        28 => {
+            let width = cursor.u32()?;
+            let height = cursor.u32()?;
+            if width == 0
+                || height == 0
+                || width > 2048
+                || height > 2048
+                || cursor.remaining() != width as usize * height as usize * 4
+            {
+                return Err(CodecError::InvalidValue);
+            }
+            let rgba = cursor.take(cursor.remaining())?.to_vec();
+            Message::EditorImage(EditorImage {
+                width,
+                height,
+                rgba,
+            })
+        }
         23 => {
             let sample_rate = cursor.u32()?;
             let quantum = cursor.u32()?;

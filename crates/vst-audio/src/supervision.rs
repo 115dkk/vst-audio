@@ -113,6 +113,7 @@ pub(crate) fn supervise(
                 continue;
             }
             let result = match command {
+                Command::Editor(action) => control.editor_action(action),
                 Command::OpenEditor => control.open_editor(),
                 Command::CloseEditor => control.request_close_editor(),
                 Command::ListParameters { start, count } => control.parameters(start, count),
@@ -311,6 +312,24 @@ pub(crate) fn supervise(
                                             request,
                                             reason: text,
                                         },
+                                    );
+                                }
+                            }
+                            Message::EditorStatus(status) => {
+                                if let Some(request) = request {
+                                    emit(
+                                        &events,
+                                        &shared,
+                                        HostEvent::EditorStatus { request, status },
+                                    );
+                                }
+                            }
+                            Message::EditorImage(image) => {
+                                if let Some(request) = request {
+                                    emit(
+                                        &events,
+                                        &shared,
+                                        HostEvent::EditorImage { request, image },
                                     );
                                 }
                             }

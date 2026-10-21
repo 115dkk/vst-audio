@@ -22,3 +22,18 @@ run("cargo", "test", "--locked", "-p", "vst-audio", "--test", "application",
     "--", "--ignored", "--test-threads=1", env=env)
 
 run("cargo", "test", "--locked", "-p", "vst-audio", "--test", "features", "--", "--ignored", "--test-threads=1", env=env)
+
+# Encode only our public fixture captures. No third-party pixels or binaries.
+import struct
+import zlib
+for source in (ROOT/"test-results/editor").glob("*.ppm"):
+    magic, dimensions, maximum, pixels=source.read_bytes().split(b"\n",3)
+    assert magic==b"P6" and maximum==b"255"
+    width,height=map(int,dimensions.split())
+    assert len(pixels)==width*height*3
+    def chunk(kind,body):
+        data=kind+body
+        return struct.pack(">I",len(body))+data+struct.pack(">I",zlib.crc32(data))
+    raw=b"".join(b"\0"+pixels[y*width*3:(y+1)*width*3] for y in range(height))
+    png=b"\x89PNG\r\n\x1a\n"+chunk(b"IHDR",struct.pack(">IIBBBBB",width,height,8,2,0,0,0))+chunk(b"IDAT",zlib.compress(raw))+chunk(b"IEND",b"")
+    source.with_suffix(".png").write_bytes(png)

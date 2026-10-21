@@ -254,6 +254,12 @@ impl PluginControl {
             RequestKind::StateSave,
         )
     }
+    pub fn editor_action(
+        &mut self,
+        action: vst_audio_protocol::EditorAction,
+    ) -> Result<u32, StartError> {
+        self.request(Message::Editor(action), RequestKind::Editor)
+    }
     pub fn open_editor(&mut self) -> Result<u32, StartError> {
         self.request(Message::OpenEditor, RequestKind::Editor)
     }

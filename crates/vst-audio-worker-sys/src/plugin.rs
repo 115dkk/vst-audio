@@ -522,6 +522,42 @@ impl Vst2Plugin {
         self.editor = Some(editor);
         Ok(())
     }
+    pub fn editor_action(
+        &mut self,
+        action: vst_audio_protocol::EditorAction,
+    ) -> Result<vst_audio_protocol::EditorReply, PluginError> {
+        use vst_audio_protocol::{EditorAction as A, EditorReply, EditorStatus};
+        let window = self
+            .editor
+            .as_ref()
+            .ok_or_else(|| PluginError("editor is not open".into()))?;
+        match action {
+            A::Show => window.show(true).map_err(|e| PluginError(e.to_string()))?,
+            A::Hide => window.show(false).map_err(|e| PluginError(e.to_string()))?,
+            A::Focus => window.focus().map_err(|e| PluginError(e.to_string()))?,
+            A::Inspect => {}
+            A::Resize { .. } | A::Scale(_) => {
+                return Err(PluginError(
+                    "VST2 has no standard host-driven resize or scale contract".into(),
+                ));
+            }
+            A::Capture => {
+                return window
+                    .capture()
+                    .map(EditorReply::Image)
+                    .map_err(|e| PluginError(e.to_string()));
+            }
+        }
+        let (visible, width, height) = window.status().map_err(|e| PluginError(e.to_string()))?;
+        Ok(EditorReply::Status(EditorStatus {
+            visible,
+            width,
+            height,
+            scale: 1.0,
+            resize_supported: false,
+            scale_supported: false,
+        }))
+    }
     pub fn request_editor_close(&self) -> Result<(), PluginError> {
         if let Some(editor) = &self.editor {
             editor

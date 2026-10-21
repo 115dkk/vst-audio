@@ -286,6 +286,7 @@ impl Shared {
     }
 }
 struct Editor {
+    scale: f32,
     view: ComPtr<IPlugView>,
     _frame: ComPtr<IPlugFrame>,
     window: Rc<EditorWindow>,
@@ -935,11 +936,107 @@ impl Vst3Plugin {
             check(result, "attached")?;
         }
         self.editor = Some(Editor {
+            scale: 1.0,
             view,
             _frame: frame,
             window,
         });
         Ok(())
+    }
+    pub fn editor_action(
+        &mut self,
+        action: vst_audio_protocol::EditorAction,
+    ) -> Result<vst_audio_protocol::EditorReply, PluginError> {
+        use vst_audio_protocol::{EditorAction as A, EditorReply, EditorStatus};
+        let editor = self
+            .editor
+            .as_mut()
+            .ok_or_else(|| PluginError("editor is not open".into()))?;
+        let scale_interface = editor.view.cast::<IPlugViewContentScaleSupport>();
+        // SAFETY: queried on the creating main thread with a retained live view.
+        let resize_supported = unsafe { editor.view.canResize() } == kResultTrue;
+        match action {
+            A::Show => editor
+                .window
+                .show(true)
+                .map_err(|e| PluginError(e.to_string()))?,
+            A::Hide => editor
+                .window
+                .show(false)
+                .map_err(|e| PluginError(e.to_string()))?,
+            A::Focus => editor
+                .window
+                .focus()
+                .map_err(|e| PluginError(e.to_string()))?,
+            A::Inspect => {}
+            A::Resize { width, height } => {
+                if !resize_supported || width == 0 || height == 0 || width > 8192 || height > 8192 {
+                    return Err(PluginError("editor resize unsupported or invalid".into()));
+                }
+                let mut rect = ViewRect {
+                    left: 0,
+                    top: 0,
+                    right: width as i32,
+                    bottom: height as i32,
+                };
+                // SAFETY: live main-thread view and writable size constraint rectangle.
+                check(
+                    // SAFETY: live main-thread view and writable rectangle.
+                    unsafe { editor.view.checkSizeConstraint(&mut rect) },
+                    "checkSizeConstraint",
+                )?;
+                let width = rect
+                    .right
+                    .checked_sub(rect.left)
+                    .filter(|v| (1..=8192).contains(v))
+                    .ok_or_else(|| PluginError("invalid constrained width".into()))?;
+                let height = rect
+                    .bottom
+                    .checked_sub(rect.top)
+                    .filter(|v| (1..=8192).contains(v))
+                    .ok_or_else(|| PluginError("invalid constrained height".into()))?;
+                // SAFETY: live view with validated writable rectangle on main thread.
+                check(unsafe { editor.view.onSize(&mut rect) }, "onSize")?;
+                editor
+                    .window
+                    .resize(width, height)
+                    .map_err(|e| PluginError(e.to_string()))?;
+            }
+            A::Scale(scale) => {
+                if !scale.is_finite() || !(0.5..=4.0).contains(&scale) {
+                    return Err(PluginError("invalid content scale".into()));
+                }
+                let interface = scale_interface
+                    .as_ref()
+                    .ok_or_else(|| PluginError("editor scaling unsupported".into()))?;
+                // SAFETY: retained optional view interface; bounded finite scale on main thread.
+                check(
+                    // SAFETY: retained interface and validated finite scale.
+                    unsafe { interface.setContentScaleFactor(scale) },
+                    "setContentScaleFactor",
+                )?;
+                editor.scale = scale;
+            }
+            A::Capture => {
+                return editor
+                    .window
+                    .capture()
+                    .map(EditorReply::Image)
+                    .map_err(|e| PluginError(e.to_string()));
+            }
+        }
+        let (visible, width, height) = editor
+            .window
+            .status()
+            .map_err(|e| PluginError(e.to_string()))?;
+        Ok(EditorReply::Status(EditorStatus {
+            visible,
+            width,
+            height,
+            scale: editor.scale,
+            resize_supported,
+            scale_supported: scale_interface.is_some(),
+        }))
     }
     pub fn request_editor_close(&self) -> Result<(), PluginError> {
         if let Some(editor) = &self.editor {

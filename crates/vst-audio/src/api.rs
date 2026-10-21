@@ -209,6 +209,7 @@ impl LoadTask {
 pub struct RequestId(pub u64);
 #[derive(Clone, Debug)]
 pub enum Command {
+    Editor(vst_audio_protocol::EditorAction),
     OpenEditor,
     CloseEditor,
     ListParameters { start: u32, count: u16 },
@@ -231,6 +232,14 @@ pub enum HostEvent {
         request: RequestId,
         total: u32,
         entries: Vec<vst_audio_protocol::Parameter>,
+    },
+    EditorStatus {
+        request: RequestId,
+        status: vst_audio_protocol::EditorStatus,
+    },
+    EditorImage {
+        request: RequestId,
+        image: vst_audio_protocol::EditorImage,
     },
     EditorClosed,
     ParametersChanged,

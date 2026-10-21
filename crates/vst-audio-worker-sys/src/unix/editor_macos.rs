@@ -27,6 +27,7 @@ pub struct EditorWindow {
     window: Retained<NSWindow>,
     view: Retained<NSView>,
     closed: Cell<bool>,
+    hidden: Cell<bool>,
 }
 impl EditorWindow {
     pub fn open(title: &str, width: i32, height: i32) -> io::Result<Self> {
@@ -62,6 +63,7 @@ impl EditorWindow {
                 window,
                 view,
                 closed: Cell::new(false),
+                hidden: Cell::new(false),
             })
         })
     }
@@ -88,7 +90,75 @@ impl EditorWindow {
                 app.sendEvent(&event);
             }
             app.updateWindows();
-            self.closed.get() || !self.window.isVisible()
+            self.closed.get() || (!self.hidden.get() && !self.window.isVisible())
+        })
+    }
+    pub fn show(&self, visible: bool) -> io::Result<()> {
+        self.hidden.set(!visible);
+        if visible {
+            self.window.orderFront(None);
+        } else {
+            self.window.orderOut(None);
+        }
+        Ok(())
+    }
+    pub fn focus(&self) -> io::Result<()> {
+        self.window.makeKeyAndOrderFront(None);
+        self.hidden.set(false);
+        Ok(())
+    }
+    pub fn status(&self) -> io::Result<(bool, u32, u32)> {
+        let rect = self.view.frame();
+        Ok((
+            self.window.isVisible(),
+            rect.size.width as u32,
+            rect.size.height as u32,
+        ))
+    }
+    pub fn capture(&self) -> io::Result<vst_audio_protocol::EditorImage> {
+        let (visible, width, height) = self.status()?;
+        if !visible || width == 0 || height == 0 || width > 2048 || height > 2048 {
+            return Err(io::Error::other("editor is hidden or too large to capture"));
+        }
+        let rect = self.view.bounds();
+        let bitmap = self
+            .view
+            .bitmapImageRepForCachingDisplayInRect(rect)
+            .ok_or_else(|| io::Error::other("view cannot be captured"))?;
+        self.view.cacheDisplayInRect_toBitmapImageRep(rect, &bitmap);
+        let width = bitmap.pixelsWide() as u32;
+        let height = bitmap.pixelsHigh() as u32;
+        if width == 0
+            || height == 0
+            || width > 2048
+            || height > 2048
+            || bitmap.isPlanar()
+            || bitmap.bitsPerSample() != 8
+            || bitmap.samplesPerPixel() != 4
+            || bitmap.bitsPerPixel() != 32
+        {
+            return Err(io::Error::other("unsupported AppKit bitmap format"));
+        }
+        let stride = bitmap.bytesPerRow() as usize;
+        if stride < width as usize * 4 {
+            return Err(io::Error::other("invalid bitmap stride"));
+        }
+        // SAFETY: retained bitmap owns its non-planar allocation for this call.
+        let pointer = bitmap.bitmapData();
+        if pointer.is_null() {
+            return Err(io::Error::other("missing bitmap storage"));
+        }
+        let mut rgba = vec![0; width as usize * height as usize * 4];
+        // SAFETY: AppKit guarantees bytesPerRow * pixelsHigh bytes for this retained bitmap.
+        let bytes = unsafe { std::slice::from_raw_parts(pointer, stride * height as usize) };
+        for y in 0..height as usize {
+            rgba[y * width as usize * 4..(y + 1) * width as usize * 4]
+                .copy_from_slice(&bytes[y * stride..y * stride + width as usize * 4]);
+        }
+        Ok(vst_audio_protocol::EditorImage {
+            width,
+            height,
+            rgba,
         })
     }
     pub fn request_close(&self) -> io::Result<()> {

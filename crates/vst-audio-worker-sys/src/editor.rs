@@ -12,6 +12,15 @@ unsafe extern "system" fn procedure(
 ) -> LRESULT {
     if message == WM_CLOSE {
         // SAFETY: live callback window; hiding defers destruction until effEditClose.
+        // SAFETY: the property is an integer marker and does not own borrowed memory.
+        let _ = unsafe {
+            SetPropW(
+                window,
+                w!("VstAudioClosed"),
+                Some(HANDLE(std::ptr::dangling_mut())),
+            )
+        };
+        // SAFETY: callback window remains live until deferred destruction.
         let _ = unsafe { ShowWindow(window, SW_HIDE) };
         return LRESULT(0);
     }
@@ -97,7 +106,110 @@ impl EditorWindow {
             unsafe { DispatchMessageW(&message) };
         }
         // SAFETY: owned window remains live until Drop.
-        !unsafe { IsWindowVisible(self.window) }.as_bool()
+        unsafe { GetPropW(self.window, w!("VstAudioClosed")) }.0 as usize == 1
+    }
+    pub fn show(&self, visible: bool) -> windows::core::Result<()> {
+        // SAFETY: live window owned by this main thread.
+        let _ = unsafe { ShowWindow(self.window, if visible { SW_SHOW } else { SW_HIDE }) };
+        Ok(())
+    }
+    pub fn focus(&self) -> windows::core::Result<()> {
+        // SAFETY: requesting foreground ownership of this live window; OS may deny it.
+        let _ = unsafe { SetForegroundWindow(self.window) };
+        Ok(())
+    }
+    pub fn status(&self) -> windows::core::Result<(bool, u32, u32)> {
+        let mut rect = RECT::default();
+        // SAFETY: live window and writable output rectangle.
+        unsafe { GetClientRect(self.window, &mut rect) }?;
+        // SAFETY: owned live window.
+        let visible = unsafe { IsWindowVisible(self.window) }.as_bool();
+        Ok((
+            visible,
+            (rect.right - rect.left) as u32,
+            (rect.bottom - rect.top) as u32,
+        ))
+    }
+    pub fn capture(&self) -> windows::core::Result<vst_audio_protocol::EditorImage> {
+        use windows::Win32::Graphics::Gdi::*;
+        let (visible, width, height) = self.status()?;
+        if !visible || width == 0 || height == 0 || width > 2048 || height > 2048 {
+            return Err(windows::core::Error::new(
+                windows::Win32::Foundation::E_FAIL,
+                "editor capture unavailable",
+            ));
+        }
+        // SAFETY: client DC of this owned visible window, released below on every path.
+        let dc = unsafe { GetDC(Some(self.window)) };
+        // SAFETY: compatible memory DC inherits the live client DC's format.
+        let memory = unsafe { CreateCompatibleDC(Some(dc)) };
+        // SAFETY: bounded bitmap sized to validated client area.
+        let bitmap = unsafe { CreateCompatibleBitmap(dc, width as i32, height as i32) };
+        // SAFETY: compatible bitmap selected into the memory DC for the copy.
+        let previous = unsafe { SelectObject(memory, bitmap.into()) };
+        // SAFETY: both DCs are live and the copy is bounded to their client bitmap.
+        let copied = unsafe {
+            BitBlt(
+                memory,
+                0,
+                0,
+                width as i32,
+                height as i32,
+                Some(dc),
+                0,
+                0,
+                SRCCOPY,
+            )
+        };
+        // SAFETY: restore original object before reading or deleting the bitmap.
+        let _ = unsafe { SelectObject(memory, previous) };
+        let mut rgba = vec![0u8; width as usize * height as usize * 4];
+        let mut info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width as i32,
+                biHeight: -(height as i32),
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // SAFETY: output allocation holds exactly height rows of width 32-bit pixels.
+        let rows = unsafe {
+            GetDIBits(
+                dc,
+                bitmap,
+                0,
+                height,
+                Some(rgba.as_mut_ptr().cast()),
+                &mut info,
+                DIB_RGB_COLORS,
+            )
+        };
+        // SAFETY: bitmap deselected, solely owned by this function.
+        let _ = unsafe { DeleteObject(bitmap.into()) };
+        // SAFETY: memory DC has no owned objects selected.
+        let _ = unsafe { DeleteDC(memory) };
+        // SAFETY: release the DC borrowed from this window.
+        let _ = unsafe { ReleaseDC(Some(self.window), dc) };
+        copied?;
+        if rows != height as i32 {
+            return Err(windows::core::Error::new(
+                windows::Win32::Foundation::E_FAIL,
+                "editor capture unavailable",
+            ));
+        }
+        for pixel in rgba.as_chunks_mut::<4>().0 {
+            pixel.swap(0, 2);
+            pixel[3] = 255;
+        }
+        Ok(vst_audio_protocol::EditorImage {
+            width,
+            height,
+            rgba,
+        })
     }
     pub fn request_close(&self) -> windows::core::Result<()> {
         // SAFETY: asynchronous close carries no pointers to borrowed memory.

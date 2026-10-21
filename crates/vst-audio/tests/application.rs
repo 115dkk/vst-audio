@@ -294,3 +294,117 @@ fn cancellation_interrupts_a_hung_state_restore() {
         std::thread::sleep(Duration::from_millis(5));
     }
 }
+
+#[test]
+#[ignore = "native fixtures and display required"]
+fn editor_visibility_focus_scaling_errors_and_pixels_roundtrip() {
+    use vst_audio::EditorAction as A;
+    for format in [PluginFormat::Vst2, PluginFormat::Vst3] {
+        let instance = host()
+            .spawn(&descriptor(format), &Configuration::default(), None)
+            .unwrap();
+        let control = instance.controller();
+        let wait = |request| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(event) = instance.try_next_event() {
+                    let id = match &event {
+                        HostEvent::Completed { request }
+                        | HostEvent::RequestFailed { request, .. }
+                        | HostEvent::EditorStatus { request, .. }
+                        | HostEvent::EditorImage { request, .. } => Some(*request),
+                        _ => None,
+                    };
+                    assert!(
+                        !matches!(event, HostEvent::Failed { .. } | HostEvent::EditorClosed),
+                        "{event:?}"
+                    );
+                    if id == Some(request) {
+                        break event;
+                    }
+                }
+                assert!(Instant::now() < deadline, "editor response timeout");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        assert!(matches!(
+            wait(control.request(Command::OpenEditor).unwrap()),
+            HostEvent::Completed { .. }
+        ));
+        for (action, visible) in [
+            (A::Inspect, true),
+            (A::Hide, false),
+            (A::Show, true),
+            (A::Focus, true),
+        ] {
+            let HostEvent::EditorStatus { status, .. } =
+                wait(control.request(Command::Editor(action)).unwrap())
+            else {
+                panic!("missing editor status")
+            };
+            assert_eq!(status.visible, visible);
+            assert!(status.width > 0 && status.height > 0);
+            std::thread::sleep(Duration::from_millis(80));
+        }
+        if format == PluginFormat::Vst3 {
+            for (action, w, h, scale) in [
+                (
+                    A::Resize {
+                        width: 120,
+                        height: 100,
+                    },
+                    320,
+                    200,
+                    1.0,
+                ),
+                (
+                    A::Resize {
+                        width: 480,
+                        height: 300,
+                    },
+                    480,
+                    300,
+                    1.0,
+                ),
+                (A::Scale(1.5), 480, 300, 1.5),
+            ] {
+                let HostEvent::EditorStatus { status, .. } =
+                    wait(control.request(Command::Editor(action)).unwrap())
+                else {
+                    panic!("missing positive size response")
+                };
+                assert_eq!((status.width, status.height, status.scale), (w, h, scale));
+                assert!(status.resize_supported && status.scale_supported);
+            }
+        } else {
+            assert!(matches!(
+                wait(control.request(Command::Editor(A::Scale(1.5))).unwrap()),
+                HostEvent::RequestFailed { .. }
+            ));
+        }
+        // Unsupported or invalid requests leave the editor and audio instance alive.
+        assert!(matches!(
+            wait(
+                control
+                    .request(Command::Editor(A::Scale(f32::NAN)))
+                    .unwrap()
+            ),
+            HostEvent::RequestFailed { .. }
+        ));
+        let HostEvent::EditorImage { image, .. } =
+            wait(control.request(Command::Editor(A::Capture)).unwrap())
+        else {
+            panic!("missing image")
+        };
+        assert!(image.valid());
+        assert!(image.rgba.iter().any(|b| *b != 0), "capture is empty");
+        let path = std::path::Path::new("../../test-results/editor");
+        std::fs::create_dir_all(path).unwrap();
+        let mut ppm = format!("P6\n{} {}\n255\n", image.width, image.height).into_bytes();
+        for rgba in image.rgba.as_chunks::<4>().0 {
+            ppm.extend_from_slice(&rgba[..3]);
+        }
+        std::fs::write(path.join(format!("{format:?}.ppm")), ppm).unwrap();
+        assert_eq!(instance.status(), Status::Running);
+    }
+}

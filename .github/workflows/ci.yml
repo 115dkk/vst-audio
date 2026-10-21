@@ -52,7 +52,7 @@ jobs:
           mkdir -p test-results
           cp "$HOME"/Library/Logs/DiagnosticReports/* test-results/ 2>/dev/null || true
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: failure()
+        if: always()
         with:
           name: diagnostics-${{ matrix.os }}
           path: |

@@ -180,6 +180,12 @@ impl Plugin for Vst2 {
     fn open_editor(&mut self) -> Result<(), PluginError> {
         self.inner.open_editor().map_err(plugin_error)
     }
+    fn editor_action(
+        &mut self,
+        action: vst_audio_protocol::EditorAction,
+    ) -> Result<vst_audio_protocol::EditorReply, PluginError> {
+        self.inner.editor_action(action).map_err(plugin_error)
+    }
     fn close_editor(&mut self) -> Result<(), PluginError> {
         self.inner.request_editor_close().map_err(plugin_error)
     }
@@ -275,7 +281,8 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
                     let shutdown = matches!(frame.message, Message::Shutdown);
                     let recoverable = matches!(
                         &frame.message,
-                        Message::ListParameters { .. }
+                        Message::Editor(_)
+                            | Message::ListParameters { .. }
                             | Message::SetParameter { .. }
                             | Message::OpenEditor
                             | Message::CloseEditor
@@ -475,6 +482,19 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
                                 .get_state()
                                 .map_err(error)?,
                         }),
+                        Message::Editor(action) => match plugin
+                            .as_mut()
+                            .ok_or_else(|| StartError("Load required".into()))?
+                            .editor_action(action)
+                            .map_err(error)?
+                        {
+                            vst_audio_protocol::EditorReply::Status(s) => {
+                                Ok(Message::EditorStatus(s))
+                            }
+                            vst_audio_protocol::EditorReply::Image(i) => {
+                                Ok(Message::EditorImage(i))
+                            }
+                        },
                         Message::OpenEditor => {
                             plugin
                                 .as_mut()

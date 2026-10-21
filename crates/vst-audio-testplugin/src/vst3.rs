@@ -428,6 +428,8 @@ impl IEditControllerTrait for Matrix {
             return std::ptr::null_mut();
         }
         ComWrapper::new(View {
+            size: std::cell::Cell::new((320, 200)),
+            scale: std::cell::Cell::new(1.0),
             handler: self.handler.borrow().clone(),
         })
         .to_com_ptr::<IPlugView>()
@@ -436,10 +438,12 @@ impl IEditControllerTrait for Matrix {
     }
 }
 struct View {
+    size: std::cell::Cell<(i32, i32)>,
+    scale: std::cell::Cell<f32>,
     handler: Option<ComPtr<IComponentHandler>>,
 }
 impl Class for View {
-    type Interfaces = (IPlugView,);
+    type Interfaces = (IPlugView, IPlugViewContentScaleSupport);
 }
 impl IPlugViewTrait for View {
     unsafe fn isPlatformTypeSupported(&self, platform: FIDString) -> tresult {
@@ -493,13 +497,20 @@ impl IPlugViewTrait for View {
             *rect = ViewRect {
                 left: 0,
                 top: 0,
-                right: 320,
-                bottom: 200,
+                right: self.size.get().0,
+                bottom: self.size.get().1,
             }
         };
         kResultOk
     }
-    unsafe fn onSize(&self, _: *mut ViewRect) -> tresult {
+    unsafe fn onSize(&self, rect: *mut ViewRect) -> tresult {
+        if rect.is_null() {
+            return kInvalidArgument;
+        }
+        // SAFETY: host supplies a writable SDK rectangle for this callback.
+        let rect = unsafe { *rect };
+        self.size
+            .set((rect.right - rect.left, rect.bottom - rect.top));
         kResultOk
     }
     unsafe fn onFocus(&self, _: TBool) -> tresult {
@@ -517,9 +528,25 @@ impl IPlugViewTrait for View {
         kResultOk
     }
     unsafe fn canResize(&self) -> tresult {
-        kResultFalse
+        kResultTrue
     }
-    unsafe fn checkSizeConstraint(&self, _: *mut ViewRect) -> tresult {
+    unsafe fn checkSizeConstraint(&self, rect: *mut ViewRect) -> tresult {
+        if rect.is_null() {
+            return kInvalidArgument;
+        }
+        // SAFETY: caller passes a live writable rectangle for size negotiation.
+        let rect = unsafe { &mut *rect };
+        rect.right = rect.right.max(rect.left + 320);
+        rect.bottom = rect.bottom.max(rect.top + 200);
+        kResultOk
+    }
+}
+impl IPlugViewContentScaleSupportTrait for View {
+    unsafe fn setContentScaleFactor(&self, scale: f32) -> tresult {
+        if !scale.is_finite() || scale <= 0.0 {
+            return kInvalidArgument;
+        }
+        self.scale.set(scale);
         kResultOk
     }
 }
