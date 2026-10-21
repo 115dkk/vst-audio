@@ -1,0 +1,276 @@
+#![allow(unsafe_code)]
+//! VST2 event/time ABI. MIDI list and time layout also checked against DPF
+//! DistrhoPluginVST2.cpp at 4238e1c7f0351bbe488d79f0899c540543ac7583 (ISC).
+//! Copyright (C) 2012-2024 Filipe Coelho. Permission to use, copy, modify and/or
+//! distribute for any purpose with or without fee is granted provided this
+//! notice appears in all copies. THE SOFTWARE IS PROVIDED "AS IS" WITHOUT ANY
+//! WARRANTY; THE AUTHOR DISCLAIMS LIABILITY FOR ANY DAMAGES ARISING FROM USE.
+use crate::vst2::AEffect;
+use std::{
+    cell::UnsafeCell,
+    ffi::c_void,
+    sync::atomic::{AtomicU32, AtomicU64, Ordering},
+};
+use vst_audio_ring::{Event, EventBuffer, EventData, MAX_EVENTS, MAX_SYSEX_BYTES, Transport};
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MidiEvent {
+    pub kind: i32,
+    pub size: i32,
+    pub offset: i32,
+    pub flags: i32,
+    pub note_length: i32,
+    pub note_offset: i32,
+    pub data: [u8; 4],
+    pub detune: i8,
+    pub note_off_velocity: u8,
+    pub reserved: [u8; 2],
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct SysExEvent {
+    pub kind: i32,
+    pub size: i32,
+    pub offset: i32,
+    pub flags: i32,
+    pub dump_bytes: i32,
+    pub reserved1: isize,
+    pub data: *mut u8,
+    pub reserved2: isize,
+}
+impl Default for SysExEvent {
+    fn default() -> Self {
+        Self {
+            kind: 6,
+            size: size_of::<Self>() as i32,
+            offset: 0,
+            flags: 0,
+            dump_bytes: 0,
+            reserved1: 0,
+            data: std::ptr::null_mut(),
+            reserved2: 0,
+        }
+    }
+}
+#[repr(C)]
+#[derive(Debug)]
+pub struct Events<const N: usize> {
+    pub count: i32,
+    pub reserved: isize,
+    pub events: [*const c_void; N],
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TimeInfo {
+    pub sample_position: f64,
+    pub sample_rate: f64,
+    pub nanos: f64,
+    pub ppq: f64,
+    pub tempo: f64,
+    pub bar: f64,
+    pub cycle_start: f64,
+    pub cycle_end: f64,
+    pub numerator: i32,
+    pub denominator: i32,
+    pub smpte_offset: i32,
+    pub smpte_rate: i32,
+    pub samples_to_clock: i32,
+    pub flags: i32,
+}
+thread_local! {
+    static TIME: UnsafeCell<TimeInfo> = const { UnsafeCell::new(TimeInfo { sample_position:0.0, sample_rate:0.0, nanos:0.0, ppq:0.0, tempo:0.0, bar:0.0, cycle_start:0.0, cycle_end:0.0, numerator:0, denominator:0, smpte_offset:0, smpte_rate:0, samples_to_clock:0, flags:0 }) };
+}
+#[derive(Debug)]
+pub struct CallbackEvents {
+    pub output: crossbeam_queue::ArrayQueue<Event>,
+    pub dropped: AtomicU32,
+    pub base: AtomicU32,
+    time: [AtomicU64; 10],
+}
+impl Default for CallbackEvents {
+    fn default() -> Self {
+        Self {
+            output: crossbeam_queue::ArrayQueue::new(MAX_EVENTS),
+            dropped: AtomicU32::new(0),
+            base: AtomicU32::new(0),
+            time: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
+}
+impl CallbackEvents {
+    pub fn context(&self, context: Transport, rate: u32, base: usize) {
+        self.base.store(base as u32, Ordering::Relaxed);
+        let flags = 0x3e00
+            | if context.playing { 2 } else { 0 }
+            | if context.cycling { 4 } else { 0 }
+            | if context.recording { 8 } else { 0 };
+        let values = [
+            (context.sample_position as f64).to_bits(),
+            f64::from(rate).to_bits(),
+            context.ppq_position.to_bits(),
+            context.tempo.to_bits(),
+            context.bar_start.to_bits(),
+            context.cycle_start.to_bits(),
+            context.cycle_end.to_bits(),
+            u64::from(context.numerator),
+            u64::from(context.denominator),
+            flags,
+        ];
+        for (to, from) in self.time.iter().zip(values) {
+            to.store(from, Ordering::Relaxed);
+        }
+    }
+    pub fn time_pointer(&self) -> isize {
+        TIME.with(|cell| {
+            let f = |i: usize| f64::from_bits(self.time[i].load(Ordering::Relaxed));
+            let value = TimeInfo {
+                sample_position: f(0),
+                sample_rate: f(1),
+                ppq: f(2),
+                tempo: f(3),
+                bar: f(4),
+                cycle_start: f(5),
+                cycle_end: f(6),
+                numerator: self.time[7].load(Ordering::Relaxed) as i32,
+                denominator: self.time[8].load(Ordering::Relaxed) as i32,
+                flags: self.time[9].load(Ordering::Relaxed) as i32,
+                ..TimeInfo::default()
+            };
+            // SAFETY: thread-local plain value, accessed only in this callback;
+            // VST time pointers are valid until the next getTime call on the thread.
+            unsafe { cell.get().write(value) };
+            cell.get() as isize
+        })
+    }
+    /// # Safety
+    /// `pointer` must be a live VST2 event list with its count of readable event
+    /// pointers; MIDI/SysEx payloads must remain readable throughout this call.
+    pub unsafe fn receive(&self, pointer: *mut c_void) -> isize {
+        if pointer.is_null() {
+            return 0;
+        }
+        // SAFETY: VST processEvents provides a readable list header.
+        let list = unsafe { &*pointer.cast::<Events<0>>() };
+        if !(0..=MAX_EVENTS as i32).contains(&list.count) {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            return 0;
+        }
+        // SAFETY: the ABI list stores count inline pointers after the aligned header.
+        let pointers = unsafe {
+            std::slice::from_raw_parts(
+                std::ptr::addr_of!(list.events).cast::<*const c_void>(),
+                list.count as usize,
+            )
+        };
+        for pointer in pointers {
+            if pointer.is_null() {
+                continue;
+            }
+            // SAFETY: each event has the common 16-byte header, live during callback.
+            let kind = unsafe { *pointer.cast::<i32>() };
+            let event = match kind {
+                1 => {
+                    // SAFETY: MIDI event tag denotes the fixed MIDI layout.
+                    let raw = unsafe { &*pointer.cast::<MidiEvent>() };
+                    if raw.offset < 0 || raw.size < 24 {
+                        self.dropped.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    Event::midi(
+                        (raw.offset as u32).saturating_add(self.base.load(Ordering::Relaxed)),
+                        0,
+                        [raw.data[0], raw.data[1], raw.data[2]],
+                    )
+                }
+                6 => {
+                    // SAFETY: SysEx event tag denotes the pointer-bearing SysEx layout.
+                    let raw = unsafe { &*pointer.cast::<SysExEvent>() };
+                    if raw.offset < 0
+                        || raw.dump_bytes <= 0
+                        || raw.dump_bytes as usize > MAX_SYSEX_BYTES
+                        || raw.data.is_null()
+                    {
+                        self.dropped.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    let mut bytes = [0; MAX_SYSEX_BYTES];
+                    // SAFETY: callback supplies dump_bytes readable bytes; copy before returning.
+                    bytes[..raw.dump_bytes as usize].copy_from_slice(unsafe {
+                        std::slice::from_raw_parts(raw.data, raw.dump_bytes as usize)
+                    });
+                    Event {
+                        sample_offset: (raw.offset as u32)
+                            .saturating_add(self.base.load(Ordering::Relaxed)),
+                        bus: 0,
+                        data: EventData::SysEx {
+                            len: raw.dump_bytes as u16,
+                            bytes,
+                        },
+                    }
+                }
+                _ => {
+                    self.dropped.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+            };
+            if self.output.push(event).is_err() {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        1
+    }
+    pub fn drain(&self, output: &mut EventBuffer, frames: usize) {
+        for _ in 0..MAX_EVENTS {
+            let Some(event) = self.output.pop() else {
+                break;
+            };
+            if event.valid(frames as u32) {
+                output.push(event);
+            } else {
+                output.dropped = output.dropped.saturating_add(1);
+            }
+        }
+        output.dropped = output
+            .dropped
+            .saturating_add(self.dropped.swap(0, Ordering::Relaxed));
+    }
+}
+
+pub(crate) trait Sample: Copy {
+    const DOUBLE: bool;
+    unsafe fn invoke(
+        effect: *mut AEffect,
+        inputs: *const *const Self,
+        outputs: *mut *mut Self,
+        frames: i32,
+    );
+}
+impl Sample for f32 {
+    const DOUBLE: bool = false;
+    unsafe fn invoke(
+        effect: *mut AEffect,
+        inputs: *const *const Self,
+        outputs: *mut *mut Self,
+        frames: i32,
+    ) {
+        // SAFETY: active plugin effect, selected f32 entry validated at configuration.
+        let process = unsafe { (*effect).process_replacing }.expect("configured f32 entry");
+        // SAFETY: processor supplies bounded live buffers with the configured channel counts.
+        unsafe { process(effect, inputs, outputs, frames) };
+    }
+}
+impl Sample for f64 {
+    const DOUBLE: bool = true;
+    unsafe fn invoke(
+        effect: *mut AEffect,
+        inputs: *const *const Self,
+        outputs: *mut *mut Self,
+        frames: i32,
+    ) {
+        // SAFETY: active plugin effect, selected f64 entry validated at configuration.
+        let process = unsafe { (*effect).process_double }.expect("configured f64 entry");
+        // SAFETY: processor supplies bounded live buffers with the configured channel counts.
+        unsafe { process(effect, inputs, outputs, frames) };
+    }
+}

@@ -54,6 +54,7 @@ pub const ARR_51: i32 = 15;
 
 pub type Callback = unsafe extern "C" fn(*mut AEffect, i32, i32, isize, *mut c_void, f32) -> isize;
 pub type Process = unsafe extern "C" fn(*mut AEffect, *const *const f32, *mut *mut f32, i32);
+pub type Process64 = unsafe extern "C" fn(*mut AEffect, *const *const f64, *mut *mut f64, i32);
 pub type SetParameter = unsafe extern "C" fn(*mut AEffect, u32, f32);
 pub type GetParameter = unsafe extern "C" fn(*mut AEffect, u32) -> f32;
 pub type Entry = unsafe extern "C" fn(Callback) -> *mut AEffect;
@@ -82,7 +83,7 @@ pub struct AEffect {
     pub unique_id: i32,
     pub version: i32,
     pub process_replacing: Option<Process>,
-    pub process_double: *mut c_void,
+    pub process_double: Option<Process64>,
     pub future: [u8; 56],
 }
 impl Default for AEffect {
@@ -109,7 +110,7 @@ impl Default for AEffect {
             unique_id: 0,
             version: 0,
             process_replacing: None,
-            process_double: std::ptr::null_mut(),
+            process_double: None,
             future: [0; 56],
         }
     }

@@ -1,5 +1,5 @@
 //! Application-side process proxy. Never calls a plugin ABI.
-use crate::{layout::main_bus, watch::ControlWatch};
+use crate::watch::ControlWatch;
 use std::{
     ffi::OsString,
     io::{Read, Write},
@@ -15,6 +15,7 @@ use vst_audio_protocol::{
     Action, ClassInfo, CodecError, DecodedFrame, Frame, Message, PluginFormat, RequestKind,
     read_frame, write_frame,
 };
+use vst_audio_protocol::{BusConfiguration, Capabilities, ProcessingSetup, SampleFormat};
 use vst_audio_ring::{Geometry, Producer, Publisher, Signal, Waited};
 use vst_audio_transport_sys::{
     Event, SharedRegion,
@@ -101,6 +102,38 @@ impl Transport {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct ProcessingOptions {
+    pub sample_rate: u32,
+    pub quantum: u32,
+    pub sample_format: SampleFormat,
+    pub offline: bool,
+    pub inputs: Option<Vec<BusConfiguration>>,
+    pub outputs: Option<Vec<BusConfiguration>>,
+}
+impl Default for ProcessingOptions {
+    fn default() -> Self {
+        Self {
+            sample_rate: 48000,
+            quantum: 128,
+            sample_format: SampleFormat::F32,
+            offline: false,
+            inputs: None,
+            outputs: None,
+        }
+    }
+}
+fn speaker_bits(buses: &[BusConfiguration]) -> Vec<u32> {
+    buses
+        .iter()
+        .filter(|b| b.active)
+        .flat_map(|b| {
+            crate::layout::wave_bits(b.layout.arrangement)
+                .unwrap_or_else(|_| vec![0; usize::from(b.layout.channels)])
+        })
+        .collect()
+}
+
 /// A host that loaded, configured and activated its plugin, with the ring it
 /// marked Ready.
 ///
@@ -111,6 +144,8 @@ impl Transport {
 /// announced the header is gone by the time this is returned.
 #[derive(Debug)]
 pub struct Started {
+    pub setup: ProcessingSetup,
+    pub capabilities: Capabilities,
     pub region: Arc<SharedRegion>,
     pub work: Arc<Event>,
     pub done: Arc<Event>,
@@ -339,11 +374,35 @@ impl PluginProcess {
         frames: u32,
         state: Option<&[u8]>,
     ) -> Result<Started, StartError> {
+        Self::start_configured(
+            exe,
+            plugin,
+            format,
+            class,
+            &ProcessingOptions {
+                sample_rate: rate,
+                quantum: frames,
+                ..Default::default()
+            },
+            state,
+        )
+    }
+    pub fn start_configured(
+        exe: &Path,
+        plugin: &Path,
+        format: PluginFormat,
+        class: Option<[u8; 16]>,
+        options: &ProcessingOptions,
+        state: Option<&[u8]>,
+    ) -> Result<Started, StartError> {
+        let rate = options.sample_rate;
+        let frames = options.quantum;
         let origin = Instant::now();
         let maximum = Geometry {
+            sample_format: options.sample_format,
             lanes: 1,
-            input_channels: 32,
-            output_channels: 32,
+            input_channels: 64,
+            output_channels: 64,
             max_frames: frames,
             sample_rate: rate,
             latency_bound_frames: rate
@@ -379,15 +438,40 @@ impl PluginProcess {
         else {
             return Err(StartError("expected Loaded".into()));
         };
-        let input_wave_bits = main_bus(&inputs, "input").map_err(error)?;
-        let output_wave_bits = main_bus(&outputs, "output").map_err(error)?;
+        transport.send(2, Message::Describe)?;
+        let Message::Features(capabilities) =
+            transport.response(2, Duration::from_secs(10))?.message
+        else {
+            return Err(StartError("expected capabilities".into()));
+        };
+        if options.sample_format == SampleFormat::F64 && !capabilities.f64 {
+            return Err(StartError("plugin does not support f64".into()));
+        }
+        let setup = ProcessingSetup {
+            sample_rate: rate,
+            quantum: frames,
+            sample_format: options.sample_format,
+            offline: options.offline,
+            inputs: options
+                .inputs
+                .clone()
+                .unwrap_or_else(|| inputs.into_iter().map(Into::into).collect()),
+            outputs: options
+                .outputs
+                .clone()
+                .unwrap_or_else(|| outputs.into_iter().map(Into::into).collect()),
+        };
+        if !setup.valid() {
+            return Err(StartError("invalid processing setup".into()));
+        }
+        let input_wave_bits = speaker_bits(&setup.inputs);
+        let output_wave_bits = speaker_bits(&setup.outputs);
         if latency_frames > maximum.latency_bound_frames {
             return Err(StartError("unsupported plugin latency".into()));
         }
-        let in_channels = inputs[0].channels;
         let geometry = Geometry {
-            input_channels: in_channels.into(),
-            output_channels: outputs[0].channels.into(),
+            input_channels: u32::from(ProcessingSetup::channels(&setup.inputs)),
+            output_channels: u32::from(ProcessingSetup::channels(&setup.outputs)),
             ..maximum
         };
         // The producer borrows the mapping and the events only while it
@@ -401,27 +485,19 @@ impl PluginProcess {
             producer
                 .announce(geometry, std::process::id())
                 .map_err(|e| error(format!("{e:?}")))?;
-            transport.send(
-                2,
-                Message::Configure {
-                    rate,
-                    max_frames: geometry.max_frames,
-                    in_channels,
-                    out_channels: outputs[0].channels,
-                },
-            )?;
-            expect_ack(transport.response(2, Duration::from_secs(10))?)?;
+            transport.send(3, Message::Prepare(setup.clone()))?;
+            expect_ack(transport.response(3, Duration::from_secs(10))?)?;
             if let Some(blob) = state {
                 transport.send(
-                    3,
+                    4,
                     Message::SetState {
                         blob: blob.to_vec(),
                     },
                 )?;
-                expect_ack(transport.response(3, Duration::from_secs(10))?)?;
+                expect_ack(transport.response(4, Duration::from_secs(10))?)?;
             }
-            transport.send(4, Message::Activate)?;
-            expect_ack(transport.response(4, Duration::from_secs(10))?)?;
+            transport.send(5, Message::Activate)?;
+            expect_ack(transport.response(5, Duration::from_secs(10))?)?;
             if producer.wait_ready(Duration::from_secs(10)) != Waited::Signalled {
                 return Err(StartError("ring readiness timeout".into()));
             }
@@ -436,7 +512,7 @@ impl PluginProcess {
             region: region.clone(),
             work: work.clone(),
             watch,
-            next_request: 5,
+            next_request: 6,
             origin,
             clock_base: 0,
             exit_seen: false,
@@ -453,6 +529,8 @@ impl PluginProcess {
             return Err(StartError("unsupported configured plugin latency".into()));
         }
         Ok(Started {
+            setup,
+            capabilities,
             region,
             work,
             done,
@@ -481,6 +559,7 @@ impl PluginProcess {
             ));
         }
         let geometry = Geometry {
+            sample_format: vst_audio_ring::SampleFormat::F32,
             lanes: 1,
             input_channels: 2,
             output_channels: 32,

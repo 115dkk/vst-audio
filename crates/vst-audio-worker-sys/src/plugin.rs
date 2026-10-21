@@ -39,6 +39,8 @@ struct CallbackState {
     frames: AtomicU32,
     width: AtomicU32,
     height: AtomicU32,
+    events: crate::vst2_events::CallbackEvents,
+    offline: AtomicBool,
 }
 #[derive(Debug)]
 struct Shared {
@@ -129,6 +131,7 @@ pub struct Vst2Plugin {
     configured: bool,
     parameter_count: u32,
     processor_taken: bool,
+    format: vst_audio_ring::SampleFormat,
     _main: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 #[derive(Debug)]
@@ -137,6 +140,12 @@ pub struct Vst2Processor {
     inputs: usize,
     outputs: usize,
     max_frames: usize,
+    rate: u32,
+    format: vst_audio_ring::SampleFormat,
+    parameter_count: u32,
+    midi: Box<[crate::vst2_events::MidiEvent; vst_audio_ring::MAX_EVENTS]>,
+    sysex: Box<[crate::vst2_events::SysExEvent; vst_audio_ring::MAX_EVENTS]>,
+    sysex_bytes: Box<[[u8; vst_audio_ring::MAX_SYSEX_BYTES]; vst_audio_ring::MAX_EVENTS]>,
 }
 impl Vst2Plugin {
     pub fn load(path: &Path) -> Result<Self, PluginError> {
@@ -156,9 +165,9 @@ impl Vst2Plugin {
         let fields = unsafe { &*effect };
         if fields.magic != MAGIC
             || fields.dispatcher.is_none()
-            || fields.process_replacing.is_none()
-            || !(0..=32).contains(&fields.num_inputs)
-            || !(1..=32).contains(&fields.num_outputs)
+            || (fields.process_replacing.is_none() && fields.process_double.is_none())
+            || !(0..=64).contains(&fields.num_inputs)
+            || !(0..=64).contains(&fields.num_outputs)
             || !(0..=16384).contains(&fields.num_params)
         {
             return Err(PluginError("invalid plugin ABI or channel count".into()));
@@ -180,6 +189,8 @@ impl Vst2Plugin {
                 frames: AtomicU32::new(480),
                 width: AtomicU32::new(0),
                 height: AtomicU32::new(0),
+                events: crate::vst2_events::CallbackEvents::default(),
+                offline: AtomicBool::new(false),
             },
             _library: library,
         });
@@ -232,8 +243,20 @@ impl Vst2Plugin {
             configured: false,
             parameter_count,
             processor_taken: false,
+            format: vst_audio_ring::SampleFormat::F32,
             _main: std::marker::PhantomData,
         })
+    }
+    pub fn capabilities(&self) -> vst_audio_protocol::Capabilities {
+        let control = self.shared.control();
+        vst_audio_protocol::Capabilities {
+            f64: control.effect().process_double.is_some(),
+            input_event_buses: 1,
+            output_event_buses: 1,
+            editor: control.effect().flags & HAS_EDITOR != 0,
+            sysex: true,
+            sample_accurate_parameters: true,
+        }
     }
     pub fn info(&self) -> Info {
         self.info.clone()
@@ -244,6 +267,24 @@ impl Vst2Plugin {
         frames: u32,
         inputs: u16,
         outputs: u16,
+    ) -> Result<(), PluginError> {
+        self.configure_precision(
+            rate,
+            frames,
+            inputs,
+            outputs,
+            vst_audio_ring::SampleFormat::F32,
+            false,
+        )
+    }
+    pub fn configure_precision(
+        &mut self,
+        rate: u32,
+        frames: u32,
+        inputs: u16,
+        outputs: u16,
+        format: vst_audio_ring::SampleFormat,
+        offline: bool,
     ) -> Result<(), PluginError> {
         if self.shared.active.load(Ordering::SeqCst)
             || self.processor_taken
@@ -256,6 +297,25 @@ impl Vst2Plugin {
             return Err(PluginError("unsupported configuration".into()));
         }
         let control = self.shared.control();
+        if (format == vst_audio_ring::SampleFormat::F64
+            && control.effect().process_double.is_none())
+            || (format == vst_audio_ring::SampleFormat::F32
+                && control.effect().process_replacing.is_none())
+        {
+            return Err(PluginError("sample precision unsupported".into()));
+        }
+        self.format = format;
+        self.shared
+            .callback
+            .offline
+            .store(offline, Ordering::Relaxed);
+        control.call(
+            77,
+            0,
+            isize::from(format == vst_audio_ring::SampleFormat::F64),
+            std::ptr::null_mut(),
+            0.0,
+        );
         self.shared.callback.rate.store(rate, Ordering::Relaxed);
         self.shared.callback.frames.store(frames, Ordering::Relaxed);
         control.call(SET_SAMPLE_RATE, 0, 0, std::ptr::null_mut(), rate as f32);
@@ -295,6 +355,16 @@ impl Vst2Plugin {
             inputs: self.info.inputs as usize,
             outputs: self.info.outputs as usize,
             max_frames: self.shared.callback.frames.load(Ordering::Relaxed) as usize,
+            rate: self.shared.callback.rate.load(Ordering::Relaxed),
+            format: self.format,
+            parameter_count: self.parameter_count,
+            midi: Box::new([crate::vst2_events::MidiEvent::default(); vst_audio_ring::MAX_EVENTS]),
+            sysex: Box::new(
+                [crate::vst2_events::SysExEvent::default(); vst_audio_ring::MAX_EVENTS],
+            ),
+            sysex_bytes: Box::new(
+                [[0; vst_audio_ring::MAX_SYSEX_BYTES]; vst_audio_ring::MAX_EVENTS],
+            ),
         })
     }
     pub fn parameters(
@@ -502,45 +572,195 @@ impl Drop for Vst2Plugin {
         self.shared.closed.store(true, Ordering::SeqCst);
     }
 }
+// SAFETY: unique audio owner; pointers in preallocated SysEx records target its
+// owned boxed scratch and are used only during an admitted audio call.
+unsafe impl Send for Vst2Processor {}
 impl Vst2Processor {
     pub fn process(&mut self, planes: &mut [&mut [f32]], frames: usize) -> bool {
-        if planes.len() < self.inputs.max(self.outputs)
+        self.process_block(
+            planes,
+            frames,
+            &vst_audio_ring::Transport::default(),
+            &[],
+            &mut vst_audio_ring::EventBuffer::default(),
+        )
+    }
+    pub fn process_block(
+        &mut self,
+        planes: &mut [&mut [f32]],
+        frames: usize,
+        context: &vst_audio_ring::Transport,
+        input: &[vst_audio_ring::Event],
+        output: &mut vst_audio_ring::EventBuffer,
+    ) -> bool {
+        self.process_inner(planes, frames, context, input, output)
+    }
+    pub fn process_block_f64(
+        &mut self,
+        planes: &mut [&mut [f64]],
+        frames: usize,
+        context: &vst_audio_ring::Transport,
+        input: &[vst_audio_ring::Event],
+        output: &mut vst_audio_ring::EventBuffer,
+    ) -> bool {
+        self.process_inner(planes, frames, context, input, output)
+    }
+    fn process_inner<T: crate::vst2_events::Sample>(
+        &mut self,
+        planes: &mut [&mut [T]],
+        frames: usize,
+        context: &vst_audio_ring::Transport,
+        input: &[vst_audio_ring::Event],
+        output: &mut vst_audio_ring::EventBuffer,
+    ) -> bool {
+        use vst_audio_ring::{EventData, MAX_EVENTS, SampleFormat};
+        output.clear();
+        if T::DOUBLE != (self.format == SampleFormat::F64)
+            || frames == 0
             || frames > self.max_frames
-            || planes.iter().any(|plane| plane.len() < frames)
+            || planes.len() < self.inputs.max(self.outputs)
+            || planes.iter().any(|p| p.len() < frames)
+            || !context.valid()
+            || input.len() > MAX_EVENTS
+            || input.iter().any(|e| {
+                !e.valid(frames as u32)
+                    || e.bus != 0
+                    || matches!(e.data, EventData::Parameter {id,..} if id >= self.parameter_count)
+            })
+            || input
+                .windows(2)
+                .any(|p| p[0].sample_offset > p[1].sample_offset)
             || self.shared.closed.load(Ordering::SeqCst)
             || !self.shared.admitted.load(Ordering::SeqCst)
             || self.shared.processing.swap(true, Ordering::SeqCst)
         {
             return false;
         }
-        let mut processed = false;
-        if self.shared.admitted.load(Ordering::SeqCst) && self.shared.active.load(Ordering::SeqCst)
-        {
-            let mut inputs = [std::ptr::null(); 32];
-            let mut outputs = [std::ptr::null_mut(); 32];
-            for (pointer, plane) in inputs.iter_mut().zip(planes.iter()).take(self.inputs) {
-                *pointer = plane.as_ptr();
+        let result = (|| {
+            if !self.shared.admitted.load(Ordering::SeqCst)
+                || !self.shared.active.load(Ordering::SeqCst)
+                || self.shared.closed.load(Ordering::SeqCst)
+            {
+                return false;
             }
-            for (pointer, plane) in outputs.iter_mut().zip(planes.iter_mut()).take(self.outputs) {
-                *pointer = plane.as_mut_ptr();
-            }
-            // SAFETY: processing token excludes control and other processors; instance is live.
-            let process = unsafe { (*self.shared.effect()).process_replacing };
-            if let Some(process) = process {
-                // SAFETY: active instance, valid preallocated pointer arrays and frame bounds.
+            // SAFETY: admission owns the live plugin and serializes all effect access.
+            let dispatch =
+                unsafe { (*self.shared.effect()).dispatcher }.expect("validated dispatcher");
+            // SAFETY: same admitted instance; the optional setter is copied before calls.
+            let set = unsafe { (*self.shared.effect()).set_parameter };
+            let mut base_context = *context;
+            let mut context_origin = 0;
+            let mut start = 0;
+            while start < frames {
+                for event in input.iter().filter(|e| e.sample_offset as usize == start) {
+                    match event.data {
+                        EventData::Parameter { id, value } => {
+                            let Some(set) = set else {
+                                return false;
+                            };
+                            // SAFETY: admitted instance, validated parameter index and normalized value.
+                            unsafe { set(self.shared.effect(), id, value as f32) };
+                        }
+                        EventData::Transport(value) => {
+                            base_context = value;
+                            context_origin = start;
+                        }
+                        _ => {}
+                    }
+                }
+                let end = input
+                    .iter()
+                    .filter(|e| {
+                        e.sample_offset as usize > start
+                            && matches!(
+                                e.data,
+                                EventData::Parameter { .. } | EventData::Transport(_)
+                            )
+                    })
+                    .map(|e| e.sample_offset as usize)
+                    .next()
+                    .unwrap_or(frames);
+                self.shared.callback.events.context(
+                    base_context.advanced(start - context_origin, self.rate),
+                    self.rate,
+                    start,
+                );
+                let mut list = crate::vst2_events::Events::<MAX_EVENTS> {
+                    count: 0,
+                    reserved: 0,
+                    events: [std::ptr::null(); MAX_EVENTS],
+                };
+                for event in input
+                    .iter()
+                    .filter(|e| (start..end).contains(&(e.sample_offset as usize)))
+                {
+                    let i = list.count as usize;
+                    match &event.data {
+                        EventData::Midi([a, b, c]) => {
+                            self.midi[i] = crate::vst2_events::MidiEvent {
+                                kind: 1,
+                                size: size_of::<crate::vst2_events::MidiEvent>() as i32,
+                                offset: event.sample_offset as i32 - start as i32,
+                                data: [*a, *b, *c, 0],
+                                ..Default::default()
+                            };
+                            list.events[i] =
+                                (&self.midi[i] as *const crate::vst2_events::MidiEvent).cast();
+                            list.count += 1;
+                        }
+                        EventData::SysEx { len, bytes } => {
+                            self.sysex_bytes[i].copy_from_slice(bytes);
+                            self.sysex[i] = crate::vst2_events::SysExEvent {
+                                offset: event.sample_offset as i32 - start as i32,
+                                dump_bytes: i32::from(*len),
+                                data: self.sysex_bytes[i].as_mut_ptr(),
+                                ..Default::default()
+                            };
+                            list.events[i] =
+                                (&self.sysex[i] as *const crate::vst2_events::SysExEvent).cast();
+                            list.count += 1;
+                        }
+                        _ => {}
+                    }
+                }
+                if list.count != 0 {
+                    // SAFETY: bounded list points into owned scratch retained through this processing segment.
+                    unsafe {
+                        dispatch(
+                            self.shared.effect(),
+                            25,
+                            0,
+                            0,
+                            (&mut list as *mut crate::vst2_events::Events<MAX_EVENTS>).cast(),
+                            0.0,
+                        )
+                    };
+                }
+                let mut inputs = [std::ptr::null(); 64];
+                let mut outputs = [std::ptr::null_mut(); 64];
+                for (pointer, plane) in inputs.iter_mut().zip(planes.iter()).take(self.inputs) {
+                    *pointer = plane.as_ptr().wrapping_add(start);
+                }
+                for (pointer, plane) in outputs.iter_mut().zip(planes.iter_mut()).take(self.outputs)
+                {
+                    *pointer = plane.as_mut_ptr().wrapping_add(start);
+                }
+                // SAFETY: precision was configured, pointers cover every declared channel and the bounded segment.
                 unsafe {
-                    process(
+                    T::invoke(
                         self.shared.effect(),
                         inputs.as_ptr(),
                         outputs.as_mut_ptr(),
-                        frames as i32,
+                        (end - start) as i32,
                     )
                 };
-                processed = true;
+                self.shared.callback.events.drain(output, frames);
+                start = end;
             }
-        }
+            true
+        })();
         self.shared.processing.store(false, Ordering::SeqCst);
-        processed
+        result
     }
 }
 
@@ -575,6 +795,18 @@ unsafe extern "C" fn callback(
     // SAFETY: host installed a stable CallbackState before effOpen and retains it through effClose.
     let state = unsafe { &*state };
     match opcode {
+        7 => state.events.time_pointer(),
+        8 => {
+            // SAFETY: host processEvents callback supplies a live VST2 event list.
+            unsafe { state.events.receive(pointer) }
+        }
+        23 => {
+            if state.offline.load(Ordering::Relaxed) {
+                4
+            } else {
+                2
+            }
+        }
         MASTER_SAMPLE_RATE => state.rate.load(Ordering::Relaxed) as isize,
         MASTER_BLOCK_SIZE => state.frames.load(Ordering::Relaxed) as isize,
         MASTER_AUTOMATE => {

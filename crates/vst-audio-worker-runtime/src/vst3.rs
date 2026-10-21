@@ -1,5 +1,5 @@
 //! Safe VST 3 adapter; all foreign calls live in vst-audio-worker-sys.
-use crate::{Bus, Plugin, PluginError, PluginEvents, PluginInfo, Processor, state};
+use crate::{Plugin, PluginError, PluginEvents, PluginInfo, Processor, state};
 use std::path::Path;
 use vst_audio_worker_sys::vst3::{Vst3Plugin, Vst3Processor};
 fn error(error: impl std::fmt::Display) -> PluginError {
@@ -25,6 +25,26 @@ impl Processor for Audio {
     fn process(&mut self, planes: &mut [&mut [f32]], frames: usize) -> bool {
         self.0.process(planes, frames)
     }
+    fn process_block(
+        &mut self,
+        p: &mut [&mut [f32]],
+        f: usize,
+        c: &vst_audio_ring::Transport,
+        i: &[vst_audio_ring::Event],
+        o: &mut vst_audio_ring::EventBuffer,
+    ) -> bool {
+        self.0.process_block(p, f, c, i, o)
+    }
+    fn process_block_f64(
+        &mut self,
+        p: &mut [&mut [f64]],
+        f: usize,
+        c: &vst_audio_ring::Transport,
+        i: &[vst_audio_ring::Event],
+        o: &mut vst_audio_ring::EventBuffer,
+    ) -> bool {
+        self.0.process_block_f64(p, f, c, i, o)
+    }
     fn stop(&mut self) {
         self.0.stop();
     }
@@ -36,14 +56,8 @@ impl Plugin for Vst3 {
             name: info.class.name,
             vendor: info.class.vendor,
             latency_frames: info.latency,
-            inputs: vec![Bus {
-                channels: info.inputs,
-                arrangement: info.input,
-            }],
-            outputs: vec![Bus {
-                channels: info.outputs,
-                arrangement: info.output,
-            }],
+            inputs: info.input_buses,
+            outputs: info.output_buses,
         }
     }
     fn configure(
@@ -56,6 +70,15 @@ impl Plugin for Vst3 {
         self.inner
             .configure(rate, frames, inputs, outputs)
             .map_err(error)
+    }
+    fn configure_audio(
+        &mut self,
+        setup: &vst_audio_protocol::ProcessingSetup,
+    ) -> Result<(), PluginError> {
+        self.inner.configure_audio(setup).map_err(error)
+    }
+    fn capabilities(&self) -> vst_audio_protocol::Capabilities {
+        self.inner.capabilities()
     }
     fn activate(&mut self) -> Result<(), PluginError> {
         self.inner.activate().map_err(error)

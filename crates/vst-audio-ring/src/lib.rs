@@ -43,8 +43,24 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+pub mod events;
+use events::{CONTEXT_WORDS, EVENT_WORDS, METADATA_WORDS, PACKET_WORDS};
+pub use events::{Event, EventBuffer, EventData, MAX_EVENTS, MAX_SYSEX_BYTES, Transport};
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(u32)]
+pub enum SampleFormat {
+    #[default]
+    F32 = 0,
+    F64 = 1,
+}
+impl SampleFormat {
+    pub fn words(self) -> usize {
+        if self == Self::F64 { 2 } else { 1 }
+    }
+}
+
 pub const MAGIC: u32 = u32::from_le_bytes(*b"SSRR");
-pub const LAYOUT_VERSION: u32 = 1;
+pub const LAYOUT_VERSION: u32 = 2;
 pub const HEADER_BYTES: usize = 512;
 pub const CACHE_LINE: usize = 64;
 pub const MAX_CHANNELS: u32 = 64;
@@ -67,6 +83,7 @@ const STATE_I: usize = 9;
 const FAULT_I: usize = 10;
 const PRODUCER_PID_I: usize = 11;
 const CONSUMER_PID_I: usize = 12;
+const FORMAT_I: usize = 13;
 const LANE_GEOMETRY_I: usize = 16;
 const SEQUENCE_I: usize = 32;
 const COMPLETED_I: usize = 48;
@@ -105,6 +122,7 @@ pub enum Fault {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Geometry {
+    pub sample_format: SampleFormat,
     pub lanes: u32,
     pub input_channels: u32,
     pub output_channels: u32,
@@ -119,9 +137,6 @@ impl Geometry {
             return Err(GeometryError::LaneCount);
         }
         if self.input_channels > MAX_CHANNELS || self.output_channels > MAX_CHANNELS {
-            return Err(GeometryError::Channels);
-        }
-        if self.input_channels == 0 && self.output_channels == 0 {
             return Err(GeometryError::Channels);
         }
         if !(1..=MAX_FRAMES).contains(&self.max_frames) {
@@ -176,7 +191,13 @@ fn round_up(value: usize, alignment: usize) -> Option<usize> {
 }
 
 fn layout(geometry: Geometry) -> Option<Layout> {
-    let slot_bytes = round_up(geometry.samples_per_slot().checked_mul(4)?, CACHE_LINE)?;
+    let audio_words = geometry
+        .samples_per_slot()
+        .checked_mul(geometry.sample_format.words())?;
+    let slot_bytes = round_up(
+        audio_words.checked_add(METADATA_WORDS)?.checked_mul(4)?,
+        CACHE_LINE,
+    )?;
     let mut offset = HEADER_BYTES;
     let mut slot_offsets = [[0; 2]; 2];
     for lane_slots in slot_offsets.iter_mut().take(geometry.lanes as usize) {
@@ -445,17 +466,25 @@ impl Publisher {
             return Publish::Dropped;
         }
         let offset = self.layout.slot_offsets[lane][sequence as usize & 1] / 4;
-        let Some(samples) = region
-            .words32
-            .get(offset..offset + self.geometry.samples_per_slot())
-        else {
+        let Some(samples) = region.words32.get(
+            offset..offset + self.geometry.samples_per_slot() * self.geometry.sample_format.words(),
+        ) else {
             return Publish::Dropped;
         };
+        let meta_offset =
+            offset + self.geometry.samples_per_slot() * self.geometry.sample_format.words();
+        let metadata = &region.words32[meta_offset..meta_offset + METADATA_WORDS];
         let mut writer = SlotWriter {
             samples,
+            metadata,
+            format: self.geometry.sample_format,
             frames: self.geometry.max_frames as usize,
             planes: self.geometry.planes(),
         };
+        writer.set_transport(Transport::default());
+        writer.set_events(&[]);
+        metadata[CONTEXT_WORDS + PACKET_WORDS].store(0, Ordering::Relaxed);
+        metadata[CONTEXT_WORDS + PACKET_WORDS + 1].store(0, Ordering::Relaxed);
         write(&mut writer);
         region.store32(SEQUENCE_I + lane, sequence.to_le(), Ordering::Release);
         if let Some(signal) = work {
@@ -475,14 +504,17 @@ impl Publisher {
             return false;
         }
         let offset = self.layout.slot_offsets[lane][sequence as usize & 1] / 4;
-        let Some(samples) = region
-            .words32
-            .get(offset..offset + self.geometry.samples_per_slot())
-        else {
+        let Some(samples) = region.words32.get(
+            offset..offset + self.geometry.samples_per_slot() * self.geometry.sample_format.words(),
+        ) else {
             return false;
         };
+        let meta_offset =
+            offset + self.geometry.samples_per_slot() * self.geometry.sample_format.words();
         read(SlotReader {
             samples,
+            metadata: &region.words32[meta_offset..meta_offset + METADATA_WORDS],
+            format: self.geometry.sample_format,
             frames: self.geometry.max_frames as usize,
             planes: self.geometry.planes(),
         });
@@ -543,6 +575,7 @@ impl<'a> Producer<'a> {
             (OUTPUTS_I, geometry.output_channels),
             (FRAMES_I, geometry.max_frames),
             (RATE_I, geometry.sample_rate),
+            (FORMAT_I, geometry.sample_format as u32),
             (LATENCY_I, geometry.latency_bound_frames),
             (PRODUCER_PID_I, producer_pid),
         ];
@@ -637,6 +670,8 @@ impl<'a> Producer<'a> {
 
 #[derive(Debug)]
 pub struct SlotWriter<'a> {
+    metadata: &'a [AtomicU32],
+    format: SampleFormat,
     samples: &'a [AtomicU32],
     frames: usize,
     planes: usize,
@@ -652,11 +687,37 @@ impl SlotWriter<'_> {
     }
 
     pub fn write(&mut self, plane: usize, frame: usize, sample: f32) {
-        self.samples[plane * self.frames + frame].store(sample.to_bits(), Ordering::Relaxed);
+        self.write_f64(plane, frame, f64::from(sample));
     }
 
+    pub fn write_f64(&mut self, plane: usize, frame: usize, sample: f64) {
+        let index = (plane * self.frames + frame) * self.format.words();
+        if self.format == SampleFormat::F64 {
+            self.samples[index].store((sample.to_bits() as u32).to_le(), Ordering::Relaxed);
+            self.samples[index + 1]
+                .store(((sample.to_bits() >> 32) as u32).to_le(), Ordering::Relaxed);
+        } else {
+            self.samples[index].store((sample as f32).to_bits().to_le(), Ordering::Relaxed);
+        }
+    }
+    pub fn set_transport(&mut self, transport: Transport) {
+        for (to, from) in self.metadata.iter().zip(transport.words()) {
+            to.store(from.to_le(), Ordering::Relaxed);
+        }
+    }
+    pub fn set_events(&mut self, events: &[Event]) -> bool {
+        if events.len() > MAX_EVENTS || events.iter().any(|e| !e.valid(self.frames as u32)) {
+            return false;
+        }
+        store_packet(
+            &self.metadata[CONTEXT_WORDS..CONTEXT_WORDS + PACKET_WORDS],
+            events,
+            0,
+        );
+        true
+    }
     pub fn copy_from(&mut self, samples: &[f32]) -> bool {
-        if samples.len() != self.samples.len() {
+        if self.format != SampleFormat::F32 || samples.len() != self.samples.len() {
             return false;
         }
         for (destination, sample) in self.samples.iter().zip(samples) {
@@ -668,6 +729,8 @@ impl SlotWriter<'_> {
 
 #[derive(Clone, Copy, Debug)]
 pub struct SlotReader<'a> {
+    metadata: &'a [AtomicU32],
+    format: SampleFormat,
     samples: &'a [AtomicU32],
     frames: usize,
     planes: usize,
@@ -683,11 +746,28 @@ impl SlotReader<'_> {
     }
 
     pub fn read(self, plane: usize, frame: usize) -> f32 {
-        f32::from_bits(self.samples[plane * self.frames + frame].load(Ordering::Relaxed))
+        self.read_f64(plane, frame) as f32
     }
 
+    pub fn read_f64(self, plane: usize, frame: usize) -> f64 {
+        let index = (plane * self.frames + frame) * self.format.words();
+        let lo = u32::from_le(self.samples[index].load(Ordering::Relaxed));
+        if self.format == SampleFormat::F64 {
+            let hi = u32::from_le(self.samples[index + 1].load(Ordering::Relaxed));
+            f64::from_bits(u64::from(lo) | (u64::from(hi) << 32))
+        } else {
+            f64::from(f32::from_bits(lo))
+        }
+    }
+    pub fn output_events(self, events: &mut EventBuffer) -> bool {
+        load_packet(
+            &self.metadata[CONTEXT_WORDS + PACKET_WORDS..],
+            self.frames as u32,
+            events,
+        )
+    }
     pub fn copy_to(self, samples: &mut [f32]) -> bool {
-        if samples.len() != self.samples.len() {
+        if self.format != SampleFormat::F32 || samples.len() != self.samples.len() {
             return false;
         }
         for (destination, sample) in samples.iter_mut().zip(self.samples) {
@@ -695,6 +775,36 @@ impl SlotReader<'_> {
         }
         true
     }
+}
+
+fn store_packet(words: &[AtomicU32], events: &[Event], dropped: u32) {
+    words[0].store((events.len() as u32).to_le(), Ordering::Relaxed);
+    words[1].store(dropped.to_le(), Ordering::Relaxed);
+    for (target, event) in words[2..].as_chunks::<EVENT_WORDS>().0.iter().zip(events) {
+        for (to, from) in target.iter().zip(event.words()) {
+            to.store(from.to_le(), Ordering::Relaxed);
+        }
+    }
+}
+fn load_packet(words: &[AtomicU32], frames: u32, events: &mut EventBuffer) -> bool {
+    events.clear();
+    let count = u32::from_le(words[0].load(Ordering::Relaxed)) as usize;
+    if count > MAX_EVENTS {
+        return false;
+    }
+    events.dropped = u32::from_le(words[1].load(Ordering::Relaxed));
+    for source in words[2..].as_chunks::<EVENT_WORDS>().0.iter().take(count) {
+        let mut values = [0; EVENT_WORDS];
+        for (to, from) in values.iter_mut().zip(source) {
+            *to = u32::from_le(from.load(Ordering::Relaxed));
+        }
+        let Some(event) = Event::from_words(&values, frames) else {
+            events.clear();
+            return false;
+        };
+        events.push(event);
+    }
+    true
 }
 
 pub struct Consumer<'a> {
@@ -776,7 +886,10 @@ impl<'a> Consumer<'a> {
         let Some((geometry, layout)) = self.geometry.zip(self.layout) else {
             return false;
         };
-        if lane >= geometry.lanes as usize || buffer.len() != geometry.samples_per_slot() {
+        if geometry.sample_format != SampleFormat::F32
+            || lane >= geometry.lanes as usize
+            || buffer.len() != geometry.samples_per_slot()
+        {
             return false;
         }
         let offset = layout.slot_offsets[lane][sequence as usize & 1] / 4;
@@ -788,6 +901,93 @@ impl<'a> Consumer<'a> {
         for (destination, sample) in samples.iter().zip(buffer) {
             destination.store(sample.to_bits(), Ordering::Relaxed);
         }
+        true
+    }
+
+    pub fn slot_mut_f64<F>(
+        &self,
+        lane: usize,
+        sequence: u32,
+        buffer: &mut [f64],
+        process: F,
+    ) -> bool
+    where
+        F: FnOnce(&mut [f64]),
+    {
+        let Some((geometry, layout)) = self.geometry.zip(self.layout) else {
+            return false;
+        };
+        if geometry.sample_format != SampleFormat::F64
+            || lane >= geometry.lanes as usize
+            || buffer.len() != geometry.samples_per_slot()
+        {
+            return false;
+        }
+        let offset = layout.slot_offsets[lane][sequence as usize & 1] / 4;
+        let samples = &self.region.words32[offset..offset + buffer.len() * 2];
+        for (to, from) in buffer.iter_mut().zip(samples.as_chunks::<2>().0.iter()) {
+            *to = f64::from_bits(
+                u64::from(u32::from_le(from[0].load(Ordering::Relaxed)))
+                    | (u64::from(u32::from_le(from[1].load(Ordering::Relaxed))) << 32),
+            );
+        }
+        process(buffer);
+        for (to, from) in samples.as_chunks::<2>().0.iter().zip(buffer) {
+            to[0].store((from.to_bits() as u32).to_le(), Ordering::Relaxed);
+            to[1].store(((from.to_bits() >> 32) as u32).to_le(), Ordering::Relaxed);
+        }
+        true
+    }
+    fn metadata(&self, lane: usize, sequence: u32) -> Option<&[AtomicU32]> {
+        let geometry = self.geometry?;
+        let layout = self.layout?;
+        if lane >= geometry.lanes as usize {
+            return None;
+        }
+        let offset = layout.slot_offsets[lane][sequence as usize & 1] / 4
+            + geometry.samples_per_slot() * geometry.sample_format.words();
+        self.region.words32.get(offset..offset + METADATA_WORDS)
+    }
+    pub fn input_packet(
+        &self,
+        lane: usize,
+        sequence: u32,
+        context: &mut Transport,
+        events: &mut EventBuffer,
+    ) -> bool {
+        let Some(words) = self.metadata(lane, sequence) else {
+            return false;
+        };
+        let mut raw = [0; CONTEXT_WORDS];
+        for (to, from) in raw.iter_mut().zip(words) {
+            *to = u32::from_le(from.load(Ordering::Relaxed));
+        }
+        let Some(value) = Transport::from_words(&raw) else {
+            return false;
+        };
+        *context = value;
+        load_packet(
+            &words[CONTEXT_WORDS..CONTEXT_WORDS + PACKET_WORDS],
+            self.geometry.expect("validated").max_frames,
+            events,
+        )
+    }
+    pub fn output_packet(&self, lane: usize, sequence: u32, events: &EventBuffer) -> bool {
+        let Some(words) = self.metadata(lane, sequence) else {
+            return false;
+        };
+        if events
+            .as_slice()
+            .iter()
+            .any(|e| !e.valid(self.geometry.expect("validated").max_frames))
+        {
+            return false;
+        }
+        store_packet(
+            &words[CONTEXT_WORDS + PACKET_WORDS..],
+            events.as_slice(),
+            events.dropped,
+        );
         true
     }
 
@@ -827,6 +1027,11 @@ fn validate_header(region: Region<'_>) -> Result<Geometry, HeaderError> {
         return Err(HeaderError::State);
     }
     let geometry = Geometry {
+        sample_format: match u32::from_le(region.load32(FORMAT_I, Ordering::Relaxed)) {
+            0 => SampleFormat::F32,
+            1 => SampleFormat::F64,
+            _ => return Err(HeaderError::Version),
+        },
         lanes: u32::from_le(region.load32(LANES_I, Ordering::Relaxed)),
         input_channels: u32::from_le(region.load32(INPUTS_I, Ordering::Relaxed)),
         output_channels: u32::from_le(region.load32(OUTPUTS_I, Ordering::Relaxed)),

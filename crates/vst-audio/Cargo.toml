@@ -13,6 +13,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+rtrb = "0.4"
 vst-audio-ring.workspace = true
 vst-audio-protocol.workspace = true
 thiserror.workspace = true

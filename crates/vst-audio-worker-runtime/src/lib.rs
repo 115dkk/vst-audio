@@ -35,6 +35,20 @@ pub trait Plugin {
         in_channels: u16,
         out_channels: u16,
     ) -> Result<(), PluginError>;
+    fn configure_audio(
+        &mut self,
+        setup: &vst_audio_protocol::ProcessingSetup,
+    ) -> Result<(), PluginError> {
+        self.configure(
+            setup.sample_rate,
+            setup.quantum,
+            vst_audio_protocol::ProcessingSetup::channels(&setup.inputs),
+            vst_audio_protocol::ProcessingSetup::channels(&setup.outputs),
+        )
+    }
+    fn capabilities(&self) -> vst_audio_protocol::Capabilities {
+        vst_audio_protocol::Capabilities::default()
+    }
     fn activate(&mut self) -> Result<(), PluginError>;
     fn deactivate(&mut self);
     /// Transfer the unique audio handle after configuration.
@@ -64,6 +78,26 @@ pub trait Processor: Send {
     /// is closed; the ring must leave this sequence pending and retry on a wake.
     fn process(&mut self, planes: &mut [&mut [f32]], frames: usize) -> bool;
 
+    fn process_block(
+        &mut self,
+        planes: &mut [&mut [f32]],
+        frames: usize,
+        _context: &vst_audio_ring::Transport,
+        _input: &[vst_audio_ring::Event],
+        _output: &mut vst_audio_ring::EventBuffer,
+    ) -> bool {
+        self.process(planes, frames)
+    }
+    fn process_block_f64(
+        &mut self,
+        _planes: &mut [&mut [f64]],
+        _frames: usize,
+        _context: &vst_audio_ring::Transport,
+        _input: &[vst_audio_ring::Event],
+        _output: &mut vst_audio_ring::EventBuffer,
+    ) -> bool {
+        false
+    }
     /// Runs on the audio thread after its last block, before main-thread teardown.
     fn stop(&mut self) {}
 }

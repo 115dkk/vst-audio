@@ -5,7 +5,7 @@ readme.workspace = true
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license = "MIT AND BSD-3-Clause"
+license = "MIT AND BSD-3-Clause AND ISC"
 repository.workspace = true
 publish.workspace = true
 
@@ -21,6 +21,7 @@ missing_safety_doc = "deny"
 dbg_macro = "deny"
 
 [dependencies]
+crossbeam-queue = "0.3"
 vst-audio-protocol.workspace = true
 vst3.workspace = true
 vst-audio-ring.workspace = true

@@ -1,4 +1,5 @@
 //! GUI- and executor-independent application API.
+use crate::audio::{AudioEndpoint, PreparedAudio};
 use crate::{ControlEvent, PluginControl, PluginFormat, PluginProcess, StartError, Started};
 use std::{
     collections::BTreeMap,
@@ -12,8 +13,6 @@ use std::{
     time::Duration,
 };
 use vst_audio_protocol::{Action, Message};
-use vst_audio_ring::{Geometry, Pipeline, Publish, Publisher};
-use vst_audio_transport_sys::{Event, SharedRegion};
 
 /// Application-selected processing settings. No sound device is opened.
 #[derive(Clone, Debug)]
@@ -22,6 +21,10 @@ pub struct Configuration {
     /// Exact number of frames per realtime call.
     pub quantum: u32,
     pub fallback: Fallback,
+    pub sample_format: vst_audio_protocol::SampleFormat,
+    pub offline: bool,
+    pub inputs: Option<Vec<vst_audio_protocol::BusConfiguration>>,
+    pub outputs: Option<Vec<vst_audio_protocol::BusConfiguration>>,
 }
 impl Default for Configuration {
     fn default() -> Self {
@@ -29,6 +32,10 @@ impl Default for Configuration {
             sample_rate: 48_000,
             quantum: 128,
             fallback: Fallback::Silence,
+            sample_format: vst_audio_protocol::SampleFormat::F32,
+            offline: false,
+            inputs: None,
+            outputs: None,
         }
     }
 }
@@ -79,13 +86,20 @@ impl Host {
         config: &Configuration,
         state: Option<&[u8]>,
     ) -> Result<Instance, StartError> {
-        let started = PluginProcess::start_with_frames(
+        let options = crate::ProcessingOptions {
+            sample_rate: config.sample_rate,
+            quantum: config.quantum,
+            sample_format: config.sample_format,
+            offline: config.offline,
+            inputs: config.inputs.clone(),
+            outputs: config.outputs.clone(),
+        };
+        let started = PluginProcess::start_configured(
             &self.worker,
             &plugin.path,
             plugin.format,
             plugin.class_id,
-            config.sample_rate,
-            config.quantum,
+            &options,
             state,
         )?;
         Instance::new(started, config.fallback)
@@ -170,11 +184,12 @@ pub enum Status {
 }
 
 #[derive(Debug)]
-struct Shared {
-    stop: AtomicBool,
-    status: AtomicU8,
+pub(crate) struct Shared {
+    pub(crate) stop: AtomicBool,
+    pub(crate) status: AtomicU8,
     overflow: AtomicBool,
     next_request: AtomicU64,
+    pub(crate) generation: AtomicU64,
 }
 #[derive(Clone, Debug)]
 pub struct Controller {
@@ -231,33 +246,38 @@ impl Instance {
             status: AtomicU8::new(0),
             overflow: AtomicBool::new(false),
             next_request: AtomicU64::new(1),
+            generation: AtomicU64::new(1),
         });
-        let geometry = started.geometry;
-        let latency = geometry
-            .max_frames
-            .checked_add(started.latency_frames)
-            .ok_or_else(|| StartError("latency overflow".into()))? as usize;
-        let audio = AudioEndpoint {
-            region: started.region,
-            work: started.work,
-            publisher: started.publisher,
+        let Started {
+            control,
+            region,
+            work,
+            publisher,
             geometry,
-            latency,
-            fallback,
-            shared: shared.clone(),
-            sequence: 1,
-            block: 0,
-            pipeline: Pipeline::default(),
-            delay: vec![0.0; latency * geometry.output_channels as usize],
-            delay_at: 0,
-            _not_sync: std::marker::PhantomData,
+            latency_frames,
+            setup,
+            capabilities,
+            ..
+        } = started;
+        let prepared = PreparedAudio {
+            region,
+            work,
+            publisher,
+            geometry,
+            latency: latency_frames,
+            setup,
+            capabilities,
+            generation: 1,
         };
+        let (updates, next) = rtrb::RingBuffer::new(2);
+        let (retired, retirements) = rtrb::RingBuffer::new(2);
+        let audio = AudioEndpoint::new(prepared, fallback, shared.clone(), next, retired)?;
         let (requests, rx) = mpsc::sync_channel(8);
         let (tx, events) = mpsc::sync_channel(16);
         let control_shared = shared.clone();
         thread::Builder::new()
             .name("vst-audio-supervisor".into())
-            .spawn(move || supervise(started.control, rx, tx, control_shared))
+            .spawn(move || supervise(control, rx, tx, control_shared, updates, retirements))
             .map_err(|e| StartError(e.to_string()))?;
         Ok(Self {
             controller: Controller { requests, shared },
@@ -304,11 +324,16 @@ fn supervise(
     requests: mpsc::Receiver<(RequestId, Command)>,
     events: mpsc::SyncSender<HostEvent>,
     shared: Arc<Shared>,
+    _updates: rtrb::Producer<PreparedAudio>,
+    mut retirements: rtrb::Consumer<PreparedAudio>,
 ) {
     let mut pending = BTreeMap::new();
     let mut stopping = false;
     let mut failure_reported = false;
     loop {
+        while let Ok(retired) = retirements.pop() {
+            drop(retired);
+        }
         if shared.stop.load(Ordering::Acquire) && !stopping {
             let _ = control.shutdown();
             stopping = true;
@@ -472,112 +497,5 @@ fn supervise(
         }
         // This supervisor never waits on a plugin call or pipe write.
         thread::sleep(Duration::from_millis(5));
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AudioStatus {
-    Processed,
-    Fallback,
-    InvalidBuffer,
-    CounterExhausted,
-}
-
-/// Sole callback owner. Preallocated, nonblocking, no device or GUI dependency.
-/// Drop on a control thread: the last mapping owner may release OS resources.
-#[derive(Debug)]
-pub struct AudioEndpoint {
-    region: Arc<SharedRegion>,
-    work: Arc<Event>,
-    publisher: Publisher,
-    geometry: Geometry,
-    latency: usize,
-    fallback: Fallback,
-    shared: Arc<Shared>,
-    sequence: u32,
-    block: u64,
-    pipeline: Pipeline,
-    delay: Vec<f32>,
-    delay_at: usize,
-    _not_sync: std::marker::PhantomData<std::cell::Cell<()>>,
-}
-impl AudioEndpoint {
-    pub fn geometry(&self) -> Geometry {
-        self.geometry
-    }
-    pub fn latency_frames(&self) -> usize {
-        self.latency
-    }
-    /// Process exactly `geometry.max_frames` planar samples. Invalid output
-    /// shapes are silenced. Called once per audio quantum, with no allocation.
-    pub fn process(&mut self, inputs: &[&[f32]], outputs: &mut [&mut [f32]]) -> AudioStatus {
-        let frames = self.geometry.max_frames as usize;
-        if inputs.len() != self.geometry.input_channels as usize
-            || outputs.len() != self.geometry.output_channels as usize
-            || inputs.iter().any(|p| p.len() != frames)
-            || outputs.iter().any(|p| p.len() != frames)
-        {
-            for output in outputs {
-                output.fill(0.0);
-            }
-            return AudioStatus::InvalidBuffer;
-        }
-        // Always advance the fallback delay, including while plugin audio succeeds.
-        for frame in 0..frames {
-            for (channel, output) in outputs.iter_mut().enumerate() {
-                let index = channel * self.latency + self.delay_at;
-                output[frame] = if self.fallback == Fallback::DelayedInput {
-                    self.delay[index]
-                } else {
-                    0.0
-                };
-                let input = inputs.get(channel).map_or(0.0, |p| p[frame]);
-                self.delay[index] = if input.is_finite() { input } else { 0.0 };
-            }
-            self.delay_at = (self.delay_at + 1) % self.latency;
-        }
-        if self.sequence == u32::MAX || self.block == u64::MAX {
-            return AudioStatus::CounterExhausted;
-        }
-        let view = self.region.region();
-        let completed = self.publisher.completed(view, 0);
-        let mut processed = false;
-        if status(&self.shared) == Status::Running
-            && let Some(sequence) = self.pipeline.output_sequence(self.block, 0, completed)
-        {
-            processed = self.publisher.try_read(view, 0, sequence, |slot| {
-                for (channel, output) in outputs.iter_mut().enumerate() {
-                    for (frame, sample) in output.iter_mut().enumerate() {
-                        let value = slot.read(channel, frame);
-                        *sample = if value.is_finite() { value } else { 0.0 };
-                    }
-                }
-            });
-        }
-        if status(&self.shared) == Status::Running
-            && self
-                .publisher
-                .try_publish(view, 0, self.sequence, Some(&*self.work), |slot| {
-                    for channel in 0..slot.planes() {
-                        for frame in 0..frames {
-                            slot.write(
-                                channel,
-                                frame,
-                                inputs.get(channel).map_or(0.0, |p| p[frame]),
-                            );
-                        }
-                    }
-                })
-                == Publish::Published
-        {
-            self.pipeline.published(self.sequence, self.block, 0);
-            self.sequence += 1;
-        }
-        self.block += 1;
-        if processed {
-            AudioStatus::Processed
-        } else {
-            AudioStatus::Fallback
-        }
     }
 }

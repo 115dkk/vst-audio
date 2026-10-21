@@ -36,3 +36,7 @@ pub fn editor_platform() -> &'static std::ffi::CStr {
 
 #[cfg(target_os = "linux")]
 mod linux_runloop;
+
+pub mod vst2_events;
+
+mod vst3_events;

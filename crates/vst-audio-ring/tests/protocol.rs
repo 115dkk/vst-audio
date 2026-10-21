@@ -11,6 +11,7 @@ use vst_audio_ring::{
 
 fn geometry(lanes: u32) -> Geometry {
     Geometry {
+        sample_format: vst_audio_ring::SampleFormat::F32,
         lanes,
         input_channels: 2,
         output_channels: 6,
@@ -24,8 +25,8 @@ fn geometry(lanes: u32) -> Geometry {
 fn header_layout_is_pinned() {
     assert_eq!(vst_audio_ring::MAGIC.to_le_bytes(), *b"SSRR");
     assert_eq!(vst_audio_ring::HEADER_BYTES, 512);
-    assert_eq!(geometry(1).total_bytes().unwrap(), 3_712);
-    assert_eq!(geometry(2).total_bytes().unwrap(), 6_784);
+    assert_eq!(geometry(1).total_bytes().unwrap(), 299_008);
+    assert_eq!(geometry(2).total_bytes().unwrap(), 597_376);
 }
 
 #[test]

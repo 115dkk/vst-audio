@@ -8,13 +8,15 @@ use std::io::{self, Read, Write};
 use std::time::Duration;
 
 pub mod layout;
+pub mod processing;
+pub use processing::{BusConfiguration, Capabilities, ProcessingSetup, SampleFormat};
 pub mod state;
 #[derive(Clone, Debug, thiserror::Error)]
 #[error("{0}")]
 pub struct PluginError(pub String);
 
 pub const MAGIC: [u8; 4] = *b"SSRP";
-pub const PROTOCOL_MAJOR: u16 = 1;
+pub const PROTOCOL_MAJOR: u16 = 2;
 pub const PROTOCOL_MINOR: u16 = 0;
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 pub const MAX_STATE_BYTES: usize = 64 * 1024 * 1024;
@@ -72,6 +74,9 @@ pub enum Message {
         in_channels: u16,
         out_channels: u16,
     },
+    Prepare(ProcessingSetup),
+    Describe,
+    Features(Capabilities),
     Activate,
     SetState {
         blob: Vec<u8>,
@@ -141,6 +146,9 @@ impl Message {
             Self::Hello { .. } => 1,
             Self::Load { .. } => 2,
             Self::Configure { .. } => 3,
+            Self::Prepare(_) => 23,
+            Self::Describe => 24,
+            Self::Features(_) => 25,
             Self::Activate => 4,
             Self::SetState { .. } => 5,
             Self::GetState => 6,
@@ -358,6 +366,7 @@ fn encode_message(message: &Message, out: &mut Vec<u8>) -> Result<(), CodecError
             put_u16(out, *out_channels);
         }
         Message::Activate
+        | Message::Describe
         | Message::GetState
         | Message::CloseEditor
         | Message::OpenEditor
@@ -393,6 +402,31 @@ fn encode_message(message: &Message, out: &mut Vec<u8>) -> Result<(), CodecError
             }
         }
         Message::LatencyChanged { frames } => put_u32(out, *frames),
+        Message::Prepare(setup) => {
+            if !setup.valid() {
+                return Err(CodecError::InvalidValue);
+            }
+            put_u32(out, setup.sample_rate);
+            put_u32(out, setup.quantum);
+            out.push(setup.sample_format as u8);
+            out.push(u8::from(setup.offline));
+            for buses in [&setup.inputs, &setup.outputs] {
+                out.push(buses.len() as u8);
+                for bus in buses {
+                    put_u16(out, bus.layout.channels);
+                    put_u64(out, bus.layout.arrangement);
+                    out.push(u8::from(bus.active));
+                }
+            }
+        }
+        Message::Features(caps) => {
+            out.push(u8::from(caps.f64));
+            put_u16(out, caps.input_event_buses);
+            put_u16(out, caps.output_event_buses);
+            out.push(u8::from(caps.editor));
+            out.push(u8::from(caps.sysex));
+            out.push(u8::from(caps.sample_accurate_parameters));
+        }
         Message::ListParameters { start, count } => {
             if *count == 0 || *count > 32 {
                 return Err(CodecError::InvalidValue);
@@ -526,6 +560,57 @@ fn decode_message(kind: u16, body: &[u8]) -> Result<Option<Message>, CodecError>
         16 => Message::Ack,
         17 => Message::EditorClosed,
         18 => Message::CloseEditor,
+        23 => {
+            let sample_rate = cursor.u32()?;
+            let quantum = cursor.u32()?;
+            let sample_format = match cursor.u8()? {
+                0 => SampleFormat::F32,
+                1 => SampleFormat::F64,
+                _ => return Err(CodecError::InvalidValue),
+            };
+            let offline = cursor.boolean()?;
+            let mut lists = Vec::new();
+            for _ in 0..2 {
+                let count = cursor.u8()?;
+                if count > 32 {
+                    return Err(CodecError::InvalidValue);
+                }
+                let mut buses = Vec::with_capacity(count as usize);
+                for _ in 0..count {
+                    buses.push(BusConfiguration {
+                        layout: Bus {
+                            channels: cursor.u16()?,
+                            arrangement: cursor.u64()?,
+                        },
+                        active: cursor.boolean()?,
+                    });
+                }
+                lists.push(buses);
+            }
+            let outputs = lists.pop().expect("two lists");
+            let inputs = lists.pop().expect("two lists");
+            let setup = ProcessingSetup {
+                sample_rate,
+                quantum,
+                sample_format,
+                offline,
+                inputs,
+                outputs,
+            };
+            if !setup.valid() {
+                return Err(CodecError::InvalidValue);
+            }
+            Message::Prepare(setup)
+        }
+        24 => Message::Describe,
+        25 => Message::Features(Capabilities {
+            f64: cursor.boolean()?,
+            input_event_buses: cursor.u16()?,
+            output_event_buses: cursor.u16()?,
+            editor: cursor.boolean()?,
+            sysex: cursor.boolean()?,
+            sample_accurate_parameters: cursor.boolean()?,
+        }),
         19 => {
             let start = cursor.u32()?;
             let count = cursor.u16()?;
@@ -640,6 +725,13 @@ impl<'a> Cursor<'a> {
     }
     fn array<const N: usize>(&mut self) -> Result<[u8; N], CodecError> {
         Ok(self.take(N)?.try_into().expect("exact length"))
+    }
+    fn boolean(&mut self) -> Result<bool, CodecError> {
+        match self.u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(CodecError::InvalidValue),
+        }
     }
     fn u8(&mut self) -> Result<u8, CodecError> {
         Ok(self.take(1)?[0])

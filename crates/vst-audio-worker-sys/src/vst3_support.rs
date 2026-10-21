@@ -2,7 +2,7 @@
 //! Host-owned COM objects. Controller callbacks are UI-thread-only (SDK threading model).
 use crate::{editor::EditorWindow, state_buffer::StateBuffer};
 use std::{
-    cell::{Cell, RefCell},
+    cell::RefCell,
     ffi::c_void,
     io::{Read, Seek, SeekFrom, Write},
     rc::Rc,
@@ -11,7 +11,7 @@ use std::{
         atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
     },
 };
-use vst3::{Class, ComPtr, ComRef, ComWrapper, Steinberg::Vst::*, Steinberg::*};
+use vst3::{Class, ComRef, ComWrapper, Steinberg::Vst::*, Steinberg::*};
 
 pub(crate) const CAPACITY: usize = 256;
 pub(crate) struct Edits {
@@ -216,98 +216,7 @@ impl IBStreamTrait for Stream {
     }
 }
 
-struct Point {
-    id: Cell<u32>,
-    value: Cell<f64>,
-}
-impl Class for Point {
-    type Interfaces = (IParamValueQueue,);
-}
-impl IParamValueQueueTrait for Point {
-    unsafe fn getParameterId(&self) -> u32 {
-        self.id.get()
-    }
-    unsafe fn getPointCount(&self) -> i32 {
-        1
-    }
-    unsafe fn getPoint(&self, index: i32, offset: *mut i32, value: *mut f64) -> tresult {
-        if index != 0 || offset.is_null() || value.is_null() {
-            return kInvalidArgument;
-        }
-        // SAFETY: caller supplies writable sample-offset output for point zero.
-        unsafe { *offset = 0 };
-        // SAFETY: caller supplies writable parameter-value output for point zero.
-        unsafe { *value = self.value.get() };
-        kResultOk
-    }
-    unsafe fn addPoint(&self, _: i32, _: f64, _: *mut i32) -> tresult {
-        kNotImplemented
-    }
-}
-pub(crate) struct Changes {
-    points: Vec<ComWrapper<Point>>,
-    pointers: Vec<ComPtr<IParamValueQueue>>,
-    count: Cell<usize>,
-}
-impl Changes {
-    pub fn new() -> ComWrapper<Self> {
-        let points: Vec<_> = (0..CAPACITY)
-            .map(|_| {
-                ComWrapper::new(Point {
-                    id: Cell::new(0),
-                    value: Cell::new(0.0),
-                })
-            })
-            .collect();
-        let pointers = points
-            .iter()
-            .map(|point| point.to_com_ptr().expect("point interface"))
-            .collect();
-        ComWrapper::new(Self {
-            points,
-            pointers,
-            count: Cell::new(0),
-        })
-    }
-    pub fn drain(&self, edits: &Edits) {
-        let mut count = 0;
-        // Bound work even if the producer continues to write. Coalesce same-param edits
-        // at sample offset zero, retaining the last value for this block.
-        for _ in 0..CAPACITY {
-            let Some((id, value)) = edits.pop() else {
-                break;
-            };
-            let index = self.points[..count]
-                .iter()
-                .position(|point| point.id.get() == id)
-                .unwrap_or(count);
-            self.points[index].id.set(id);
-            self.points[index].value.set(value);
-            if index == count {
-                count += 1;
-            }
-        }
-        self.count.set(count);
-    }
-}
-impl Class for Changes {
-    type Interfaces = (IParameterChanges,);
-}
-impl IParameterChangesTrait for Changes {
-    unsafe fn getParameterCount(&self) -> i32 {
-        self.count.get() as i32
-    }
-    unsafe fn getParameterData(&self, index: i32) -> *mut IParamValueQueue {
-        if index < 0 || index as usize >= self.count.get() {
-            std::ptr::null_mut()
-        } else {
-            self.pointers[index as usize].as_ptr()
-        }
-    }
-    unsafe fn addParameterData(&self, _: *const u32, _: *mut i32) -> *mut IParamValueQueue {
-        std::ptr::null_mut()
-    }
-}
+pub(crate) use crate::vst3_events::Changes;
 
 pub(crate) struct Frame {
     pub window: Rc<EditorWindow>,

@@ -17,7 +17,7 @@ from fixtures import ROOT, prepare
 worker, vst2_plugin, plugin = prepare()
 version = tomllib.loads((ROOT / "Cargo.toml").read_text())["workspace"]["package"]["version"]
 names = [
-    "vst-audio-protocol", "vst-audio-ring", "vst-audio-transport-sys",
+    "vst-audio-ring", "vst-audio-protocol", "vst-audio-transport-sys",
     "vst-audio", "vst-audio-worker-sys", "vst-audio-worker-runtime", "vst-audio-worker",
 ]
 temp_parent = Path(tempfile.gettempdir()).resolve()

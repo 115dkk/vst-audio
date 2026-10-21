@@ -123,6 +123,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5ce183b975b8fc736a20919c4002717255fbd867df575c792aeefa9a56a73ad0"
 
 [[package]]
+name = "crossbeam-queue"
+version = "0.3.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03e8bd762f7479489c70ed6c768ddca99d7296857de437a68dcb2a94365b3fae"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
+name = "crossbeam-utils"
+version = "0.8.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
+
+[[package]]
 name = "dispatch2"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -278,6 +293,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
+name = "rtrb"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9278fb35b3e730abe136e9b395b5b81b96d06b9f5478a50f0c8430a2237b22de"
+
+[[package]]
 name = "rustix"
 version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -368,6 +389,7 @@ name = "vst-audio"
 version = "0.1.0"
 dependencies = [
  "assert_no_alloc",
+ "rtrb",
  "thiserror",
  "vst-audio-protocol",
  "vst-audio-ring",
@@ -379,6 +401,7 @@ name = "vst-audio-protocol"
 version = "0.1.0"
 dependencies = [
  "thiserror",
+ "vst-audio-ring",
  "vst3",
 ]
 
@@ -387,6 +410,15 @@ name = "vst-audio-ring"
 version = "0.1.0"
 dependencies = [
  "assert_no_alloc",
+]
+
+[[package]]
+name = "vst-audio-test-advanced"
+version = "0.1.0"
+dependencies = [
+ "vst-audio-ring",
+ "vst-audio-worker-sys",
+ "vst3",
 ]
 
 [[package]]
@@ -431,6 +463,7 @@ dependencies = [
 name = "vst-audio-worker-sys"
 version = "0.1.0"
 dependencies = [
+ "crossbeam-queue",
  "libc",
  "objc2",
  "objc2-app-kit",

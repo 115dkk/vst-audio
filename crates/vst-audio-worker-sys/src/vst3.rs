@@ -53,6 +53,8 @@ pub struct Info {
     pub inputs: u16,
     pub outputs: u16,
     pub latency: u32,
+    pub input_buses: Vec<vst_audio_protocol::Bus>,
+    pub output_buses: Vec<vst_audio_protocol::Bus>,
 }
 #[derive(Debug, Default)]
 pub struct Events {
@@ -311,6 +313,8 @@ pub struct Vst3Plugin {
     closed_editor: bool,
     processor_taken: bool,
     max_frames: usize,
+    setup: Option<vst_audio_protocol::ProcessingSetup>,
+    capabilities: vst_audio_protocol::Capabilities,
     _main: std::marker::PhantomData<Rc<()>>,
 }
 impl std::fmt::Debug for Vst3Plugin {
@@ -362,11 +366,15 @@ impl Vst3Plugin {
                 inputs: 0,
                 outputs: 0,
                 latency: 0,
+                input_buses: Vec::new(),
+                output_buses: Vec::new(),
             },
             module,
             closed_editor: false,
             processor_taken: false,
             max_frames: 0,
+            setup: None,
+            capabilities: Default::default(),
             _main: std::marker::PhantomData,
         };
         check(
@@ -419,72 +427,93 @@ impl Vst3Plugin {
                 check(unsafe { b.connect(a.as_ptr()) }, "controller connect")?;
             }
         }
-        let input = plugin.arrangements(BusDirections_::kInput as i32)?;
-        let output = plugin.arrangements(BusDirections_::kOutput as i32)?;
-        if input.is_empty() || output.is_empty() {
-            return Err(PluginError("VST 3 missing main audio bus".into()));
-        }
-        let mut requested = input;
-        requested[0] = kSpeakerL | kSpeakerR;
-        let mut output = output;
-        // SAFETY: inactive component, arrays cover all declared audio buses. Rejection is allowed.
-        let _ = unsafe {
-            plugin.shared.processor.setBusArrangements(
-                requested.as_mut_ptr(),
-                requested.len() as i32,
-                output.as_mut_ptr(),
-                output.len() as i32,
-            )
+        plugin.refresh_buses()?;
+        // SAFETY: initialized processor queried on the main thread.
+        let f64 = unsafe { plugin.shared.processor.canProcessSampleSize(1) } == kResultOk;
+        let event_count = |direction| -> Result<u16, PluginError> {
+            // SAFETY: initialized component, valid event media type and direction.
+            let count = unsafe { plugin.component.getBusCount(1, direction) };
+            if !(0..=32).contains(&count) {
+                return Err(PluginError("invalid event bus count".into()));
+            }
+            Ok(count as u16)
         };
-        // Always read back: rejection may retain or select a default arrangement.
-        let input = plugin.arrangements(BusDirections_::kInput as i32)?;
-        let output = plugin.arrangements(BusDirections_::kOutput as i32)?;
-        plugin.info.input = input[0];
-        plugin.info.output = output[0];
-        plugin.info.inputs = plugin.bus_channels(BusDirections_::kInput as i32)?;
-        plugin.info.outputs = plugin.bus_channels(BusDirections_::kOutput as i32)?;
-        // SAFETY: initialized audio processor; latency queried on main thread.
+        let editor = if let Some(controller) = &plugin.controller {
+            // SAFETY: initialized controller queried on its main thread; nullable owned result.
+            let raw = unsafe { controller.createView(ViewType::kEditor) };
+            // SAFETY: createView transfers one reference, immediately released after capability probe.
+            unsafe { ComPtr::from_raw(raw) }.is_some()
+        } else {
+            false
+        };
+        plugin.capabilities = vst_audio_protocol::Capabilities {
+            f64,
+            input_event_buses: event_count(0)?,
+            output_event_buses: event_count(1)?,
+            editor,
+            sysex: true,
+            sample_accurate_parameters: true,
+        };
+        // SAFETY: initialized audio processor, main-thread latency query.
         plugin.info.latency = unsafe { plugin.shared.processor.getLatencySamples() };
         Ok(plugin)
     }
-    fn arrangements(&self, direction: i32) -> Result<Vec<u64>, PluginError> {
-        // SAFETY: main-thread initialized component; audio media and valid direction.
-        let count = unsafe {
-            self.component
-                .getBusCount(MediaTypes_::kAudio as i32, direction)
-        };
-        if !(1..=32).contains(&count) {
-            return Err(PluginError("VST 3 invalid audio bus count".into()));
+    fn buses(&self, direction: i32) -> Result<Vec<vst_audio_protocol::Bus>, PluginError> {
+        // SAFETY: initialized component queried on its owning thread.
+        let count = unsafe { self.component.getBusCount(0, direction) };
+        if !(0..=32).contains(&count) {
+            return Err(PluginError("invalid audio bus count".into()));
         }
-        let mut buses = vec![0; count as usize];
-        for (index, bus) in buses.iter_mut().enumerate() {
+        let mut buses = Vec::new();
+        let mut total = 0;
+        for index in 0..count {
+            // SAFETY: SDK BusInfo has valid all-zero primitive representation.
+            let mut info: BusInfo = unsafe { std::mem::zeroed() };
             check(
-                // SAFETY: queried bus index and writable arrangement output.
-                unsafe {
-                    self.shared
-                        .processor
-                        .getBusArrangement(direction, index as i32, bus)
-                },
-                "getBusArrangement",
+                // SAFETY: enumerated audio bus and writable information output.
+                unsafe { self.component.getBusInfo(0, direction, index, &mut info) },
+                "getBusInfo",
             )?;
+            if !(0..=64).contains(&info.channelCount) {
+                return Err(PluginError("invalid bus channels".into()));
+            }
+            total += info.channelCount;
+            if total > 64 {
+                return Err(PluginError("too many audio channels".into()));
+            }
+            let mut arrangement = 0;
+            // SAFETY: valid bus index, live processor and writable arrangement output.
+            let result = unsafe {
+                self.shared
+                    .processor
+                    .getBusArrangement(direction, index, &mut arrangement)
+            };
+            if result != kResultOk {
+                arrangement = 0;
+            }
+            if arrangement != 0 && arrangement.count_ones() != info.channelCount as u32 {
+                return Err(PluginError(
+                    "bus arrangement disagrees with channel count".into(),
+                ));
+            }
+            buses.push(vst_audio_protocol::Bus {
+                channels: info.channelCount as u16,
+                arrangement,
+            });
         }
         Ok(buses)
     }
-    fn bus_channels(&self, direction: i32) -> Result<u16, PluginError> {
-        // SAFETY: BusInfo contains only fixed arrays and integers, zero is valid.
-        let mut bus: BusInfo = unsafe { std::mem::zeroed() };
-        check(
-            // SAFETY: main bus index exists per arrangements, output struct has correct layout.
-            unsafe {
-                self.component
-                    .getBusInfo(MediaTypes_::kAudio as i32, direction, 0, &mut bus)
-            },
-            "getBusInfo",
-        )?;
-        if bus.busType != BusTypes_::kMain as i32 || !(0..=32).contains(&bus.channelCount) {
-            return Err(PluginError("VST 3 unsupported main bus".into()));
-        }
-        Ok(bus.channelCount as u16)
+    fn refresh_buses(&mut self) -> Result<(), PluginError> {
+        self.info.input_buses = self.buses(0)?;
+        self.info.output_buses = self.buses(1)?;
+        self.info.inputs = self.info.input_buses.iter().map(|b| b.channels).sum();
+        self.info.outputs = self.info.output_buses.iter().map(|b| b.channels).sum();
+        self.info.input = self.info.input_buses.first().map_or(0, |b| b.arrangement);
+        self.info.output = self.info.output_buses.first().map_or(0, |b| b.arrangement);
+        Ok(())
+    }
+    pub fn capabilities(&self) -> vst_audio_protocol::Capabilities {
+        self.capabilities
     }
     pub fn info(&self) -> Info {
         self.info.clone()
@@ -496,63 +525,128 @@ impl Vst3Plugin {
         inputs: u16,
         outputs: u16,
     ) -> Result<(), PluginError> {
+        if inputs != self.info.inputs || outputs != self.info.outputs {
+            return Err(PluginError("configuration channel mismatch".into()));
+        }
+        self.configure_audio(&vst_audio_protocol::ProcessingSetup {
+            sample_rate: rate,
+            quantum: frames,
+            sample_format: vst_audio_ring::SampleFormat::F32,
+            offline: false,
+            inputs: self
+                .info
+                .input_buses
+                .iter()
+                .cloned()
+                .map(Into::into)
+                .collect(),
+            outputs: self
+                .info
+                .output_buses
+                .iter()
+                .cloned()
+                .map(Into::into)
+                .collect(),
+        })
+    }
+    pub fn configure_audio(
+        &mut self,
+        configuration: &vst_audio_protocol::ProcessingSetup,
+    ) -> Result<(), PluginError> {
+        use vst_audio_ring::SampleFormat;
         if self.shared.active.load(Ordering::SeqCst)
             || self.processor_taken
-            || frames == 0
-            || frames > 65536
-            || rate < 1000
-            || inputs != self.info.inputs
-            || outputs != self.info.outputs
+            || !configuration.valid()
+            || configuration.inputs.len() != self.info.input_buses.len()
+            || configuration.outputs.len() != self.info.output_buses.len()
         {
-            return Err(PluginError("unsupported VST 3 configuration".into()));
+            return Err(PluginError("invalid VST3 configuration".into()));
         }
-        check(
-            // SAFETY: inactive processor, querying 32-bit sample support on main thread.
-            unsafe {
-                self.shared
-                    .processor
-                    .canProcessSampleSize(SymbolicSampleSizes_::kSample32 as i32)
-            },
-            "canProcessSampleSize",
-        )?;
-        let mut setup = ProcessSetup {
-            processMode: ProcessModes_::kRealtime as i32,
-            symbolicSampleSize: SymbolicSampleSizes_::kSample32 as i32,
-            maxSamplesPerBlock: frames as i32,
-            sampleRate: f64::from(rate),
+        let mut input: Vec<_> = configuration
+            .inputs
+            .iter()
+            .map(|b| b.layout.arrangement)
+            .collect();
+        let mut output: Vec<_> = configuration
+            .outputs
+            .iter()
+            .map(|b| b.layout.arrangement)
+            .collect();
+        // SAFETY: inactive component; complete arrays cover declared buses. Read-back below validates even a rejection.
+        let _ = unsafe {
+            self.shared.processor.setBusArrangements(
+                input.as_mut_ptr(),
+                input.len() as i32,
+                output.as_mut_ptr(),
+                output.len() as i32,
+            )
+        };
+        self.refresh_buses()?;
+        for (requested, actual) in configuration
+            .inputs
+            .iter()
+            .zip(&self.info.input_buses)
+            .chain(configuration.outputs.iter().zip(&self.info.output_buses))
+        {
+            if requested.layout.channels != actual.channels
+                || (requested.layout.arrangement != 0
+                    && requested.layout.arrangement != actual.arrangement)
+            {
+                return Err(PluginError("plugin rejected bus arrangement".into()));
+            }
+        }
+        let precision = if configuration.sample_format == SampleFormat::F64 {
+            1
+        } else {
+            0
         };
         check(
-            // SAFETY: main-thread inactive processor and fully initialized ProcessSetup.
+            // SAFETY: main-thread query before setupProcessing.
+            unsafe { self.shared.processor.canProcessSampleSize(precision) },
+            "sample precision",
+        )?;
+        let mut setup = ProcessSetup {
+            processMode: if configuration.offline { 2 } else { 0 },
+            symbolicSampleSize: precision,
+            maxSamplesPerBlock: configuration.quantum as i32,
+            sampleRate: f64::from(configuration.sample_rate),
+        };
+        check(
+            // SAFETY: fully initialized setup, inactive processor on main thread.
             unsafe { self.shared.processor.setupProcessing(&mut setup) },
             "setupProcessing",
         )?;
-        for direction in [
-            BusDirections_::kInput as i32,
-            BusDirections_::kOutput as i32,
-        ] {
-            // SAFETY: component is set up; query audio bus count on the main thread.
-            let count = unsafe {
-                self.component
-                    .getBusCount(MediaTypes_::kAudio as i32, direction)
-            };
-            for index in 0..count {
+        for (direction, buses) in [(0, &configuration.inputs), (1, &configuration.outputs)] {
+            for (index, bus) in buses.iter().enumerate() {
                 check(
-                    // SAFETY: main bus enabled, all auxiliary buses disabled; indices were queried.
+                    // SAFETY: enumerated audio bus, activation on the main thread.
                     unsafe {
-                        self.component.activateBus(
-                            MediaTypes_::kAudio as i32,
-                            direction,
-                            index,
-                            u8::from(index == 0),
-                        )
+                        self.component
+                            .activateBus(0, direction, index as i32, u8::from(bus.active))
                     },
-                    "activateBus",
+                    "activate audio bus",
                 )?;
             }
         }
-        // SAFETY: main-thread latency query after setupProcessing.
+        for (direction, count) in [
+            (0, self.capabilities.input_event_buses),
+            (1, self.capabilities.output_event_buses),
+        ] {
+            for index in 0..count {
+                check(
+                    // SAFETY: enumerated event bus, activate on the main thread before processing.
+                    unsafe {
+                        self.component
+                            .activateBus(1, direction, i32::from(index), 1)
+                    },
+                    "activate event bus",
+                )?;
+            }
+        }
+        // SAFETY: main-thread query after setupProcessing.
         self.info.latency = unsafe { self.shared.processor.getLatencySamples() };
-        self.max_frames = frames as usize;
+        self.max_frames = configuration.quantum as usize;
+        self.setup = Some(configuration.clone());
         Ok(())
     }
     pub fn activate(&mut self) -> Result<(), PluginError> {
@@ -578,16 +672,76 @@ impl Vst3Plugin {
             ));
         }
         self.processor_taken = true;
+        let setup = self.setup.as_ref().expect("configured").clone();
         let changes = Changes::new();
-        let pointer = changes.to_com_ptr().expect("parameter changes interface");
+        let pointer = changes.to_com_ptr().expect("parameter changes");
+        let output_changes = Changes::new();
+        let output_pointer = output_changes
+            .to_com_ptr()
+            .expect("output parameter changes");
+        let input_events = crate::vst3_events::EventList::new();
+        let input_events_ptr = input_events.to_com_ptr().expect("input event list");
+        let output_events = crate::vst3_events::EventList::new();
+        let output_events_ptr = output_events.to_com_ptr().expect("output event list");
+        let mut mappings = Vec::new();
+        if let Some(mapping) = self
+            .controller
+            .as_ref()
+            .and_then(|c| c.cast::<IMidiMapping>())
+        {
+            for bus in 0..self.capabilities.input_event_buses {
+                for channel in 0..16 {
+                    for cc in 0..=130 {
+                        let mut id = 0;
+                        // SAFETY: UI-thread controller mapping query with valid MIDI ranges and writable output.
+                        if unsafe {
+                            mapping.getMidiControllerAssignment(
+                                i32::from(bus),
+                                channel,
+                                cc,
+                                &mut id,
+                            )
+                        } == kResultOk
+                        {
+                            mappings.push((
+                                (u32::from(bus) << 16) | ((channel as u32) << 8) | cc as u32,
+                                id,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        let mut parameter_ids = Vec::new();
+        let mut start = 0;
+        loop {
+            let (total, page) = self.parameters(start, 32)?;
+            parameter_ids.extend(page.into_iter().map(|p| p.id));
+            start += 32;
+            if start >= total {
+                break;
+            }
+        }
+        parameter_ids.sort_unstable();
+        parameter_ids.dedup();
         Ok(Vst3Processor {
             shared: self.shared.clone(),
             changes,
             pointer,
-            inputs: self.info.inputs as usize,
-            outputs: self.info.outputs as usize,
+            output_changes,
+            output_pointer,
+            input_events,
+            input_events_ptr,
+            output_events,
+            output_events_ptr,
+            mappings,
+            parameter_ids,
+            inputs: vst_audio_protocol::ProcessingSetup::channels(&setup.inputs) as usize,
+            outputs: vst_audio_protocol::ProcessingSetup::channels(&setup.outputs) as usize,
             frames: self.max_frames,
             processing: false,
+            setup,
+            capabilities: self.capabilities,
         })
     }
     pub fn parameters(
@@ -863,10 +1017,40 @@ pub struct Vst3Processor {
     shared: Arc<Shared>,
     changes: ComWrapper<Changes>,
     pointer: ComPtr<IParameterChanges>,
+    output_changes: ComWrapper<Changes>,
+    output_pointer: ComPtr<IParameterChanges>,
+    input_events: ComWrapper<crate::vst3_events::EventList>,
+    input_events_ptr: ComPtr<IEventList>,
+    output_events: ComWrapper<crate::vst3_events::EventList>,
+    output_events_ptr: ComPtr<IEventList>,
+    mappings: Vec<(u32, u32)>,
+    parameter_ids: Vec<u32>,
     inputs: usize,
     outputs: usize,
     frames: usize,
     processing: bool,
+    setup: vst_audio_protocol::ProcessingSetup,
+    capabilities: vst_audio_protocol::Capabilities,
+}
+trait Sample: Copy {
+    const FORMAT: vst_audio_ring::SampleFormat;
+    fn pointers(pointer: *mut *mut Self) -> AudioBusBuffers__type0;
+}
+impl Sample for f32 {
+    const FORMAT: vst_audio_ring::SampleFormat = vst_audio_ring::SampleFormat::F32;
+    fn pointers(pointer: *mut *mut Self) -> AudioBusBuffers__type0 {
+        AudioBusBuffers__type0 {
+            channelBuffers32: pointer,
+        }
+    }
+}
+impl Sample for f64 {
+    const FORMAT: vst_audio_ring::SampleFormat = vst_audio_ring::SampleFormat::F64;
+    fn pointers(pointer: *mut *mut Self) -> AudioBusBuffers__type0 {
+        AudioBusBuffers__type0 {
+            channelBuffers64: pointer,
+        }
+    }
 }
 impl std::fmt::Debug for Vst3Processor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -878,78 +1062,185 @@ impl std::fmt::Debug for Vst3Processor {
 unsafe impl Send for Vst3Processor {}
 impl Vst3Processor {
     pub fn process(&mut self, planes: &mut [&mut [f32]], frames: usize) -> bool {
-        if frames > self.frames
-            || planes.len() < self.inputs.max(self.outputs)
-            || planes.iter().any(|p| p.len() < frames)
-            || self.shared.closed.load(Ordering::SeqCst)
-            || !self.shared.admitted.load(Ordering::SeqCst)
-            || self.shared.busy.swap(true, Ordering::SeqCst)
-        {
-            return false;
-        }
-        if !self.shared.admitted.load(Ordering::SeqCst)
-            || !self.shared.active.load(Ordering::SeqCst)
-            || self.shared.closed.load(Ordering::SeqCst)
-        {
-            self.shared.busy.store(false, Ordering::SeqCst);
-            return false;
-        }
-        if !self.processing {
-            // SAFETY: active component, sole audio thread before its first process call.
-            let result = unsafe { self.shared.processor.setProcessing(1) };
-            if result != kResultOk {
-                self.shared.edits.flags.fetch_or(16, Ordering::Release);
-                self.shared.busy.store(false, Ordering::SeqCst);
+        self.process_block(
+            planes,
+            frames,
+            &vst_audio_ring::Transport::default(),
+            &[],
+            &mut vst_audio_ring::EventBuffer::default(),
+        )
+    }
+    pub fn process_block(
+        &mut self,
+        planes: &mut [&mut [f32]],
+        frames: usize,
+        context: &vst_audio_ring::Transport,
+        input: &[vst_audio_ring::Event],
+        output: &mut vst_audio_ring::EventBuffer,
+    ) -> bool {
+        self.process_inner(planes, frames, context, input, output)
+    }
+    pub fn process_block_f64(
+        &mut self,
+        planes: &mut [&mut [f64]],
+        frames: usize,
+        context: &vst_audio_ring::Transport,
+        input: &[vst_audio_ring::Event],
+        output: &mut vst_audio_ring::EventBuffer,
+    ) -> bool {
+        self.process_inner(planes, frames, context, input, output)
+    }
+    fn process_inner<T: Sample>(
+        &mut self,
+        planes: &mut [&mut [T]],
+        frames: usize,
+        context: &vst_audio_ring::Transport,
+        input: &[vst_audio_ring::Event],
+        output: &mut vst_audio_ring::EventBuffer,
+    ) -> bool {
+        use vst_audio_ring::{EventData, MAX_EVENTS};
+        output.clear();
+        if T::FORMAT!=self.setup.sample_format||frames==0||frames>self.frames||planes.len()<self.inputs.max(self.outputs)||planes.iter().any(|p|p.len()<frames)||!context.valid()||input.len()>MAX_EVENTS||input.iter().any(|e|!e.valid(frames as u32)||matches!(e.data,EventData::Parameter{id,..} if self.parameter_ids.binary_search(&id).is_err()))||input.windows(2).any(|p|p[0].sample_offset>p[1].sample_offset)||self.shared.closed.load(Ordering::SeqCst)||!self.shared.admitted.load(Ordering::SeqCst)||self.shared.busy.swap(true,Ordering::SeqCst){return false;}
+        let result = (|| {
+            if !self.shared.admitted.load(Ordering::SeqCst)
+                || !self.shared.active.load(Ordering::SeqCst)
+                || self.shared.closed.load(Ordering::SeqCst)
+            {
                 return false;
             }
-            self.processing = true;
-        }
-        self.changes.drain(&self.shared.edits);
-        let mut input_pointers = [std::ptr::null_mut(); 32];
-        let mut output_pointers = [std::ptr::null_mut(); 32];
-        for (index, plane) in planes.iter_mut().enumerate().take(32) {
-            if index < self.inputs {
-                input_pointers[index] = plane.as_mut_ptr();
+            if !self.processing {
+                // SAFETY: sole audio handle, active configured component, entering processing.
+                if unsafe { self.shared.processor.setProcessing(1) } != kResultOk {
+                    return false;
+                }
+                self.processing = true;
             }
-            if index < self.outputs {
-                output_pointers[index] = plane.as_mut_ptr();
+            let mut start = 0;
+            let mut base_context = *context;
+            let mut context_origin = 0;
+            while start < frames {
+                for event in input.iter().filter(|e| e.sample_offset as usize == start) {
+                    if let EventData::Transport(value) = event.data {
+                        base_context = value;
+                        context_origin = start;
+                    }
+                }
+                let end = input
+                    .iter()
+                    .filter(|e| {
+                        e.sample_offset as usize > start
+                            && matches!(e.data, EventData::Transport(_))
+                    })
+                    .map(|e| e.sample_offset as usize)
+                    .next()
+                    .unwrap_or(frames);
+                let context = base_context.advanced(start - context_origin, self.setup.sample_rate);
+                if start == 0 {
+                    self.changes.drain(&self.shared.edits);
+                } else {
+                    self.changes.clear();
+                }
+                self.output_changes.clear();
+                self.input_events.reset(
+                    frames as u32,
+                    start as u32,
+                    self.capabilities.input_event_buses,
+                );
+                self.output_events.reset(
+                    frames as u32,
+                    start as u32,
+                    self.capabilities.output_event_buses,
+                );
+                self.input_events.fill(
+                    input,
+                    start,
+                    end,
+                    context,
+                    self.setup.sample_rate,
+                    &self.changes,
+                    &self.mappings,
+                    &mut output.dropped,
+                );
+                let mut input_pointers = [std::ptr::null_mut(); 64];
+                let mut output_pointers = [std::ptr::null_mut(); 64];
+                for (index, plane) in planes.iter_mut().enumerate().take(64) {
+                    if index < self.inputs {
+                        input_pointers[index] = plane.as_mut_ptr().wrapping_add(start);
+                    }
+                    if index < self.outputs {
+                        output_pointers[index] = plane.as_mut_ptr().wrapping_add(start);
+                    }
+                }
+                let empty = AudioBusBuffers {
+                    numChannels: 0,
+                    silenceFlags: 0,
+                    __field0: T::pointers(std::ptr::null_mut()),
+                };
+                let mut inputs = [empty; 32];
+                let mut outputs = [empty; 32];
+                for (buses, pointers, target) in [
+                    (&self.setup.inputs, &mut input_pointers, &mut inputs),
+                    (&self.setup.outputs, &mut output_pointers, &mut outputs),
+                ] {
+                    let mut offset = 0;
+                    for (index, bus) in buses.iter().enumerate() {
+                        let channels = if bus.active {
+                            usize::from(bus.layout.channels)
+                        } else {
+                            0
+                        };
+                        target[index] = AudioBusBuffers {
+                            numChannels: channels as i32,
+                            silenceFlags: 0,
+                            __field0: T::pointers(if channels == 0 {
+                                std::ptr::null_mut()
+                            } else {
+                                pointers.as_mut_ptr().wrapping_add(offset)
+                            }),
+                        };
+                        offset += channels;
+                    }
+                }
+                let mut native_context =
+                    crate::vst3_events::process_context(context, self.setup.sample_rate);
+                let mut data = ProcessData {
+                    processMode: if self.setup.offline { 2 } else { 0 },
+                    symbolicSampleSize: self.setup.sample_format as i32,
+                    numSamples: (end - start) as i32,
+                    numInputs: self.setup.inputs.len() as i32,
+                    numOutputs: self.setup.outputs.len() as i32,
+                    inputs: if self.setup.inputs.is_empty() {
+                        std::ptr::null_mut()
+                    } else {
+                        inputs.as_mut_ptr()
+                    },
+                    outputs: if self.setup.outputs.is_empty() {
+                        std::ptr::null_mut()
+                    } else {
+                        outputs.as_mut_ptr()
+                    },
+                    inputParameterChanges: self.pointer.as_ptr(),
+                    outputParameterChanges: self.output_pointer.as_ptr(),
+                    inputEvents: self.input_events_ptr.as_ptr(),
+                    outputEvents: self.output_events_ptr.as_ptr(),
+                    processContext: &mut native_context,
+                };
+                // SAFETY: exclusive admitted audio call, complete native bus arrays and bounded live buffers/event interfaces.
+                if unsafe { self.shared.processor.process(&mut data) } != kResultOk {
+                    return false;
+                }
+                self.output_events.collect(output);
+                self.output_changes
+                    .collect(start as u32, frames as u32, output);
+                start = end;
             }
-        }
-        let mut input = AudioBusBuffers {
-            numChannels: self.inputs as i32,
-            silenceFlags: 0,
-            __field0: AudioBusBuffers__type0 {
-                channelBuffers32: input_pointers.as_mut_ptr(),
-            },
-        };
-        let mut output = AudioBusBuffers {
-            numChannels: self.outputs as i32,
-            silenceFlags: 0,
-            __field0: AudioBusBuffers__type0 {
-                channelBuffers32: output_pointers.as_mut_ptr(),
-            },
-        };
-        let mut data = ProcessData {
-            processMode: ProcessModes_::kRealtime as i32,
-            symbolicSampleSize: SymbolicSampleSizes_::kSample32 as i32,
-            numSamples: frames as i32,
-            numInputs: 1,
-            numOutputs: 1,
-            inputs: &mut input,
-            outputs: &mut output,
-            inputParameterChanges: self.pointer.as_ptr(),
-            outputParameterChanges: std::ptr::null_mut(),
-            inputEvents: std::ptr::null_mut(),
-            outputEvents: std::ptr::null_mut(),
-            processContext: std::ptr::null_mut(),
-        };
-        // SAFETY: exclusive audio admission, configured active processor, bounded live planar buffers.
-        let result = unsafe { self.shared.processor.process(&mut data) };
-        if result != kResultOk {
+            true
+        })();
+        if !result {
             self.shared.edits.flags.fetch_or(16, Ordering::Release);
         }
         self.shared.busy.store(false, Ordering::SeqCst);
-        result == kResultOk
+        result
     }
     pub fn stop(&mut self) {
         if !self.shared.admitted.load(Ordering::SeqCst)

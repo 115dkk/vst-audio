@@ -126,6 +126,10 @@ impl<P: Plugin> Session<P> {
 #[derive(Debug)]
 pub struct AudioBuffer {
     samples: Vec<f32>,
+    samples64: Vec<f64>,
+    sample_format: vst_audio_ring::SampleFormat,
+    input: Box<vst_audio_ring::EventBuffer>,
+    output: Box<vst_audio_ring::EventBuffer>,
     frames: usize,
     planes: usize,
 }
@@ -133,7 +137,25 @@ impl AudioBuffer {
     pub fn new(geometry: vst_audio_ring::Geometry) -> Result<Self, vst_audio_ring::GeometryError> {
         let geometry = geometry.validate()?;
         Ok(Self {
-            samples: vec![0.0; geometry.samples_per_slot()],
+            samples: vec![
+                0.0;
+                if geometry.sample_format == vst_audio_ring::SampleFormat::F32 {
+                    geometry.samples_per_slot()
+                } else {
+                    0
+                }
+            ],
+            samples64: vec![
+                0.0;
+                if geometry.sample_format == vst_audio_ring::SampleFormat::F64 {
+                    geometry.samples_per_slot()
+                } else {
+                    0
+                }
+            ],
+            sample_format: geometry.sample_format,
+            input: Box::default(),
+            output: Box::default(),
             frames: geometry.max_frames as usize,
             planes: geometry.planes(),
         })
@@ -147,14 +169,41 @@ impl AudioBuffer {
             let frames = self.frames;
             let planes = self.planes;
             let mut processed = false;
-            let copied = consumer.slot_mut(0, sequence, &mut self.samples, |samples| {
-                // Fixed stack storage avoids allocating the plane-pointer vector.
-                let mut refs: [&mut [f32]; 64] = std::array::from_fn(|_| &mut [][..]);
-                for (destination, plane) in refs.iter_mut().zip(samples.chunks_exact_mut(frames)) {
-                    *destination = plane;
-                }
-                processed = processor.process(&mut refs[..planes], frames);
-            });
+            let mut context = vst_audio_ring::Transport::default();
+            if !consumer.input_packet(0, sequence, &mut context, &mut self.input) {
+                consumer.fault(2);
+                break;
+            }
+            self.output.clear();
+            let copied = if self.sample_format == vst_audio_ring::SampleFormat::F32 {
+                consumer.slot_mut(0, sequence, &mut self.samples, |samples| {
+                    let mut refs: [&mut [f32]; 64] = std::array::from_fn(|_| &mut [][..]);
+                    for (to, from) in refs.iter_mut().zip(samples.chunks_exact_mut(frames)) {
+                        *to = from;
+                    }
+                    processed = processor.process_block(
+                        &mut refs[..planes],
+                        frames,
+                        &context,
+                        self.input.as_slice(),
+                        &mut self.output,
+                    );
+                })
+            } else {
+                consumer.slot_mut_f64(0, sequence, &mut self.samples64, |samples| {
+                    let mut refs: [&mut [f64]; 64] = std::array::from_fn(|_| &mut [][..]);
+                    for (to, from) in refs.iter_mut().zip(samples.chunks_exact_mut(frames)) {
+                        *to = from;
+                    }
+                    processed = processor.process_block_f64(
+                        &mut refs[..planes],
+                        frames,
+                        &context,
+                        self.input.as_slice(),
+                        &mut self.output,
+                    );
+                })
+            };
             if !copied || !processed {
                 break;
             }
@@ -162,9 +211,14 @@ impl AudioBuffer {
                 .samples
                 .iter()
                 .filter(|value| !value.is_finite())
-                .count();
+                .count()
+                + self.samples64.iter().filter(|v| !v.is_finite()).count();
             if non_finite != 0 {
                 consumer.set_last_error(non_finite as u64);
+            }
+            if !consumer.output_packet(0, sequence, &self.output) {
+                consumer.fault(3);
+                break;
             }
             consumer.complete(0, sequence);
         }
@@ -291,6 +345,7 @@ mod tests {
             }
         }
         let geometry = Geometry {
+            sample_format: vst_audio_ring::SampleFormat::F32,
             lanes: 1,
             input_channels: 2,
             output_channels: 2,
@@ -393,6 +448,7 @@ mod tests {
     #[test]
     fn frame_session_and_ring_round_trip() {
         let geometry = Geometry {
+            sample_format: vst_audio_ring::SampleFormat::F32,
             lanes: 1,
             input_channels: 2,
             output_channels: 2,

@@ -24,6 +24,7 @@ impl Wait for Noop {
 #[test]
 fn producer_per_block_path_does_not_allocate() {
     let storage = RegionBuf::new(Geometry {
+        sample_format: vst_audio_ring::SampleFormat::F32,
         lanes: 1,
         input_channels: 2,
         output_channels: 6,
@@ -37,6 +38,7 @@ fn producer_per_block_path_does_not_allocate() {
     producer
         .announce(
             Geometry {
+                sample_format: vst_audio_ring::SampleFormat::F32,
                 lanes: 1,
                 input_channels: 2,
                 output_channels: 6,

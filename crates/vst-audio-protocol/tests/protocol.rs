@@ -127,7 +127,7 @@ fn malicious_frames_are_rejected_and_unknown_kinds_skip() {
     ));
 
     let mut wrong_major = frame;
-    wrong_major[16..18].copy_from_slice(&2_u16.to_le_bytes());
+    wrong_major[16..18].copy_from_slice(&1_u16.to_le_bytes());
     assert!(matches!(
         decode_frame(&wrong_major),
         Err(CodecError::WrongMajor { .. })

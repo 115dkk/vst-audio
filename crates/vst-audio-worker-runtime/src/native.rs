@@ -43,13 +43,13 @@ impl Vst2 {
     fn load(path: &Path) -> Result<Self, PluginError> {
         let inner = Vst2Plugin::load(path).map_err(plugin_error)?;
         let info = inner.info();
-        let arrangement = |types: Option<Vec<i32>>, count| {
-            types
+        let arrangement = |types: Option<Vec<i32>>, count| -> Result<u64, PluginError> {
+            Ok(types
                 .map_or_else(
                     || default_arrangement(count),
                     |types| vst2_arrangement(&types),
                 )
-                .map_err(plugin_error)
+                .unwrap_or(0))
         };
         let info = PluginInfo {
             name: info.name,
@@ -75,6 +75,26 @@ impl Processor for Vst2ProcessorAdapter {
     fn process(&mut self, planes: &mut [&mut [f32]], frames: usize) -> bool {
         self.0.process(planes, frames)
     }
+    fn process_block(
+        &mut self,
+        p: &mut [&mut [f32]],
+        f: usize,
+        c: &vst_audio_ring::Transport,
+        i: &[vst_audio_ring::Event],
+        o: &mut vst_audio_ring::EventBuffer,
+    ) -> bool {
+        self.0.process_block(p, f, c, i, o)
+    }
+    fn process_block_f64(
+        &mut self,
+        p: &mut [&mut [f64]],
+        f: usize,
+        c: &vst_audio_ring::Transport,
+        i: &[vst_audio_ring::Event],
+        o: &mut vst_audio_ring::EventBuffer,
+    ) -> bool {
+        self.0.process_block_f64(p, f, c, i, o)
+    }
 }
 #[derive(Debug)]
 struct Vst2ProcessorAdapter(Vst2Processor);
@@ -96,6 +116,37 @@ impl Plugin for Vst2 {
             self.inner.processor().map_err(plugin_error)?,
         ));
         Ok(())
+    }
+    fn configure_audio(
+        &mut self,
+        setup: &vst_audio_protocol::ProcessingSetup,
+    ) -> Result<(), PluginError> {
+        if !setup.valid()
+            || setup.inputs.len() > 1
+            || setup.outputs.len() > 1
+            || setup.inputs.iter().chain(&setup.outputs).any(|b| !b.active)
+        {
+            return Err(PluginError(
+                "VST2 exposes one active audio port per direction".into(),
+            ));
+        }
+        self.inner
+            .configure_precision(
+                setup.sample_rate,
+                setup.quantum,
+                vst_audio_protocol::ProcessingSetup::channels(&setup.inputs),
+                vst_audio_protocol::ProcessingSetup::channels(&setup.outputs),
+                setup.sample_format,
+                setup.offline,
+            )
+            .map_err(plugin_error)?;
+        self.processor = Some(Vst2ProcessorAdapter(
+            self.inner.processor().map_err(plugin_error)?,
+        ));
+        Ok(())
+    }
+    fn capabilities(&self) -> vst_audio_protocol::Capabilities {
+        self.inner.capabilities()
     }
     fn activate(&mut self) -> Result<(), PluginError> {
         self.inner.activate();
@@ -218,7 +269,35 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
                             | Message::OpenEditor
                             | Message::CloseEditor
                     );
-                    let reply: Result<Message, StartError> = (|| match frame.message {
+                    let message = match frame.message {
+                        Message::Configure {
+                            rate,
+                            max_frames,
+                            in_channels,
+                            out_channels,
+                        } => Message::Prepare(vst_audio_protocol::ProcessingSetup {
+                            sample_rate: rate,
+                            quantum: max_frames,
+                            sample_format: vst_audio_ring::SampleFormat::F32,
+                            offline: false,
+                            inputs: vec![
+                                Bus {
+                                    channels: in_channels,
+                                    arrangement: 0,
+                                }
+                                .into(),
+                            ],
+                            outputs: vec![
+                                Bus {
+                                    channels: out_channels,
+                                    arrangement: 0,
+                                }
+                                .into(),
+                            ],
+                        }),
+                        other => other,
+                    };
+                    let reply: Result<Message, StartError> = (|| match message {
                         Message::Scan { path } => {
                             if Path::new(&path)
                                 .extension()
@@ -275,19 +354,27 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
                                 outputs: info.outputs,
                             })
                         }
-                        Message::Configure {
-                            rate,
-                            max_frames,
-                            in_channels,
-                            out_channels,
-                        } if !configured => {
+                        Message::Describe => Ok(Message::Features(
+                            plugin
+                                .as_ref()
+                                .ok_or_else(|| StartError("Load required".into()))?
+                                .capabilities(),
+                        )),
+                        Message::Prepare(setup) if !configured => {
+                            if !setup.valid() {
+                                return Err(StartError("invalid audio configuration".into()));
+                            }
+                            let rate = setup.sample_rate;
+                            let max_frames = setup.quantum;
+                            let in_channels =
+                                vst_audio_protocol::ProcessingSetup::channels(&setup.inputs);
+                            let out_channels =
+                                vst_audio_protocol::ProcessingSetup::channels(&setup.outputs);
                             let plugin = plugin
                                 .as_mut()
                                 .ok_or_else(|| StartError("Load required".into()))?;
                             let previous_latency = plugin.info().latency_frames;
-                            plugin
-                                .configure(rate, max_frames, in_channels, out_channels)
-                                .map_err(error)?;
+                            plugin.configure_audio(&setup).map_err(error)?;
                             let latency = plugin.info().latency_frames;
                             if latency != previous_latency {
                                 write_frame(
@@ -301,6 +388,7 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
                                 .map_err(error)?;
                             }
                             let geometry = Geometry {
+                                sample_format: setup.sample_format,
                                 lanes: 1,
                                 input_channels: in_channels.into(),
                                 output_channels: out_channels.into(),
