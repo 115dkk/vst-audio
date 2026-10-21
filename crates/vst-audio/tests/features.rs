@@ -9,6 +9,61 @@ fn host() -> Host {
 
 #[test]
 #[ignore = "native fixtures required"]
+fn invalid_event_routes_and_parameter_ids_preserve_the_instance() {
+    for format in [PluginFormat::Vst2, PluginFormat::Vst3] {
+        let mut instance = host()
+            .spawn(&plugin(format), &Configuration::default(), None)
+            .unwrap();
+        let mut audio = instance.take_audio().unwrap();
+        let mut left = [0.0; 128];
+        let mut right = [0.0; 128];
+        let mut received = [AudioEvent::default(); 4];
+        let invalid = [AudioEvent::midi(0, 1, [0x90, 60, 127])];
+        let report = audio.process_events(
+            128,
+            &[],
+            &mut [&mut left, &mut right],
+            Transport::default(),
+            &invalid,
+            &mut received,
+        );
+        assert_eq!(report.status, AudioStatus::InvalidEvents);
+        let events = [
+            AudioEvent {
+                sample_offset: 0,
+                bus: 0,
+                data: EventData::Parameter {
+                    id: u32::MAX,
+                    value: 0.5,
+                },
+            },
+            AudioEvent::midi(11, 0, [0x90, 60, 127]),
+            AudioEvent::midi(27, 0, [0xa0, 60, 95]),
+        ];
+        for block in 0..3 {
+            let report = assert_no_alloc::assert_no_alloc(|| {
+                audio.process_events(
+                    128,
+                    &[],
+                    &mut [&mut left, &mut right],
+                    Transport::default(),
+                    if block == 0 { &events } else { &[] },
+                    &mut received,
+                )
+            });
+            if block == 2 {
+                assert_eq!(report.status, AudioStatus::Processed);
+                assert_eq!((report.events_written, report.events_dropped), (2, 1));
+                assert_eq!(&received[..2], &events[1..]);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(instance.status(), Status::Running);
+    }
+}
+
+#[test]
+#[ignore = "native fixtures required"]
 fn sysex_ownership_transport_splits_and_output_overflow_are_explicit() {
     for format in [PluginFormat::Vst2, PluginFormat::Vst3] {
         let mut instance = host()

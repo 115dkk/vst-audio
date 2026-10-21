@@ -234,6 +234,7 @@ impl EventList {
         rate: u32,
         changes: &Changes,
         mappings: &[(u32, u32, u32)],
+        parameter_ids: &[u32],
         rejected: &mut u32,
     ) {
         self.count.set(0);
@@ -249,7 +250,9 @@ impl EventList {
                 continue;
             }
             if let EventData::Parameter { id, value } = event.data {
-                if !changes.add(id, event.sample_offset as i32 - start as i32, value) {
+                if parameter_ids.binary_search(&id).is_err()
+                    || !changes.add(id, event.sample_offset as i32 - start as i32, value)
+                {
                     *rejected = rejected.saturating_add(1);
                 }
                 continue;
@@ -367,6 +370,11 @@ impl EventList {
             self.count.set(i + 1);
         }
     }
+    fn reject(&self, result: tresult) -> tresult {
+        let mut output = self.output.borrow_mut();
+        output.dropped = output.dropped.saturating_add(1);
+        result
+    }
     pub fn collect(&self, output: &mut EventBuffer) {
         for event in self.output.borrow().as_slice() {
             output.push(*event);
@@ -393,7 +401,7 @@ impl IEventListTrait for EventList {
     }
     unsafe fn addEvent(&self, event: *mut Event) -> tresult {
         if event.is_null() {
-            return kInvalidArgument;
+            return self.reject(kInvalidArgument);
         }
         // SAFETY: SDK supplies a live event for synchronous copying.
         let event = unsafe { &*event };
@@ -401,8 +409,7 @@ impl IEventListTrait for EventList {
             || event.busIndex < 0
             || event.busIndex >= i32::from(self.buses.get())
         {
-            self.output.borrow_mut().dropped += 1;
-            return kInvalidArgument;
+            return self.reject(kInvalidArgument);
         }
         let mut result = AudioEvent {
             bus: event.busIndex as u16,
@@ -417,7 +424,7 @@ impl IEventListTrait for EventList {
                     || !(0..128).contains(&n.pitch)
                     || !n.velocity.is_finite()
                 {
-                    return kInvalidArgument;
+                    return self.reject(kInvalidArgument);
                 }
                 EventData::Midi([
                     0x90 | n.channel as u8,
@@ -432,7 +439,7 @@ impl IEventListTrait for EventList {
                     || !(0..128).contains(&n.pitch)
                     || !n.velocity.is_finite()
                 {
-                    return kInvalidArgument;
+                    return self.reject(kInvalidArgument);
                 }
                 EventData::Midi([
                     0x80 | n.channel as u8,
@@ -447,7 +454,7 @@ impl IEventListTrait for EventList {
                     || !(0..128).contains(&n.pitch)
                     || !n.pressure.is_finite()
                 {
-                    return kInvalidArgument;
+                    return self.reject(kInvalidArgument);
                 }
                 EventData::Midi([
                     0xa0 | n.channel as u8,
@@ -463,8 +470,7 @@ impl IEventListTrait for EventList {
                     || n.size as usize > MAX_SYSEX_BYTES
                     || n.bytes.is_null()
                 {
-                    self.output.borrow_mut().dropped += 1;
-                    return kInvalidArgument;
+                    return self.reject(kInvalidArgument);
                 }
                 let mut bytes = [0; MAX_SYSEX_BYTES];
                 // SAFETY: SDK data event supplies size readable bytes; copy before callback return.
@@ -480,25 +486,24 @@ impl IEventListTrait for EventList {
                 // SAFETY: legacy MIDI output tag selects its union member.
                 let n = unsafe { event.__field0.midiCCOut };
                 if !(0..16).contains(&n.channel) || n.value < 0 || n.value2 < 0 {
-                    return kInvalidArgument;
+                    return self.reject(kInvalidArgument);
                 }
                 EventData::Midi(match n.controlNumber {
                     0..=127 => [0xb0 | n.channel as u8, n.controlNumber, n.value as u8],
                     128 => [0xd0 | n.channel as u8, n.value as u8, 0],
                     129 => [0xe0 | n.channel as u8, n.value as u8, n.value2 as u8],
                     130 => [0xc0 | n.channel as u8, n.value as u8, 0],
-                    _ => return kInvalidArgument,
+                    131 => [0xa0 | n.channel as u8, n.value as u8, n.value2 as u8],
+                    _ => return self.reject(kInvalidArgument),
                 })
             }
             _ => {
-                self.output.borrow_mut().dropped += 1;
-                return kNotImplemented;
+                return self.reject(kNotImplemented);
             }
         };
         result.data = data;
         if !result.valid(self.frames.get()) {
-            self.output.borrow_mut().dropped += 1;
-            return kInvalidArgument;
+            return self.reject(kInvalidArgument);
         }
         if self.output.borrow_mut().push(result) {
             kResultOk
@@ -531,4 +536,41 @@ pub(crate) fn process_context(context: Transport, rate: u32) -> ProcessContext {
     result.timeSigNumerator = i32::from(context.numerator);
     result.timeSigDenominator = i32::from(context.denominator);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn legacy_poly_pressure_and_invalid_output_have_explicit_results() {
+        let list = EventList::new();
+        list.reset(128, 0, 1);
+        // SAFETY: SDK Event contains plain numbers/pointers with a valid zero representation.
+        let mut event: Event = unsafe { std::mem::zeroed() };
+        event.r#type = 65535;
+        event.sampleOffset = 17;
+        event.__field0.midiCCOut = LegacyMIDICCOutEvent {
+            controlNumber: 131,
+            channel: 2,
+            value: 60,
+            value2: 95,
+        };
+        // SAFETY: retained audio-thread list and a live writable SDK event.
+        assert_eq!(unsafe { list.addEvent(&mut event) }, kResultOk);
+        event.__field0.midiCCOut = LegacyMIDICCOutEvent {
+            controlNumber: 131,
+            channel: 17,
+            value: 60,
+            value2: 95,
+        };
+        // SAFETY: live SDK event; invalid MIDI channel must be rejected without dereferencing foreign data.
+        assert_eq!(unsafe { list.addEvent(&mut event) }, kInvalidArgument);
+        event.r#type = 99;
+        // SAFETY: live SDK event with an unsupported tag, carrying no borrowed payload.
+        assert_eq!(unsafe { list.addEvent(&mut event) }, kNotImplemented);
+        let mut output = EventBuffer::default();
+        list.collect(&mut output);
+        assert_eq!(output.as_slice(), [AudioEvent::midi(17, 0, [0xa2, 60, 95])]);
+        assert_eq!(output.dropped, 2);
+    }
 }

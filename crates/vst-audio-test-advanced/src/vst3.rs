@@ -252,8 +252,20 @@ impl IAudioProcessorTrait for Matrix {
                 // SAFETY: validated list index and writable Event output.
                 let _ = unsafe { events.getEvent(index as i32, event) };
                 if let Some(out) = &output_events {
-                    // SAFETY: event and any data payload remain readable until this callback returns.
-                    let _ = unsafe { out.addEvent(event) };
+                    let mut echo = *event;
+                    if echo.r#type == 3 {
+                        // SAFETY: the poly-pressure tag selects this union member.
+                        let pressure = unsafe { echo.__field0.polyPressure };
+                        echo.r#type = 65535;
+                        echo.__field0.midiCCOut = LegacyMIDICCOutEvent {
+                            controlNumber: 131,
+                            channel: pressure.channel as i8,
+                            value: pressure.pitch as i8,
+                            value2: (pressure.pressure * 127.0).round() as i8,
+                        };
+                    }
+                    // SAFETY: copied event and any data payload remain readable until this callback returns.
+                    let _ = unsafe { out.addEvent(&mut echo) };
                 }
             }
         }

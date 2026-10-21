@@ -224,7 +224,11 @@ impl AudioEndpoint {
             Some(AudioStatus::InvalidBuffer)
         } else if !transport.valid()
             || events.len() > MAX_EVENTS
-            || events.iter().any(|e| !e.valid(frames as u32))
+            || events.iter().any(|e| {
+                !e.valid(frames as u32)
+                    || (matches!(e.data, EventData::Midi(_) | EventData::SysEx { .. })
+                        && e.bus >= self.active.capabilities.input_event_buses)
+            })
             || events
                 .windows(2)
                 .any(|p| p[0].sample_offset > p[1].sample_offset)

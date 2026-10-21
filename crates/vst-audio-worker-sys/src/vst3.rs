@@ -1243,7 +1243,23 @@ impl Vst3Processor {
     ) -> bool {
         use vst_audio_ring::{EventData, MAX_EVENTS};
         output.clear();
-        if T::FORMAT!=self.setup.sample_format||frames==0||frames>self.frames||planes.len()<self.inputs.max(self.outputs)||planes.iter().any(|p|p.len()<frames)||!context.valid()||input.len()>MAX_EVENTS||input.iter().any(|e|!e.valid(frames as u32)||matches!(e.data,EventData::Parameter{id,..} if self.parameter_ids.binary_search(&id).is_err()))||input.windows(2).any(|p|p[0].sample_offset>p[1].sample_offset)||self.shared.closed.load(Ordering::SeqCst)||!self.shared.admitted.load(Ordering::SeqCst)||self.shared.busy.swap(true,Ordering::SeqCst){return false;}
+        if T::FORMAT != self.setup.sample_format
+            || frames == 0
+            || frames > self.frames
+            || planes.len() < self.inputs.max(self.outputs)
+            || planes.iter().any(|p| p.len() < frames)
+            || !context.valid()
+            || input.len() > MAX_EVENTS
+            || input.iter().any(|e| !e.valid(frames as u32))
+            || input
+                .windows(2)
+                .any(|p| p[0].sample_offset > p[1].sample_offset)
+            || self.shared.closed.load(Ordering::SeqCst)
+            || !self.shared.admitted.load(Ordering::SeqCst)
+            || self.shared.busy.swap(true, Ordering::SeqCst)
+        {
+            return false;
+        }
         let result = (|| {
             if !self.shared.admitted.load(Ordering::SeqCst)
                 || !self.shared.active.load(Ordering::SeqCst)
@@ -1302,6 +1318,7 @@ impl Vst3Processor {
                     self.setup.sample_rate,
                     &self.changes,
                     &self.mappings,
+                    &self.parameter_ids,
                     &mut output.dropped,
                 );
                 let mut input_pointers = [std::ptr::null_mut(); 64];

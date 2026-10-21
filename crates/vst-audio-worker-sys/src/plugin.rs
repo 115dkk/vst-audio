@@ -661,11 +661,7 @@ impl Vst2Processor {
             || planes.iter().any(|p| p.len() < frames)
             || !context.valid()
             || input.len() > MAX_EVENTS
-            || input.iter().any(|e| {
-                !e.valid(frames as u32)
-                    || e.bus != 0
-                    || matches!(e.data, EventData::Parameter {id,..} if id >= self.parameter_count)
-            })
+            || input.iter().any(|e| !e.valid(frames as u32) || e.bus != 0)
             || input
                 .windows(2)
                 .any(|p| p[0].sample_offset > p[1].sample_offset)
@@ -694,9 +690,11 @@ impl Vst2Processor {
                 for event in input.iter().filter(|e| e.sample_offset as usize == start) {
                     match event.data {
                         EventData::Parameter { id, value } => {
-                            let Some(set) = set else {
-                                return false;
-                            };
+                            if id >= self.parameter_count || set.is_none() {
+                                output.dropped = output.dropped.saturating_add(1);
+                                continue;
+                            }
+                            let set = set.expect("validated setter");
                             // SAFETY: admitted instance, validated parameter index and normalized value.
                             unsafe { set(self.shared.effect(), id, value as f32) };
                         }
