@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -110,7 +111,12 @@ def main():
             # Delete only this exact mkdtemp-created directory, outside the checkout.
             parent = Path(os.environ.get("RUNNER_TEMP") or tempfile.gettempdir()).resolve()
             assert root.parent == parent and root.name.startswith("vst-audio-real-") and not root.is_symlink()
-            shutil.rmtree(root)
+            def remove_readonly(function, path, _error):
+                resolved=Path(path).resolve()
+                assert root in resolved.parents, "cleanup escaped its temporary tree"
+                os.chmod(resolved,stat.S_IWRITE|stat.S_IREAD)
+                function(path)
+            shutil.rmtree(root,onerror=remove_readonly)
 
 if __name__ == "__main__":
     main()
