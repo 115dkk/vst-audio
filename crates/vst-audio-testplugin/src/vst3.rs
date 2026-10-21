@@ -56,8 +56,13 @@ impl Matrix {
         let mut read = 0;
         // SAFETY: two-byte writable output and byte-count output are live for this call.
         let result = unsafe { stream.read(bytes.as_mut_ptr().cast(), 2, &mut read) };
-        if result != kResultOk || read != 2 || bytes[0] != 1 || bytes[1] > 4 {
+        if result != kResultOk || read != 2 || bytes[0] != 1 || bytes[1] > 5 {
             return kInvalidArgument;
+        }
+        if bytes[1] == 5 {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
         }
         if bytes[1] == 4 {
             std::process::abort();

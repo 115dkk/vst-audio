@@ -1,18 +1,15 @@
 //! GUI- and executor-independent application API.
 use crate::audio::{AudioEndpoint, PreparedAudio};
-use crate::{ControlEvent, PluginControl, PluginFormat, PluginProcess, StartError, Started};
+use crate::{PluginFormat, PluginProcess, StartError, Started};
 use std::{
-    collections::BTreeMap,
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
         mpsc,
     },
     thread,
-    time::Duration,
 };
-use vst_audio_protocol::{Action, Message};
 
 /// Application-selected processing settings. No sound device is opened.
 #[derive(Clone, Debug)]
@@ -21,6 +18,7 @@ pub struct Configuration {
     /// Exact number of frames per realtime call.
     pub quantum: u32,
     pub fallback: Fallback,
+    pub recovery: RecoveryPolicy,
     pub sample_format: vst_audio_protocol::SampleFormat,
     pub offline: bool,
     pub inputs: Option<Vec<vst_audio_protocol::BusConfiguration>>,
@@ -32,10 +30,55 @@ impl Default for Configuration {
             sample_rate: 48_000,
             quantum: 128,
             fallback: Fallback::Silence,
+            recovery: RecoveryPolicy::Manual,
             sample_format: vst_audio_protocol::SampleFormat::F32,
             offline: false,
             inputs: None,
             outputs: None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RecoveryPolicy {
+    #[default]
+    Manual,
+    Automatic {
+        attempts: u8,
+        backoff_ms: u32,
+    },
+}
+#[derive(Clone, Debug)]
+pub(crate) struct Launch {
+    pub host: Host,
+    pub plugin: PluginDescriptor,
+    pub configuration: Configuration,
+}
+impl Launch {
+    pub fn start(
+        &self,
+        state: Option<&[u8]>,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<Started, StartError> {
+        PluginProcess::start_configured(
+            &self.host.worker,
+            &self.plugin.path,
+            self.plugin.format,
+            self.plugin.class_id,
+            &self.configuration.options(Some(cancel)),
+            state,
+        )
+    }
+}
+impl Configuration {
+    fn options(&self, cancel: Option<Arc<AtomicBool>>) -> crate::ProcessingOptions {
+        crate::ProcessingOptions {
+            cancel,
+            sample_rate: self.sample_rate,
+            quantum: self.quantum,
+            sample_format: self.sample_format,
+            offline: self.offline,
+            inputs: self.inputs.clone(),
+            outputs: self.outputs.clone(),
         }
     }
 }
@@ -86,23 +129,26 @@ impl Host {
         config: &Configuration,
         state: Option<&[u8]>,
     ) -> Result<Instance, StartError> {
-        let options = crate::ProcessingOptions {
-            sample_rate: config.sample_rate,
-            quantum: config.quantum,
-            sample_format: config.sample_format,
-            offline: config.offline,
-            inputs: config.inputs.clone(),
-            outputs: config.outputs.clone(),
+        self.spawn_cancel(plugin, config, state, Arc::new(AtomicBool::new(false)))
+    }
+    fn spawn_cancel(
+        &self,
+        plugin: &PluginDescriptor,
+        config: &Configuration,
+        state: Option<&[u8]>,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<Instance, StartError> {
+        if matches!(config.recovery,RecoveryPolicy::Automatic{attempts,backoff_ms} if attempts>8||backoff_ms>60000)
+        {
+            return Err(StartError("invalid recovery policy".into()));
+        }
+        let launch = Launch {
+            host: self.clone(),
+            plugin: plugin.clone(),
+            configuration: config.clone(),
         };
-        let started = PluginProcess::start_configured(
-            &self.worker,
-            &plugin.path,
-            plugin.format,
-            plugin.class_id,
-            &options,
-            state,
-        )?;
-        Instance::new(started, config.fallback)
+        let started = launch.start(state, cancel.clone())?;
+        Instance::new(started, config.fallback, launch, cancel)
     }
     /// Starts loading on a dedicated control thread; polling never blocks the GUI.
     pub fn spawn_async(
@@ -113,19 +159,44 @@ impl Host {
     ) -> LoadTask {
         let host = self.clone();
         let (tx, rx) = mpsc::sync_channel(1);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
         thread::spawn(move || {
-            let _ = tx.send(host.spawn(&plugin, &config, state.as_deref()));
+            let _ = tx.send(host.spawn_cancel(&plugin, &config, state.as_deref(), worker_cancel));
         });
-        LoadTask(rx)
+        LoadTask {
+            receive: rx,
+            cancel,
+            delivered: std::cell::Cell::new(false),
+        }
     }
 }
 
 #[derive(Debug)]
-pub struct LoadTask(mpsc::Receiver<Result<Instance, StartError>>);
+pub struct LoadTask {
+    receive: mpsc::Receiver<Result<Instance, StartError>>,
+    cancel: Arc<AtomicBool>,
+    delivered: std::cell::Cell<bool>,
+}
+impl Drop for LoadTask {
+    fn drop(&mut self) {
+        if !self.delivered.get() {
+            self.cancel.store(true, Ordering::Release);
+        }
+    }
+}
 impl LoadTask {
+    pub fn cancel(&self) {
+        if !self.delivered.get() {
+            self.cancel.store(true, Ordering::Release);
+        }
+    }
     pub fn try_complete(&self) -> Result<Option<Instance>, StartError> {
-        match self.0.try_recv() {
-            Ok(result) => result.map(Some),
+        match self.receive.try_recv() {
+            Ok(result) => {
+                self.delivered.set(true);
+                result.map(Some)
+            }
             Err(mpsc::TryRecvError::Empty) => Ok(None),
             Err(mpsc::TryRecvError::Disconnected) => Err(StartError(
                 "load task disconnected or already consumed".into(),
@@ -144,6 +215,7 @@ pub enum Command {
     SetParameter { id: u32, value: f64 },
     SaveState,
     RestoreState(Vec<u8>),
+    Recover { use_previous: bool },
     Shutdown,
 }
 #[derive(Clone, Debug)]
@@ -171,6 +243,9 @@ pub enum HostEvent {
         reason: String,
     },
     RecoveryRequired,
+    Recovered {
+        generation: u64,
+    },
     Stopped,
     /// The GUI was slower than the bounded notification queue. `status` remains
     /// available independently; request a fresh state after draining notifications.
@@ -180,16 +255,19 @@ pub enum HostEvent {
 pub enum Status {
     Running,
     Failed,
+    Recovering,
     Stopped,
 }
 
 #[derive(Debug)]
 pub(crate) struct Shared {
-    pub(crate) stop: AtomicBool,
+    pub(crate) stop: Arc<AtomicBool>,
     pub(crate) status: AtomicU8,
-    overflow: AtomicBool,
+    pub(crate) overflow: AtomicBool,
     next_request: AtomicU64,
     pub(crate) generation: AtomicU64,
+    pub(crate) applied_generation: AtomicU64,
+    pub(crate) history: Mutex<vst_audio_protocol::StateHistory>,
 }
 #[derive(Clone, Debug)]
 pub struct Controller {
@@ -205,7 +283,12 @@ impl Controller {
         {
             return Err(StartError("state too large".into()));
         }
-        if self.status() != Status::Running {
+        if self.status() != Status::Running
+            && !matches!(
+                (&command, self.status()),
+                (Command::Recover { .. }, Status::Failed) | (Command::Shutdown, _)
+            )
+        {
             return Err(StartError("plugin is not running".into()));
         }
         let id = self
@@ -227,6 +310,7 @@ fn status(shared: &Shared) -> Status {
     match shared.status.load(Ordering::Acquire) {
         0 => Status::Running,
         1 => Status::Failed,
+        3 | 4 => Status::Recovering,
         _ => Status::Stopped,
     }
 }
@@ -240,13 +324,20 @@ pub struct Instance {
     audio: Option<AudioEndpoint>,
 }
 impl Instance {
-    fn new(started: Started, fallback: Fallback) -> Result<Self, StartError> {
+    fn new(
+        started: Started,
+        fallback: Fallback,
+        launch: Launch,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<Self, StartError> {
         let shared = Arc::new(Shared {
-            stop: AtomicBool::new(false),
+            stop: cancel,
             status: AtomicU8::new(0),
             overflow: AtomicBool::new(false),
             next_request: AtomicU64::new(1),
             generation: AtomicU64::new(1),
+            applied_generation: AtomicU64::new(1),
+            history: Mutex::new(started.control.state_history()),
         });
         let Started {
             control,
@@ -259,6 +350,11 @@ impl Instance {
             capabilities,
             ..
         } = started;
+        let recovery = crate::supervision::RecoveryConfig {
+            launch,
+            geometry,
+            setup: setup.clone(),
+        };
         let prepared = PreparedAudio {
             region,
             work,
@@ -277,7 +373,17 @@ impl Instance {
         let control_shared = shared.clone();
         thread::Builder::new()
             .name("vst-audio-supervisor".into())
-            .spawn(move || supervise(control, rx, tx, control_shared, updates, retirements))
+            .spawn(move || {
+                crate::supervision::supervise(
+                    control,
+                    rx,
+                    tx,
+                    control_shared,
+                    updates,
+                    retirements,
+                    recovery,
+                )
+            })
             .map_err(|e| StartError(e.to_string()))?;
         Ok(Self {
             controller: Controller { requests, shared },
@@ -311,191 +417,5 @@ impl Instance {
 impl Drop for Instance {
     fn drop(&mut self) {
         self.controller.shared.stop.store(true, Ordering::Release);
-    }
-}
-
-fn emit(tx: &mpsc::SyncSender<HostEvent>, shared: &Shared, event: HostEvent) {
-    if tx.try_send(event).is_err() {
-        shared.overflow.store(true, Ordering::Release);
-    }
-}
-fn supervise(
-    mut control: PluginControl,
-    requests: mpsc::Receiver<(RequestId, Command)>,
-    events: mpsc::SyncSender<HostEvent>,
-    shared: Arc<Shared>,
-    _updates: rtrb::Producer<PreparedAudio>,
-    mut retirements: rtrb::Consumer<PreparedAudio>,
-) {
-    let mut pending = BTreeMap::new();
-    let mut stopping = false;
-    let mut failure_reported = false;
-    loop {
-        while let Ok(retired) = retirements.pop() {
-            drop(retired);
-        }
-        if shared.stop.load(Ordering::Acquire) && !stopping {
-            let _ = control.shutdown();
-            stopping = true;
-        }
-        for _ in 0..8 {
-            let Ok((id, command)) = requests.try_recv() else {
-                break;
-            };
-            if pending.len() >= 64 {
-                emit(
-                    &events,
-                    &shared,
-                    HostEvent::RequestFailed {
-                        request: id,
-                        reason: "too many pending requests".into(),
-                    },
-                );
-                continue;
-            }
-            let result = match command {
-                Command::OpenEditor => control.open_editor(),
-                Command::CloseEditor => control.request_close_editor(),
-                Command::ListParameters { start, count } => control.parameters(start, count),
-                Command::SetParameter { id, value } => control.set_parameter(id, value),
-                Command::SaveState => control.get_state(),
-                Command::RestoreState(bytes) => control.set_state(&bytes),
-                Command::Shutdown => {
-                    stopping = true;
-                    match control.shutdown() {
-                        Ok(()) => emit(&events, &shared, HostEvent::Completed { request: id }),
-                        Err(e) => emit(
-                            &events,
-                            &shared,
-                            HostEvent::RequestFailed {
-                                request: id,
-                                reason: e.to_string(),
-                            },
-                        ),
-                    }
-                    continue;
-                }
-            };
-            match result {
-                Ok(wire) => {
-                    pending.insert(wire, id);
-                }
-                Err(e) => emit(
-                    &events,
-                    &shared,
-                    HostEvent::RequestFailed {
-                        request: id,
-                        reason: e.to_string(),
-                    },
-                ),
-            }
-        }
-        for event in control.poll(control.elapsed_ms()) {
-            match event {
-                ControlEvent::Message(frame) => {
-                    let request = pending.remove(&frame.request);
-                    match frame.message {
-                        Message::State { blob } => emit(
-                            &events,
-                            &shared,
-                            HostEvent::State {
-                                request,
-                                bytes: blob,
-                            },
-                        ),
-                        Message::Ack => {
-                            if let Some(request) = request {
-                                emit(&events, &shared, HostEvent::Completed { request });
-                            }
-                        }
-                        Message::Parameters { total, entries } => {
-                            if let Some(request) = request {
-                                emit(
-                                    &events,
-                                    &shared,
-                                    HostEvent::Parameters {
-                                        request,
-                                        total,
-                                        entries,
-                                    },
-                                );
-                            }
-                        }
-                        Message::RequestError { text, .. } => {
-                            if let Some(request) = request {
-                                emit(
-                                    &events,
-                                    &shared,
-                                    HostEvent::RequestFailed {
-                                        request,
-                                        reason: text,
-                                    },
-                                );
-                            }
-                        }
-                        Message::EditorClosed => emit(&events, &shared, HostEvent::EditorClosed),
-                        Message::ParamsChanged => {
-                            emit(&events, &shared, HostEvent::ParametersChanged)
-                        }
-                        Message::LatencyChanged { frames } => {
-                            emit(&events, &shared, HostEvent::LatencyChanged(frames))
-                        }
-                        Message::Fault { text, .. } => {
-                            shared.status.store(1, Ordering::Release);
-                            failure_reported = true;
-                            emit(&events, &shared, HostEvent::Failed { reason: text });
-                        }
-                        _ => {}
-                    }
-                }
-                ControlEvent::Exited(code) => {
-                    let failed = !stopping || code != 0;
-                    shared
-                        .status
-                        .store(if failed { 1 } else { 2 }, Ordering::Release);
-                    if failed && !failure_reported {
-                        emit(
-                            &events,
-                            &shared,
-                            HostEvent::Failed {
-                                reason: format!("worker exited with status {code}"),
-                            },
-                        );
-                    }
-                    if failed {
-                        emit(&events, &shared, HostEvent::RecoveryRequired);
-                    } else {
-                        emit(&events, &shared, HostEvent::Stopped);
-                    }
-                    for (_, request) in pending {
-                        emit(
-                            &events,
-                            &shared,
-                            HostEvent::RequestFailed {
-                                request,
-                                reason: "worker exited".into(),
-                            },
-                        );
-                    }
-                    return;
-                }
-                ControlEvent::Action(Action::Kill { .. } | Action::Disable { .. }) => {
-                    shared.status.store(1, Ordering::Release);
-                    if !stopping && !failure_reported {
-                        failure_reported = true;
-                        emit(
-                            &events,
-                            &shared,
-                            HostEvent::Failed {
-                                reason: "worker deadline exceeded".into(),
-                            },
-                        );
-                    }
-                }
-                _ => {}
-            }
-        }
-        // This supervisor never waits on a plugin call or pipe write.
-        thread::sleep(Duration::from_millis(5));
     }
 }

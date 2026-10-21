@@ -1065,6 +1065,9 @@ impl StateHistory {
         Self::default()
     }
     pub fn save(&mut self, blob: Vec<u8>) {
+        if self.current.as_ref() == Some(&blob) {
+            return;
+        }
         self.previous = self.current.replace(blob);
         self.restoring_current = false;
     }

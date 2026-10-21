@@ -297,7 +297,7 @@ impl AudioEndpoint {
                 self.pending.push(e);
                 event_index += 1;
             }
-            let running = self.shared.status.load(Ordering::Acquire) == 0
+            let running = matches!(self.shared.status.load(Ordering::Acquire), 0 | 3)
                 && self.shared.generation.load(Ordering::Acquire) == self.active.generation;
             let valid_output = self.ready && running;
             if !valid_output {
@@ -382,6 +382,10 @@ impl AudioEndpoint {
             self.retired
                 .push(old)
                 .expect("single producer reserved retirement slot");
+            self.shared
+                .applied_generation
+                .store(self.active.generation, Ordering::Release);
+            self.pending.clear();
             self.pipeline.clear();
             self.sequence = 1;
             self.block = 0;
@@ -393,7 +397,7 @@ impl AudioEndpoint {
         if self.sequence == u32::MAX || self.block == u64::MAX {
             return false;
         }
-        if self.shared.status.load(Ordering::Acquire) != 0
+        if !matches!(self.shared.status.load(Ordering::Acquire), 0 | 3)
             || self.shared.generation.load(Ordering::Acquire) != self.active.generation
         {
             self.pending.clear();

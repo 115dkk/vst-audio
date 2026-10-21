@@ -200,6 +200,10 @@ impl Plugin for Vst2 {
 
 pub fn host_main(args: Args) -> Result<(), StartError> {
     runtime::suppress_error_dialogs();
+    let trace = std::env::var_os("VST_AUDIO_TRACE").is_some();
+    if trace {
+        eprintln!("worker {} starting", std::process::id());
+    }
     #[cfg(target_os = "macos")]
     vst_audio_worker_sys::editor::initialize().map_err(error)?;
     let input = runtime::inherited_file(args.control_in).map_err(error)?;
@@ -260,6 +264,13 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
             }
             match rx.recv_timeout(Duration::from_millis(10)) {
                 Ok(Ok(Some(DecodedFrame::Known(frame)))) => {
+                    if trace {
+                        eprintln!(
+                            "worker request {} {:?}",
+                            frame.request,
+                            std::mem::discriminant(&frame.message)
+                        );
+                    }
                     let request = frame.request;
                     let shutdown = matches!(frame.message, Message::Shutdown);
                     let recoverable = matches!(

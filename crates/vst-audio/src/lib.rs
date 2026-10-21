@@ -12,7 +12,7 @@ pub use vst_audio_transport_sys::{Event, SharedEvent, SharedRegion};
 mod api;
 pub use api::{
     Command, Configuration, Controller, Fallback, Host, HostEvent, Instance, LoadTask,
-    PluginDescriptor, RequestId, Status,
+    PluginDescriptor, RecoveryPolicy, RequestId, Status,
 };
 
 pub use vst_audio_protocol::Parameter;
@@ -24,3 +24,5 @@ pub use vst_audio_ring::{
 
 mod audio;
 pub use audio::{AudioEndpoint, AudioStatus, ProcessReport};
+
+mod supervision;

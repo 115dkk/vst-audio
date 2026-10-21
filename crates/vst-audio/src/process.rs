@@ -6,6 +6,7 @@ use std::{
     path::Path,
     sync::{
         Arc,
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, SyncSender},
     },
     thread,
@@ -29,6 +30,8 @@ fn error(error: impl std::fmt::Display) -> StartError {
 }
 
 struct Transport {
+    process: Arc<ChildProcess>,
+    cancel: Option<Arc<AtomicBool>>,
     pending: std::cell::RefCell<std::collections::VecDeque<Frame>>,
     send: SyncSender<Frame>,
     receive: Receiver<Result<Option<DecodedFrame>, CodecError>>,
@@ -39,7 +42,12 @@ impl std::fmt::Debug for Transport {
     }
 }
 impl Transport {
-    fn new(mut input: impl Read + Send + 'static, mut output: impl Write + Send + 'static) -> Self {
+    fn new(
+        mut input: impl Read + Send + 'static,
+        mut output: impl Write + Send + 'static,
+        cancel: Option<Arc<AtomicBool>>,
+        process: Arc<ChildProcess>,
+    ) -> Self {
         let (tx, rx) = mpsc::sync_channel(8);
         let (frames, received) = mpsc::sync_channel(2);
         thread::spawn(move || {
@@ -59,6 +67,8 @@ impl Transport {
             }
         });
         Self {
+            process,
+            cancel,
             pending: Default::default(),
             send: tx,
             receive: received,
@@ -76,13 +86,31 @@ impl Transport {
     fn response(&self, request: u32, timeout: Duration) -> Result<Frame, StartError> {
         let deadline = Instant::now() + timeout;
         loop {
-            let frame = self
+            if self
+                .cancel
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Acquire))
+            {
+                return Err(StartError("operation cancelled".into()));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(StartError("worker response timed out".into()));
+            }
+            let frame = match self
                 .receive
-                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                .map_err(error)?
-                .map_err(error)?;
+                .recv_timeout(remaining.min(Duration::from_millis(20)))
+            {
+                Ok(frame) => frame.map_err(error)?,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(e) => return Err(error(e)),
+            };
             let Some(frame) = frame else {
-                return Err(StartError("host closed control pipe".into()));
+                let _ = self.process.wait(Duration::from_millis(100));
+                return Err(StartError(format!(
+                    "host closed control pipe; exit={:?}",
+                    self.process.exit_code().ok().flatten()
+                )));
             };
             if let DecodedFrame::Known(frame) = frame {
                 if let Message::Fault { code, text } | Message::RequestError { code, text } =
@@ -104,6 +132,7 @@ impl Transport {
 
 #[derive(Clone, Debug)]
 pub struct ProcessingOptions {
+    pub cancel: Option<Arc<AtomicBool>>,
     pub sample_rate: u32,
     pub quantum: u32,
     pub sample_format: SampleFormat,
@@ -114,6 +143,7 @@ pub struct ProcessingOptions {
 impl Default for ProcessingOptions {
     fn default() -> Self {
         Self {
+            cancel: None,
             sample_rate: 48000,
             quantum: 128,
             sample_format: SampleFormat::F32,
@@ -166,7 +196,7 @@ pub enum ControlEvent {
 }
 #[derive(Debug)]
 pub struct PluginControl {
-    process: ChildProcess,
+    process: Arc<ChildProcess>,
     transport: Transport,
     region: Arc<SharedRegion>,
     work: Arc<Event>,
@@ -178,6 +208,9 @@ pub struct PluginControl {
     pub needs_respawn: bool,
 }
 impl PluginControl {
+    pub fn state_history(&self) -> vst_audio_protocol::StateHistory {
+        self.watch.states.clone()
+    }
     fn now(&self) -> u64 {
         self.clock_base
             .saturating_add(self.origin.elapsed().as_millis().min(u128::from(u64::MAX)) as u64)
@@ -409,7 +442,8 @@ impl PluginProcess {
                 .checked_mul(2)
                 .ok_or_else(|| StartError("invalid rate".into()))?,
         };
-        let (process, transport, region, work, done, ready) = spawn(exe, maximum)?;
+        let (process, transport, region, work, done, ready) =
+            spawn(exe, maximum, options.cancel.clone())?;
         let mut watch = ControlWatch::new(0);
         let hello = transport.response(0, Duration::from_secs(5))?;
         if hello.message != Message::hello() {
@@ -567,7 +601,7 @@ impl PluginProcess {
             sample_rate: 48000,
             latency_bound_frames: 96000,
         };
-        let (process, transport, ..) = spawn(exe, geometry)?;
+        let (process, transport, ..) = spawn(exe, geometry, None)?;
         if transport.response(0, Duration::from_secs(5))?.message != Message::hello() {
             return Err(StartError("expected Hello".into()));
         }
@@ -598,14 +632,18 @@ fn expect_ack(frame: Frame) -> Result<(), StartError> {
     }
 }
 type Spawned = (
-    ChildProcess,
+    Arc<ChildProcess>,
     Transport,
     Arc<SharedRegion>,
     Arc<Event>,
     Arc<Event>,
     Arc<Event>,
 );
-fn spawn(exe: &Path, geometry: Geometry) -> Result<Spawned, StartError> {
+fn spawn(
+    exe: &Path,
+    geometry: Geometry,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<Spawned, StartError> {
     let region = Arc::new(
         SharedRegion::create(
             geometry
@@ -645,9 +683,9 @@ fn spawn(exe: &Path, geometry: Geometry) -> Result<Spawned, StartError> {
     }
     args.push("--region-bytes".into());
     args.push(region.bytes().to_string().into());
-    let process = runtime::spawn_handles(exe, &args, &values, parent).map_err(error)?;
+    let process = Arc::new(runtime::spawn_handles(exe, &args, &values, parent).map_err(error)?);
     drop(input.child);
     drop(output.child);
-    let transport = Transport::new(output.parent, input.parent);
+    let transport = Transport::new(output.parent, input.parent, cancel, process.clone());
     Ok((process, transport, region, work, done, ready))
 }

@@ -211,3 +211,86 @@ fn parameter_pages_and_invalid_edits_do_not_kill_instances() {
         assert!((entries[0].value - 0.25).abs() < 1e-6);
     }
 }
+
+#[test]
+#[ignore = "native fixtures required"]
+fn recovery_replaces_resources_only_at_an_audio_boundary() {
+    for format in [PluginFormat::Vst2, PluginFormat::Vst3] {
+        let mut instance = host()
+            .spawn(&descriptor(format), &Configuration::default(), None)
+            .unwrap();
+        let controller = instance.controller();
+        let mut audio = instance.take_audio().unwrap();
+        let crash = controller
+            .request(Command::RestoreState(state(format, 1)))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while !matches!(instance.try_next_event(),Some(HostEvent::Completed{request})if request==crash)
+        {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let input = [0.25; 128];
+        let mut output = [[0.0; 128]; 6];
+        let mut refs: Vec<_> = output.iter_mut().map(|p| &mut p[..]).collect();
+        audio.process(&[&input, &input], &mut refs);
+        while controller.status() != Status::Failed {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let recover = controller
+            .request(Command::Recover {
+                use_previous: false,
+            })
+            .unwrap();
+        while !matches!(instance.try_next_event(),Some(HostEvent::Completed{request})if request==recover)
+        {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let half = [0.25; 64];
+        let mut short = [[0.0; 64]; 6];
+        let mut short_refs: Vec<_> = short.iter_mut().map(|p| &mut p[..]).collect();
+        assert_no_alloc::assert_no_alloc(|| audio.process(&[&half, &half], &mut short_refs));
+        assert_eq!(audio.generation(), 1);
+        assert_no_alloc::assert_no_alloc(|| audio.process(&[&half, &half], &mut short_refs));
+        assert_eq!(audio.generation(), 2);
+        let mut recovered = false;
+        while Instant::now() < deadline {
+            let result =
+                assert_no_alloc::assert_no_alloc(|| audio.process(&[&input, &input], &mut refs));
+            if result == AudioStatus::Processed && refs[0][100] > 0.0 {
+                recovered = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(recovered);
+        assert!((refs[0][100] - 0.25).abs() < 1e-6);
+    }
+}
+
+#[test]
+#[ignore = "native fixtures required"]
+fn cancellation_interrupts_a_hung_state_restore() {
+    let task = host().spawn_async(
+        descriptor(PluginFormat::Vst3),
+        Configuration::default(),
+        Some(state(PluginFormat::Vst3, 5)),
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    task.cancel();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match task.try_complete() {
+            Err(error) => {
+                assert!(error.to_string().contains("cancel"));
+                break;
+            }
+            Ok(None) => {}
+            Ok(Some(_)) => panic!("hung state restore unexpectedly completed"),
+        };
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}

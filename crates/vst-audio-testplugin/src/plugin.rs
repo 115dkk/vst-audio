@@ -118,8 +118,13 @@ unsafe extern "C" fn dispatch(
             }
             // SAFETY: SET_CHUNK supplies value readable bytes for this synchronous call.
             let chunk = unsafe { std::slice::from_raw_parts(pointer.cast::<u8>(), 2) };
-            if chunk[0] != 1 || chunk[1] > 4 {
+            if chunk[0] != 1 || chunk[1] > 5 {
                 return 0;
+            }
+            if chunk[1] == 5 {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
             }
             if chunk[1] == 4 {
                 std::process::abort();
