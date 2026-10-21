@@ -300,7 +300,6 @@ impl Drop for Editor {
     }
 }
 pub struct Vst3Plugin {
-    component: ComPtr<IComponent>,
     controller: Option<ComPtr<IEditController>>,
     separate: bool,
     component_initialized: bool,
@@ -309,6 +308,8 @@ pub struct Vst3Plugin {
     editor: Option<Editor>,
     handler: ComPtr<IComponentHandler>,
     shared: Arc<Shared>,
+    // Child interfaces must be released before the component (DPF enforces this).
+    component: ComPtr<IComponent>,
     info: Info,
     module: Vst3Module,
     closed_editor: bool,
@@ -692,7 +693,7 @@ impl Vst3Plugin {
         {
             for bus in 0..self.capabilities.input_event_buses {
                 for channel in 0..16 {
-                    for cc in 0..=130 {
+                    for cc in 0..130 {
                         let mut id = 0;
                         // SAFETY: UI-thread controller mapping query with valid MIDI ranges and writable output.
                         if unsafe {
@@ -707,17 +708,55 @@ impl Vst3Plugin {
                             mappings.push((
                                 (u32::from(bus) << 16) | ((channel as u32) << 8) | cc as u32,
                                 id,
+                                0,
                             ));
                         }
                     }
                 }
             }
         }
+        // Program changes are parameters associated with units, not CC number
+        // 130 (that number is reserved for legacy MIDI *output* events).
+        if let Some(controller) = &self.controller {
+            let units = controller.cast::<IUnitInfo>();
+            // SAFETY: initialized controller queried on its main thread.
+            let count = unsafe { controller.getParameterCount() }.clamp(0, 65536);
+            let mut programs = Vec::new();
+            for index in 0..count {
+                // SAFETY: ParameterInfo has primitive fields with valid zero representations.
+                let mut info: ParameterInfo = unsafe { std::mem::zeroed() };
+                // SAFETY: writable parameter record and in-range parameter index.
+                if unsafe { controller.getParameterInfo(index, &mut info) } == kResultOk
+                    && info.flags & (1 << 15) != 0
+                    && info.stepCount > 0
+                {
+                    programs.push((info.unitId, info.id, info.stepCount as u32));
+                }
+            }
+            for bus in 0..self.capabilities.input_event_buses {
+                for channel in 0..16 {
+                    let mut unit = 0;
+                    if let Some(units) = &units {
+                        // SAFETY: live unit interface, valid event bus/channel, writable unit id.
+                        let _ =
+                            unsafe { units.getUnitByBus(1, 0, i32::from(bus), channel, &mut unit) };
+                    }
+                    if let Some((_, id, steps)) = programs.iter().find(|p| p.0 == unit) {
+                        mappings.push((
+                            (u32::from(bus) << 16) | ((channel as u32) << 8) | 130,
+                            *id,
+                            *steps,
+                        ));
+                    }
+                }
+            }
+        }
+        mappings.sort_unstable_by_key(|p| p.0);
         let mut parameter_ids = Vec::new();
         let mut start = 0;
         loop {
             let (total, page) = self.parameters(start, 32)?;
-            parameter_ids.extend(page.into_iter().map(|p| p.id));
+            parameter_ids.extend(page.into_iter().filter(|p| !p.read_only).map(|p| p.id));
             start += 32;
             if start >= total {
                 break;
@@ -787,6 +826,9 @@ impl Vst3Plugin {
                 value,
                 default: Some(info.defaultNormalizedValue),
                 steps: Some(info.stepCount as u32),
+                automatable: info.flags & 1 != 0,
+                read_only: info.flags & 2 != 0,
+                hidden: info.flags & (1 << 4) != 0,
             });
         }
         Ok((total as u32, entries))
@@ -796,14 +838,18 @@ impl Vst3Plugin {
             return Err(PluginError("invalid parameter value".into()));
         }
         let (total, first) = self.parameters(0, 32)?;
-        let mut found = first.iter().any(|p| p.id == id);
+        let mut found = first.iter().any(|p| p.id == id && !p.read_only);
         let mut start = 32;
         while !found && start < total {
-            found = self.parameters(start, 32)?.1.iter().any(|p| p.id == id);
+            found = self
+                .parameters(start, 32)?
+                .1
+                .iter()
+                .any(|p| p.id == id && !p.read_only);
             start += 32;
         }
         if !found {
-            return Err(PluginError("unknown parameter".into()));
+            return Err(PluginError("unknown or read-only parameter".into()));
         }
         let controller = self
             .controller
@@ -1120,7 +1166,7 @@ pub struct Vst3Processor {
     input_events_ptr: ComPtr<IEventList>,
     output_events: ComWrapper<crate::vst3_events::EventList>,
     output_events_ptr: ComPtr<IEventList>,
-    mappings: Vec<(u32, u32)>,
+    mappings: Vec<(u32, u32, u32)>,
     parameter_ids: Vec<u32>,
     inputs: usize,
     outputs: usize,

@@ -15,6 +15,9 @@ fn parameter_codec_is_bounded_and_preserves_optional_metadata() {
         Message::Parameters {
             total: 1,
             entries: vec![Parameter {
+                automatable: true,
+                read_only: false,
+                hidden: false,
                 id: 99,
                 name: "Gain".into(),
                 unit: "dB".into(),

@@ -18,7 +18,7 @@ pub mod state;
 pub struct PluginError(pub String);
 
 pub const MAGIC: [u8; 4] = *b"SSRP";
-pub const PROTOCOL_MAJOR: u16 = 2;
+pub const PROTOCOL_MAJOR: u16 = 3;
 pub const PROTOCOL_MINOR: u16 = 0;
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 pub const MAX_STATE_BYTES: usize = 64 * 1024 * 1024;
@@ -56,6 +56,9 @@ pub struct Parameter {
     pub value: f64,
     pub default: Option<f64>,
     pub steps: Option<u32>,
+    pub automatable: bool,
+    pub read_only: bool,
+    pub hidden: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -492,6 +495,11 @@ fn encode_message(message: &Message, out: &mut Vec<u8>) -> Result<(), CodecError
             put_u16(out, entries.len() as u16);
             for entry in entries {
                 put_u32(out, entry.id);
+                out.push(
+                    u8::from(entry.automatable)
+                        | (u8::from(entry.read_only) << 1)
+                        | (u8::from(entry.hidden) << 2),
+                );
                 put_string(out, &entry.name)?;
                 put_string(out, &entry.unit)?;
                 put_u64(out, entry.value.to_bits());
@@ -710,6 +718,10 @@ fn decode_message(kind: u16, body: &[u8]) -> Result<Option<Message>, CodecError>
             let mut entries = Vec::with_capacity(count as usize);
             for _ in 0..count {
                 let id = cursor.u32()?;
+                let flags = cursor.u8()?;
+                if flags & !7 != 0 {
+                    return Err(CodecError::InvalidValue);
+                }
                 let name = cursor.string()?;
                 let unit = cursor.string()?;
                 let value = cursor.normalized()?;
@@ -724,6 +736,9 @@ fn decode_message(kind: u16, body: &[u8]) -> Result<Option<Message>, CodecError>
                     _ => return Err(CodecError::InvalidValue),
                 };
                 entries.push(Parameter {
+                    automatable: flags & 1 != 0,
+                    read_only: flags & 2 != 0,
+                    hidden: flags & 4 != 0,
                     id,
                     name,
                     unit,

@@ -398,6 +398,9 @@ impl Vst2Plugin {
                 value,
                 default: None,
                 steps: None,
+                automatable: control.call(26, id as i32, 0, std::ptr::null_mut(), 0.0) == 1,
+                read_only: control.effect().set_parameter.is_none(),
+                hidden: false,
             });
         }
         Ok((self.parameter_count, entries))

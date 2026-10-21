@@ -14,6 +14,7 @@ struct Instance {
     input: Arrangement,
     output: Arrangement,
     rect: Rect,
+    canvas: Option<crate::visual::Canvas>,
 }
 
 // SAFETY: the entry symbol has the VST 2 ABI, has no competing definition, and
@@ -44,6 +45,7 @@ pub extern "C" fn VSTPluginMain(host: Callback) -> *mut AEffect {
         active: false,
         input: Arrangement::new(ARR_STEREO, &[1, 2]),
         output: Arrangement::new(ARR_51, &[1, 2, 3, 4, 5, 6]),
+        canvas: None,
         rect: Rect {
             top: 0,
             left: 0,
@@ -73,8 +75,17 @@ unsafe extern "C" fn dispatch(
     // SAFETY: host serializes dispatch/state with processing and effect points to our instance.
     let instance = unsafe { &mut *effect.cast::<Instance>() };
     match opcode {
-        OPEN | SET_SAMPLE_RATE | SET_BLOCK_SIZE | START_PROCESS | STOP_PROCESS | EDIT_OPEN
-        | EDIT_CLOSE | EDIT_IDLE | SET_PROGRAM => 1,
+        OPEN | SET_SAMPLE_RATE | SET_BLOCK_SIZE | START_PROCESS | STOP_PROCESS | EDIT_IDLE
+        | SET_PROGRAM => 1,
+        EDIT_OPEN => {
+            // SAFETY: effEditOpen provides the worker-owned platform parent on the main thread.
+            instance.canvas = unsafe { crate::visual::Canvas::attach(pointer) };
+            isize::from(instance.canvas.is_some())
+        }
+        EDIT_CLOSE => {
+            instance.canvas = None;
+            1
+        }
         GET_PROGRAM => 0,
         MAINS_CHANGED => {
             instance.active = value != 0;

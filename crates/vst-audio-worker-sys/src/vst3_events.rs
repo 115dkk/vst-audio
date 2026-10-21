@@ -233,7 +233,7 @@ impl EventList {
         context: Transport,
         rate: u32,
         changes: &Changes,
-        mappings: &[(u32, u32)],
+        mappings: &[(u32, u32, u32)],
         rejected: &mut u32,
     ) {
         self.count.set(0);
@@ -332,6 +332,16 @@ impl EventList {
                             };
                             let key = (u32::from(event.bus) << 16) | ((channel as u32) << 8) | cc;
                             if let Ok(index) = mappings.binary_search_by_key(&key, |p| p.0) {
+                                let normalized = if kind == 0xc0 {
+                                    let steps = mappings[index].2;
+                                    if steps == 0 || u32::from(*a) > steps {
+                                        *rejected = rejected.saturating_add(1);
+                                        continue;
+                                    }
+                                    f64::from(*a) / f64::from(steps)
+                                } else {
+                                    normalized
+                                };
                                 if !changes.add(mappings[index].1, value.sampleOffset, normalized) {
                                     *rejected = rejected.saturating_add(1);
                                 }

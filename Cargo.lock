@@ -425,8 +425,13 @@ dependencies = [
 name = "vst-audio-testplugin"
 version = "0.1.0"
 dependencies = [
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
  "vst-audio-worker-sys",
  "vst3",
+ "windows",
+ "x11rb",
 ]
 
 [[package]]

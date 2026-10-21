@@ -428,6 +428,7 @@ impl IEditControllerTrait for Matrix {
             return std::ptr::null_mut();
         }
         ComWrapper::new(View {
+            canvas: std::cell::RefCell::new(None),
             size: std::cell::Cell::new((320, 200)),
             scale: std::cell::Cell::new(1.0),
             handler: self.handler.borrow().clone(),
@@ -438,6 +439,7 @@ impl IEditControllerTrait for Matrix {
     }
 }
 struct View {
+    canvas: std::cell::RefCell<Option<crate::visual::Canvas>>,
     size: std::cell::Cell<(i32, i32)>,
     scale: std::cell::Cell<f32>,
     handler: Option<ComPtr<IComponentHandler>>,
@@ -465,6 +467,11 @@ impl IPlugViewTrait for View {
         if unsafe { self.isPlatformTypeSupported(platform) } != kResultTrue {
             return kResultFalse;
         }
+        // SAFETY: attached supplies a live platform parent on the UI thread.
+        *self.canvas.borrow_mut() = unsafe { crate::visual::Canvas::attach(parent) };
+        if self.canvas.borrow().is_none() {
+            return kResultFalse;
+        }
         // A deterministic editor gesture exercises the host's lock-free automation path.
         if let Some(handler) = &self.handler {
             // SAFETY: attached is on UI thread; retained host handler and known parameter zero.
@@ -477,6 +484,7 @@ impl IPlugViewTrait for View {
         kResultOk
     }
     unsafe fn removed(&self) -> tresult {
+        self.canvas.borrow_mut().take();
         kResultOk
     }
     unsafe fn onWheel(&self, _: f32) -> tresult {
