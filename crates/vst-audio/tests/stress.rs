@@ -52,6 +52,34 @@ fn repeated_crash_recovery_keeps_variable_callbacks_and_healthy_peer_running() {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
+        // Save two distinct valid snapshots. Independent later crashes must
+        // restore the latest (mode 3), not roll back merely because a previous
+        // crash has already used one attempt from the session budget.
+        let latest = if format == PluginFormat::Vst3 {
+            vst_audio::state::encode(&[1, 3], &[1, 3]).unwrap()
+        } else {
+            vec![1, 3]
+        };
+        let edit = a
+            .controller()
+            .request(Command::RestoreState(latest.clone()))
+            .unwrap();
+        loop {
+            if matches!(a.try_next_event(),Some(HostEvent::Completed{request})if request==edit) {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let saved = a.controller().request(Command::SaveState).unwrap();
+        loop {
+            if matches!(a.try_next_event(),Some(HostEvent::State{request,..})if request==Some(saved))
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
         let source = [0.25; 256];
         let mut output_a = [[0.0; 256]; 6];
         let mut output_b = [[0.0; 256]; 6];
@@ -87,6 +115,10 @@ fn repeated_crash_recovery_keeps_variable_callbacks_and_healthy_peer_running() {
                     Some(HostEvent::Recovered { generation }) => {
                         assert!(generation > last_injected_generation);
                         recovered += 1;
+                        a.controller().request(Command::SaveState).unwrap();
+                    }
+                    Some(HostEvent::State { bytes, .. }) => {
+                        assert_eq!(bytes, latest, "latest successful checkpoint was lost")
                     }
                     Some(HostEvent::NotificationsLost) => {
                         panic!("stress consumer lost lifecycle notifications")

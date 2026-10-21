@@ -6,6 +6,119 @@ static ALLOC: assert_no_alloc::AllocDisabler = assert_no_alloc::AllocDisabler;
 fn host() -> Host {
     Host::new(PathBuf::from(std::env::var_os("VST_AUDIO_WORKER").unwrap()))
 }
+
+#[test]
+#[ignore = "native fixtures required"]
+fn sysex_ownership_transport_splits_and_output_overflow_are_explicit() {
+    for format in [PluginFormat::Vst2, PluginFormat::Vst3] {
+        let mut instance = host()
+            .spawn(
+                &plugin(format),
+                &Configuration {
+                    sample_format: SampleFormat::F64,
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        let mut audio = instance.take_audio().unwrap();
+        let mut bytes = [0; MAX_SYSEX_BYTES];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = (index % 128) as u8;
+        }
+        bytes[0] = 0xf0;
+        bytes[MAX_SYSEX_BYTES - 1] = 0xf7;
+        let sysex = AudioEvent {
+            sample_offset: 17,
+            bus: 0,
+            data: EventData::SysEx {
+                len: MAX_SYSEX_BYTES as u16,
+                bytes,
+            },
+        };
+        let context = Transport {
+            sample_position: 1000,
+            ..Default::default()
+        };
+        let jump = Transport {
+            sample_position: 2000,
+            tempo: 137.0,
+            ..Default::default()
+        };
+        let events = [
+            AudioEvent::midi(0, 0, [0x90, 60, 127]),
+            sysex,
+            AudioEvent {
+                sample_offset: 64,
+                bus: 0,
+                data: EventData::Transport(jump),
+            },
+        ];
+        let mut left = [0.0; 128];
+        let mut right = [0.0; 128];
+        let mut received = [AudioEvent::default(); 4];
+        for block in 0..3 {
+            let report = assert_no_alloc::assert_no_alloc(|| {
+                audio.process_events_f64(
+                    128,
+                    &[],
+                    &mut [&mut left, &mut right],
+                    context,
+                    if block == 0 { &events } else { &[] },
+                    &mut received,
+                )
+            });
+            if block == 2 {
+                assert_eq!(report.status, AudioStatus::Processed);
+                assert_eq!((report.events_written, report.events_dropped), (2, 0));
+                assert_eq!(received[0], events[0]);
+                assert_eq!(received[1], sysex);
+                for (frame, value) in right.iter().enumerate() {
+                    let sample = if frame < 64 {
+                        1000 + frame
+                    } else {
+                        2000 + frame - 64
+                    };
+                    assert!(
+                        (value - sample as f64 * 0.000001).abs() < 1e-14,
+                        "{format:?} transport frame {frame}: {value}"
+                    );
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let burst: Vec<_> = (0..MAX_EVENTS)
+            .map(|i| {
+                AudioEvent::midi(
+                    (i / 2) as u32,
+                    0,
+                    [if i % 2 == 0 { 0x90 } else { 0x80 }, 60, 100],
+                )
+            })
+            .collect();
+        for block in 0..3 {
+            let report = assert_no_alloc::assert_no_alloc(|| {
+                audio.process_events_f64(
+                    128,
+                    &[],
+                    &mut [&mut left, &mut right],
+                    context,
+                    if block == 0 { &burst } else { &[] },
+                    &mut received,
+                )
+            });
+            if block == 2 {
+                assert_eq!(report.status, AudioStatus::Processed);
+                assert_eq!(
+                    (report.events_written, report.events_dropped),
+                    (4, (MAX_EVENTS - 4) as u32)
+                );
+                assert_eq!(&received[..], &burst[..4]);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
 fn plugin(format: PluginFormat) -> PluginDescriptor {
     PluginDescriptor::new(
         PathBuf::from(

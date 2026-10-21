@@ -38,7 +38,13 @@ pub(crate) fn supervise(
     let mut recovery: Option<(Instant, bool, Option<RequestId>)> = None;
     let mut attempts = 0u8;
     let mut prepared_generation = None;
+    let mut restoration_pending = false;
     loop {
+        if shared.processed_generation.load(Ordering::Acquire)
+            == shared.generation.load(Ordering::Acquire)
+        {
+            restoration_pending = false;
+        }
         while let Ok(retired) = retirements.pop() {
             drop(retired);
         }
@@ -119,7 +125,11 @@ pub(crate) fn supervise(
                 Command::ListParameters { start, count } => control.parameters(start, count),
                 Command::SetParameter { id, value } => control.set_parameter(id, value),
                 Command::SaveState => control.get_state(),
-                Command::RestoreState(bytes) => control.set_state(&bytes),
+                Command::RestoreState(bytes) => {
+                    // A later explicit edit is independent of startup restoration.
+                    restoration_pending = false;
+                    control.set_state(&bytes)
+                }
                 Command::Recover { .. } | Command::Shutdown => unreachable!(),
             };
             match result {
@@ -218,6 +228,7 @@ pub(crate) fn supervise(
                         continue;
                     }
                     control = Some(new_control);
+                    restoration_pending = true;
                     prepared_generation = Some(generation);
                     failure_reported = false;
                     if let Some(request) = request {
@@ -409,7 +420,7 @@ pub(crate) fn supervise(
                 recovery = Some((
                     Instant::now()
                         + Duration::from_millis(u64::from(backoff_ms) * u64::from(attempts)),
-                    attempts > 1,
+                    restoration_pending,
                     None,
                 ));
             }

@@ -36,26 +36,23 @@ Keep bounded logs, test reports, native crash diagnostics and available editor
 captures on failure. No proprietary plugin, decrypted asset or secret is an
 artifact. Only trusted release jobs receive signing credentials.
 
-## Development evidence
+## Implementation and evidence
 
-- P0: extracted from spatial-audio-softdriver b6d4df9 into the independent
-  repository. `check_boundary.py` checks the application dependency graph.
-- P1–P2: native fixture processing, state, editor, crash and hang tests have run
-  on Windows x64, Linux x64, macOS ARM64 and macOS Intel GitHub runners.
-  Fixtures now use platform-native bundles and require module initialization.
-- P3: high-level API supervises without GUI polling. Application tests run a
-  healthy instance while another crashes, and check callback allocation freedom.
-  Control queues are bounded. Configuration cannot change under a VST2 processor.
-- P4: paged parameter metadata and normalized control edits implemented.
-  MIDI, multi-bus, f64 and transport/automation work remain.
-- P5: egui and iced consume the same API from separate example packages.
-  Floating editor open/close runs in native GUI jobs. Further editor commands,
-  visual evidence and manual accessibility/input testing remain.
-- P6: state history and failure notifications exist. High-level endpoint
-  replacement, independent third-party compatibility and extended testing remain.
-- P7: `package_check.py` constructs `.crate` archives in a copied workspace,
-  builds a packaged worker and a fresh consumer from extracted archives only.
-  Final distribution packaging and publication remain.
+- P0-P3: the independent boundary, native bundle lifecycle, bounded ring and
+  crash/hang containment are implemented and required on all four targets.
+- P4: instruments, MIDI/SysEx, f64, multi-bus/sidechain configuration, variable
+  callbacks, transport and sample-offset automation have native semantic tests.
+- P5: egui/iced consume the same public API. Native editor visibility, focus
+  requests, constrained size/scale negotiation and pixel capture are tested.
+- P6: recovered endpoints move at audio boundaries; stress verifies repeated
+  failure and latest-state preservation. Independent upstream DSP/MIDI/layout
+  assertions, coverage-guided fuzzing and native ASan/leak checks are required.
+- P7: all seven archives build an isolated consumer and worker. Release worker
+  ZIPs include licenses, provenance and checksums, and their extracted binaries
+  execute native tests. Rust 1.99.0 is the tested minimum. The macOS helper has an
+  ad-hoc hardened-runtime signature and documented distributor signing steps.
 
-See `support.md` for the release gaps. A green current test suite alone does not
-complete all of these milestones.
+Remaining release operations are choosing the final tagged commit, publishing
+crates in dependency order and applying distributor signing/notarization where
+needed. These operations are not performed by the validation jobs. See
+`support.md` for the supported bounds and explicitly separate future work.

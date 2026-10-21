@@ -19,6 +19,7 @@ Pinned sources:
 |---|---|
 | DPF MIDI Through | All 16 MIDI channels; 96 note, pressure, CC and pitch-bend events retain type, values, bus and sample offset |
 | DPF MIDI Through | VST2 program change round trip; VST3 reports a rejected program change because this plugin has no program parameter |
+| DPF MIDI Through | The pinned VST3 adapter omits SysEx conversion; its zero echoes are recorded as a known upstream limitation, separately from host packet support |
 | DPF Latency | Zero-latency setting produces sample-for-sample ramp output in both formats |
 | DPF Latency | Stereo and f64 configuration requests are rejected; the independently running mono instance stays healthy |
 | DPF Latency | Hidden read-only latency meter is distinguishable from its editable control and refuses writes |

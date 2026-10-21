@@ -104,7 +104,11 @@ fn exercise(host: &Host, path: PathBuf, format: PluginFormat) -> Result<(), Box<
     let mut outputs: Vec<_> = outputs.iter_mut().map(Vec::as_mut_slice).collect();
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        if audio.process(&inputs, &mut outputs) == AudioStatus::Processed { break; }
+        if audio.process(&inputs, &mut outputs) == AudioStatus::Processed {
+            assert!((outputs[0][100]-0.25f32).abs()<1e-6,"packaged front output mismatch");
+            assert!((outputs[5][100]-0.125f32).abs()<1e-6,"packaged surround output mismatch");
+            break;
+        }
         assert!(Instant::now() < deadline, "packaged consumer did not process");
         std::thread::sleep(Duration::from_millis(10));
     }

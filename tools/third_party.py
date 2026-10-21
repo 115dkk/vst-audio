@@ -104,6 +104,7 @@ def main():
         if result.returncode:
             raise SystemExit(result.returncode)
         assert len(report["metrics"]) >= 10, "semantic test measurements missing"
+        report["known_upstream_limitations"]=[m["case"] for m in report["metrics"] if m["case"].startswith("known limitation:")]
         report["passed"] = True
     finally:
         (report_dir / "summary.json").write_text(json.dumps(report, indent=2), encoding="utf-8")

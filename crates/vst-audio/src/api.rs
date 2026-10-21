@@ -276,6 +276,7 @@ pub(crate) struct Shared {
     next_request: AtomicU64,
     pub(crate) generation: AtomicU64,
     pub(crate) applied_generation: AtomicU64,
+    pub(crate) processed_generation: AtomicU64,
     pub(crate) history: Mutex<vst_audio_protocol::StateHistory>,
 }
 #[derive(Clone, Debug)]
@@ -346,6 +347,7 @@ impl Instance {
             next_request: AtomicU64::new(1),
             generation: AtomicU64::new(1),
             applied_generation: AtomicU64::new(1),
+            processed_generation: AtomicU64::new(0),
             history: Mutex::new(started.control.state_history()),
         });
         let Started {

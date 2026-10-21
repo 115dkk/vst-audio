@@ -18,6 +18,7 @@ seeds={"hello":frame(1,b"SSRP"+struct.pack("<HH",3,0)),"ack":frame(16,b""),
        "state":b"SSV3\1"+struct.pack("<I",2)+b"ab"+struct.pack("<I",2)+b"cd"}
 for name,data in seeds.items(): (corpus/name).write_bytes(data)
 seconds=int(os.environ.get("VST_AUDIO_FUZZ_SECONDS","120"))
+if not 1<=seconds<=3600: raise ValueError("fuzz duration must be 1..3600 seconds")
 results=[]
 try:
     for target in ["control","ring"]:

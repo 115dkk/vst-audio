@@ -1,23 +1,26 @@
 # vst-audio
 
-Work toward a GUI-independent Rust library for hosting VST2 and VST3 plugins
+A GUI-independent Rust library for hosting VST2 and VST3 plugins
 in separate processes on Windows, macOS and Linux.
 
-**0.1.0 is in development.** Native VST2/VST3 fixture tests pass on Windows,
-Linux, macOS ARM64 and macOS Intel. Broader format capabilities and compatibility
-work are still in progress.
-This is not yet a crates.io release.
+**0.1.0 implementation candidate.** Required CI executes native Windows x64,
+Linux x64, macOS ARM64 and macOS Intel tests, two unrelated Rust GUI consumers,
+and independently built open-source plugins. This repository has not yet been
+published to crates.io.
 
-The intended contract is one worker per plugin instance, safe application-side
+The contract is one worker per plugin instance, safe application-side
 Rust APIs, bounded audio IPC and worker-owned native editor windows. Any Rust GUI
 can request an editor over the same control protocol. Native editor embedding
 inside an application's window is a separate, platform-specific capability.
 Process isolation contains crashes and hangs; it is not a security sandbox for
 hostile code.
 
-See [architecture](docs/architecture.md), [implementation plan](docs/roadmap.md)
-and [implemented/pending support](docs/support.md).
-Source and license provenance is recorded in [NOTICE](NOTICE).
+See [architecture](https://github.com/115dkk/vst-audio/blob/main/docs/architecture.md), [implementation plan](https://github.com/115dkk/vst-audio/blob/main/docs/roadmap.md)
+and [support and verification](https://github.com/115dkk/vst-audio/blob/main/docs/support.md).
+[Independent plugin measurements](https://github.com/115dkk/vst-audio/blob/main/docs/independent-plugins.md),
+[extended checks](https://github.com/115dkk/vst-audio/blob/main/docs/extended-tests.md) and
+[worker distribution](https://github.com/115dkk/vst-audio/blob/main/docs/distribution.md) describe the required release gates.
+Source and license provenance is recorded in [NOTICE](https://github.com/115dkk/vst-audio/blob/main/NOTICE).
 
 The application API has a nonblocking loading task, bounded control requests,
 polled events and an independent supervisor. Any GUI can use this contract:
@@ -33,8 +36,10 @@ if let Some(instance) = task.try_complete()? {
 ```
 
 `Instance::take_audio` transfers the unique preallocated audio endpoint.
-It accepts planar f32 blocks of the configured quantum, returns processed or
-fallback output, and reports pipeline + plugin latency. The supervisor runs
+It accepts variable-length planar f32/f64 callbacks, reblocks them into a
+prepared quantum, and carries bounded sample-offset MIDI/SysEx, automation and
+transport data. It returns processed or explicit fallback output, reports two
+quanta plus plugin latency, and swaps recovered workers at audio boundaries. The supervisor runs
 even when the GUI does not poll. Drop audio resources on a control thread.
 
 Build and test:
@@ -43,14 +48,18 @@ Build and test:
 cargo test --workspace
 python tools/check_boundary.py
 python tools/native_tests.py
+python tools/third_party.py
 python tools/package_check.py
+python tools/package_worker.py
 ```
 
-On headless Linux, run the last command under `xvfb-run -a`.
+On headless Linux, run the native and worker-distribution commands under `xvfb-run -a`.
+The [distribution guide](https://github.com/115dkk/vst-audio/blob/main/docs/distribution.md) explains executable placement,
+checksums, license notices and the separate macOS signing/notarization steps.
 The CLI `cargo run -p vst-audio --example editor -- <worker> <plugin>` opens an
 editor without a GUI framework.
 
-The independent [egui and iced consumers](examples/gui) demonstrate the same
+The independent [egui and iced consumers](https://github.com/115dkk/vst-audio/tree/main/examples/gui) demonstrate the same
 editor IPC contract. They are built and exercised separately in CI.
 
 VST is a registered trademark of Steinberg Media Technologies GmbH.

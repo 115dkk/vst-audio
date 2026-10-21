@@ -31,6 +31,7 @@ pub enum AudioStatus {
 pub struct ProcessReport {
     pub status: AudioStatus,
     pub events_written: usize,
+    /// Host-detected rejection/overflow. A plugin may also intentionally ignore input.
     pub events_dropped: u32,
     pub generation: u64,
 }
@@ -427,6 +428,11 @@ impl AudioEndpoint {
                     self.delivered.dropped = 1;
                 }
             });
+            if self.ready {
+                self.shared
+                    .processed_generation
+                    .store(self.active.generation, Ordering::Release);
+            }
             self.delivered.sort_by_offset();
         }
         self.pending.sort_by_offset();

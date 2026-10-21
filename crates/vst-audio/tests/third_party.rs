@@ -144,6 +144,39 @@ fn dpf_midi_through_preserves_types_channels_values_and_sample_offsets() {
             }
             pause();
         }
+        if format == PluginFormat::Vst3 {
+            let mut bytes = [0; MAX_SYSEX_BYTES];
+            bytes[..7].copy_from_slice(&[0xf0, 0x7d, 1, 2, 3, 4, 0xf7]);
+            let sysex = [AudioEvent {
+                sample_offset: 23,
+                bus: 0,
+                data: EventData::SysEx { len: 7, bytes },
+            }];
+            for block in 0..3 {
+                let report = audio.process_events(
+                    128,
+                    &[],
+                    &mut [],
+                    Transport::default(),
+                    if block == 0 { &sysex } else { &[] },
+                    &mut received,
+                );
+                if block == 2 {
+                    assert_eq!(report.status, AudioStatus::Processed);
+                    // Pinned upstream appendEvent excludes V3_EVENT_DATA and its
+                    // SysexData conversion is TODO. Record that independent
+                    // limitation; host drop counts cannot detect plugin-internal
+                    // filtering. Our two native fixtures verify owned SysEx.
+                    assert_eq!((report.events_written, report.events_dropped), (0, 0));
+                    metric(
+                        "known limitation: DPF VST3 SysEx echoes",
+                        0.0,
+                        report.events_written as f64,
+                    );
+                }
+                pause();
+            }
+        }
         // This independent VST3 adapter exposes CC/pressure/bend mappings, but
         // deliberately has no program-change assignment. The host must report
         // the unsupported event instead of silently changing a different control.
