@@ -29,7 +29,7 @@ vst-audio-protocol = { path = "crates/vst-audio-protocol", version = "=0.1.1" }
 vst-audio-worker-sys = { path = "crates/vst-audio-worker-sys", version = "=0.1.1" }
 vst-audio-transport-sys = { path = "crates/vst-audio-transport-sys", version = "=0.1.1" }
 vst-audio-worker-runtime = { path = "crates/vst-audio-worker-runtime", version = "=0.1.1" }
-vst3 = "=0.3.0"
+vst3 = "0.3.0"
 thiserror = "2.0.21"
 clap = { version = "4.6.7", features = ["derive"] }
 assert_no_alloc = { version = "1.1.2", default-features = false }
