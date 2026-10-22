@@ -21,6 +21,7 @@ pub struct Configuration {
     pub recovery: RecoveryPolicy,
     pub sample_format: vst_audio_protocol::SampleFormat,
     pub offline: bool,
+    pub sandbox: Option<crate::SandboxPolicy>,
     pub buses: Option<crate::BusSelector>,
     pub inputs: Option<Vec<vst_audio_protocol::BusConfiguration>>,
     pub outputs: Option<Vec<vst_audio_protocol::BusConfiguration>>,
@@ -34,6 +35,7 @@ impl Default for Configuration {
             recovery: RecoveryPolicy::Manual,
             sample_format: vst_audio_protocol::SampleFormat::F32,
             offline: false,
+            sandbox: None,
             buses: None,
             inputs: None,
             outputs: None,
@@ -79,6 +81,7 @@ impl Configuration {
             quantum: self.quantum,
             sample_format: self.sample_format,
             offline: self.offline,
+            sandbox: self.sandbox.clone(),
             buses: self.buses.clone(),
             inputs: self.inputs.clone(),
             outputs: self.outputs.clone(),
@@ -166,6 +169,19 @@ impl Host {
     /// Blocking control-thread operation. The scan itself runs out of process.
     pub fn scan(&self, plugin: &PluginDescriptor) -> Result<Vec<crate::ClassInfo>, StartError> {
         PluginProcess::scan(&self.worker_for(plugin)?, &plugin.path, plugin.format)
+    }
+    /// Scan under the same opt-in restrictions as a processing worker.
+    pub fn scan_sandboxed(
+        &self,
+        plugin: &PluginDescriptor,
+        policy: &crate::SandboxPolicy,
+    ) -> Result<Vec<crate::ClassInfo>, StartError> {
+        PluginProcess::scan_sandboxed(
+            &self.worker_for(plugin)?,
+            &plugin.path,
+            plugin.format,
+            Some(policy),
+        )
     }
     /// Blocking startup. GUI applications should use `spawn_async`.
     pub fn spawn(

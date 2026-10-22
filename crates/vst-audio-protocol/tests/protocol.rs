@@ -41,6 +41,9 @@ fn codec_round_trips_every_message() {
     }];
     for message in [
         Message::hello(),
+        Message::Sandboxed {
+            mechanism: "landlock-abi-7+seccomp".into(),
+        },
         Message::Load {
             path: "plugin.vst3".into(),
             format: PluginFormat::Vst3,

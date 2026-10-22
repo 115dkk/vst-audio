@@ -235,6 +235,52 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
     }
     let input = runtime::inherited_file(args.control_in).map_err(error)?;
     let mut output = runtime::inherited_file(args.control_out).map_err(error)?;
+    let parent = Arc::new(runtime::duplicate_value(args.parent, false).map_err(error)?);
+    let region = Arc::new(SharedRegion::open(args.region, args.region_bytes).map_err(error)?);
+    let work = Arc::new(
+        Event::open(args.work)
+            .map_err(error)?
+            .with_peer(parent.try_clone().map_err(error)?),
+    );
+    let done = Arc::new(Event::open(args.done).map_err(error)?);
+    let ready = Arc::new(Event::open(args.ready).map_err(error)?);
+    if args.sandbox {
+        let policy = vst_audio_transport_sys::sandbox::SandboxPolicy {
+            network: args.sandbox_network,
+            processes: args.sandbox_processes,
+            writable: args.sandbox_writable.clone(),
+        };
+        let report = vst_audio_transport_sys::sandbox::apply_worker(&policy, &std::env::temp_dir());
+        let message = match report {
+            Ok(report) => Message::Sandboxed {
+                mechanism: report.mechanism,
+            },
+            Err(reason) => {
+                write_frame(
+                    &mut output,
+                    &Frame {
+                        flags: 0,
+                        request: 0,
+                        message: Message::Fault {
+                            code: 1,
+                            text: format!("sandbox setup failed: {reason}"),
+                        },
+                    },
+                )
+                .map_err(error)?;
+                return Err(error(reason));
+            }
+        };
+        write_frame(
+            &mut output,
+            &Frame {
+                flags: 0,
+                request: 0,
+                message,
+            },
+        )
+        .map_err(error)?;
+    }
     // Main-thread writes are acceptable in the disposable host. The app's reader
     // drains continuously; app-side writes use a dedicated thread.
     write_frame(
@@ -260,7 +306,6 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
             }
         }
     });
-    let parent = Arc::new(runtime::duplicate_value(args.parent, false).map_err(error)?);
     // Independent of the plugin's main/audio threads: even a hung foreign
     // call must not leave a worker behind after the application exits.
     let parent_watch = parent.clone();
@@ -272,14 +317,6 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
             thread::sleep(Duration::from_millis(50));
         }
     });
-    let region = Arc::new(SharedRegion::open(args.region, args.region_bytes).map_err(error)?);
-    let work = Arc::new(
-        Event::open(args.work)
-            .map_err(error)?
-            .with_peer(parent.try_clone().map_err(error)?),
-    );
-    let done = Arc::new(Event::open(args.done).map_err(error)?);
-    let ready = Arc::new(Event::open(args.ready).map_err(error)?);
     let stop = Arc::new(AtomicBool::new(false));
     let mut audio = None;
     let mut plugin: Option<Box<dyn Plugin>> = None;

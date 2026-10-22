@@ -190,6 +190,7 @@ pub struct ProcessingOptions {
     pub quantum: u32,
     pub sample_format: SampleFormat,
     pub offline: bool,
+    pub sandbox: Option<crate::SandboxPolicy>,
     pub buses: Option<BusSelector>,
     pub inputs: Option<Vec<BusConfiguration>>,
     pub outputs: Option<Vec<BusConfiguration>>,
@@ -202,6 +203,7 @@ impl Default for ProcessingOptions {
             quantum: 128,
             sample_format: SampleFormat::F32,
             offline: false,
+            sandbox: None,
             buses: None,
             inputs: None,
             outputs: None,
@@ -267,6 +269,7 @@ fn speaker_bits(buses: &[BusConfiguration]) -> Vec<u32> {
 /// announced the header is gone by the time this is returned.
 #[derive(Debug)]
 pub struct Started {
+    pub sandbox: Option<crate::SandboxReport>,
     pub setup: ProcessingSetup,
     pub declared_inputs: Vec<BusInfo>,
     pub declared_outputs: Vec<BusInfo>,
@@ -543,8 +546,14 @@ impl PluginProcess {
                 .checked_mul(2)
                 .ok_or_else(|| StartError("invalid rate".into()))?,
         };
-        let (process, transport, region, work, done, ready) =
-            spawn(exe, maximum, options.cancel.clone())?;
+        let (process, transport, region, work, done, ready) = spawn(
+            exe,
+            plugin,
+            maximum,
+            options.cancel.clone(),
+            options.sandbox.as_ref(),
+        )?;
+        let sandbox = sandbox_report(&transport, options.sandbox.as_ref())?;
         let mut watch = ControlWatch::new(0);
         let hello = transport.response(0, Duration::from_secs(5))?;
         if hello.message != Message::hello() {
@@ -659,6 +668,7 @@ impl PluginProcess {
             return Err(StartError("unsupported configured plugin latency".into()));
         }
         Ok(Started {
+            sandbox,
             setup,
             declared_inputs: inputs,
             declared_outputs: outputs,
@@ -680,6 +690,14 @@ impl PluginProcess {
         path: &Path,
         format: PluginFormat,
     ) -> Result<Vec<ClassInfo>, StartError> {
+        Self::scan_sandboxed(exe, path, format, None)
+    }
+    pub fn scan_sandboxed(
+        exe: &Path,
+        path: &Path,
+        format: PluginFormat,
+        policy: Option<&crate::SandboxPolicy>,
+    ) -> Result<Vec<ClassInfo>, StartError> {
         // Frozen Scan wire message has no format field; VST 3 files/bundles use .vst3.
         if (format == PluginFormat::Vst3)
             != path
@@ -699,7 +717,8 @@ impl PluginProcess {
             sample_rate: 48000,
             latency_bound_frames: 96000,
         };
-        let (process, transport, ..) = spawn(exe, geometry, None)?;
+        let (process, transport, ..) = spawn(exe, path, geometry, None, policy)?;
+        sandbox_report(&transport, policy)?;
         if transport.response(0, Duration::from_secs(5))?.message != Message::hello() {
             return Err(StartError("expected Hello".into()));
         }
@@ -737,11 +756,31 @@ type Spawned = (
     Arc<Event>,
     Arc<Event>,
 );
+fn sandbox_report(
+    transport: &Transport,
+    policy: Option<&crate::SandboxPolicy>,
+) -> Result<Option<crate::SandboxReport>, StartError> {
+    policy
+        .map(|policy| {
+            let reply = transport.response(0, Duration::from_secs(10))?;
+            let Message::Sandboxed { mechanism } = reply.message else {
+                return Err(StartError(
+                    "worker did not confirm sandbox installation".into(),
+                ));
+            };
+            Ok(crate::SandboxReport::applied(policy, mechanism))
+        })
+        .transpose()
+}
 fn spawn(
     exe: &Path,
+    plugin: &Path,
     geometry: Geometry,
     cancel: Option<Arc<AtomicBool>>,
+    policy: Option<&crate::SandboxPolicy>,
 ) -> Result<Spawned, StartError> {
+    let sandbox =
+        vst_audio_transport_sys::sandbox::SandboxLaunch::new(policy, plugin).map_err(error)?;
     let region = Arc::new(
         SharedRegion::create(
             geometry
@@ -781,7 +820,9 @@ fn spawn(
     }
     args.push("--region-bytes".into());
     args.push(region.bytes().to_string().into());
-    let process = Arc::new(runtime::spawn_handles(exe, &args, &values, parent).map_err(error)?);
+    sandbox.arguments(&mut args);
+    let process =
+        Arc::new(runtime::spawn_handles(exe, &args, &values, parent, sandbox).map_err(error)?);
     drop(input.child);
     drop(output.child);
     let transport = Transport::new(output.parent, input.parent, cancel, process.clone());

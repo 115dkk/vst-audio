@@ -91,6 +91,10 @@ pub struct Parameter {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Message {
+    /// Sent before Hello only when an OS sandbox was requested and installed.
+    Sandboxed {
+        mechanism: String,
+    },
     Hello {
         magic: [u8; 4],
         major: u16,
@@ -179,6 +183,7 @@ impl Message {
 
     fn kind(&self) -> u16 {
         match self {
+            Self::Sandboxed { .. } => 29,
             Self::Hello { .. } => 1,
             Self::Load { .. } => 2,
             Self::Configure { .. } => 3,
@@ -375,6 +380,7 @@ fn decode_parts(meta: &[u8], body: &[u8]) -> Result<DecodedFrame, CodecError> {
 
 fn encode_message(message: &Message, out: &mut Vec<u8>) -> Result<(), CodecError> {
     match message {
+        Message::Sandboxed { mechanism } => put_string(out, mechanism)?,
         Message::Hello {
             magic,
             major,
@@ -571,6 +577,9 @@ fn decode_message(kind: u16, body: &[u8]) -> Result<Option<Message>, CodecError>
                 minor,
             }
         }
+        29 => Message::Sandboxed {
+            mechanism: cursor.string()?,
+        },
         2 => {
             let path = cursor.string()?;
             let format = match cursor.u16()? {

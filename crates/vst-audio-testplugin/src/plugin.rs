@@ -6,7 +6,7 @@ use vst_audio_worker_sys::vst2::*;
 struct Instance {
     effect: AEffect,
     host: Callback,
-    chunk: [u8; 2],
+    chunk: [u8; 5],
     width: f32,
     delay: [[f32; 64]; 6],
     cursor: usize,
@@ -38,7 +38,7 @@ pub extern "C" fn VSTPluginMain(host: Callback) -> *mut AEffect {
             ..AEffect::default()
         },
         host,
-        chunk: [1, 0],
+        chunk: [1, 0, 0, 0, 0],
         width: 1.0,
         delay: [[0.0; 64]; 6],
         cursor: 0,
@@ -121,15 +121,15 @@ unsafe extern "C" fn dispatch(
             }
             // SAFETY: GET_CHUNK supplies a pointer-out; chunk remains live until next state call.
             unsafe { *pointer.cast::<*const u8>() = instance.chunk.as_ptr() };
-            2
+            if instance.chunk[1] == 6 { 5 } else { 2 }
         }
         SET_CHUNK => {
-            if value != 2 || pointer.is_null() {
+            if ![2, 5].contains(&value) || pointer.is_null() {
                 return 0;
             }
             // SAFETY: SET_CHUNK supplies value readable bytes for this synchronous call.
             let chunk = unsafe { std::slice::from_raw_parts(pointer.cast::<u8>(), 2) };
-            if chunk[0] != 1 || chunk[1] > 5 {
+            if chunk[0] != 1 || chunk[1] > 6 {
                 return 0;
             }
             if chunk[1] == 5 {
@@ -140,7 +140,10 @@ unsafe extern "C" fn dispatch(
             if chunk[1] == 4 {
                 std::process::abort();
             }
-            instance.chunk.copy_from_slice(chunk);
+            instance.chunk[..2].copy_from_slice(chunk);
+            if chunk[1] == 6 {
+                instance.chunk[2..].copy_from_slice(&crate::probe::run());
+            }
             1
         }
         EDIT_GET_RECT => {

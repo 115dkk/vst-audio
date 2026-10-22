@@ -22,6 +22,14 @@ pub struct Args {
     pub ready: u64,
     #[arg(long)]
     pub parent: usize,
+    #[arg(long)]
+    pub sandbox: bool,
+    #[arg(long)]
+    pub sandbox_network: bool,
+    #[arg(long)]
+    pub sandbox_processes: bool,
+    #[arg(long)]
+    pub sandbox_writable: Vec<std::path::PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

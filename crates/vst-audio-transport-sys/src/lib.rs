@@ -11,6 +11,7 @@ pub mod mapping;
 pub mod runtime;
 pub use events::{Event, SharedEvent};
 pub use mapping::SharedRegion;
+pub mod sandbox;
 
 #[cfg(unix)]
 #[path = "unix/events.rs"]

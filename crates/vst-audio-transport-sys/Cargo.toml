@@ -20,6 +20,9 @@ multiple_unsafe_ops_per_block = "deny"
 missing_safety_doc = "deny"
 dbg_macro = "deny"
 
+[dependencies]
+tempfile = "3"
+
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true
 vst-audio-ring.workspace = true
@@ -27,5 +30,4 @@ thiserror.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-tempfile = "3"
 vst-audio-ring.workspace = true

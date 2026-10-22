@@ -8,6 +8,7 @@ pub use process::{
     BusChoice, BusSelector, ControlEvent, PluginControl, PluginProcess, ProcessingOptions,
     StartError, Started,
 };
+pub use vst_audio_transport_sys::sandbox::{SandboxPolicy, SandboxReport};
 pub use vst_audio_transport_sys::{Event, SharedEvent, SharedRegion};
 
 mod architecture;

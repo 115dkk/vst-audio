@@ -29,6 +29,7 @@ struct Delay {
 }
 struct Matrix {
     mode: AtomicU8,
+    probe: [AtomicU8; 3],
     width: AtomicU64,
     active: AtomicBool,
     delay: UnsafeCell<Delay>,
@@ -38,6 +39,7 @@ impl Matrix {
     fn new() -> Self {
         Self {
             mode: AtomicU8::new(0),
+            probe: [const { AtomicU8::new(0) }; 3],
             width: AtomicU64::new(1.0f64.to_bits()),
             active: AtomicBool::new(false),
             delay: UnsafeCell::new(Delay {
@@ -56,7 +58,7 @@ impl Matrix {
         let mut read = 0;
         // SAFETY: two-byte writable output and byte-count output are live for this call.
         let result = unsafe { stream.read(bytes.as_mut_ptr().cast(), 2, &mut read) };
-        if result != kResultOk || read != 2 || bytes[0] != 1 || bytes[1] > 5 {
+        if result != kResultOk || read != 2 || bytes[0] != 1 || bytes[1] > 6 {
             return kInvalidArgument;
         }
         if bytes[1] == 5 {
@@ -67,6 +69,11 @@ impl Matrix {
         if bytes[1] == 4 {
             std::process::abort();
         }
+        if bytes[1] == 6 {
+            for (target, result) in self.probe.iter().zip(crate::probe::run()) {
+                target.store(result, Ordering::Relaxed);
+            }
+        }
         self.mode.store(bytes[1], Ordering::Relaxed);
         kResultOk
     }
@@ -75,11 +82,19 @@ impl Matrix {
         let Some(stream) = (unsafe { ComRef::from_raw(state) }) else {
             return kInvalidArgument;
         };
-        let mut bytes = [1, self.mode.load(Ordering::Relaxed)];
+        let mode = self.mode.load(Ordering::Relaxed);
+        let mut bytes = [
+            1,
+            mode,
+            self.probe[0].load(Ordering::Relaxed),
+            self.probe[1].load(Ordering::Relaxed),
+            self.probe[2].load(Ordering::Relaxed),
+        ];
+        let length = if mode == 6 { 5 } else { 2 };
         let mut written = 0;
-        // SAFETY: stream reads two stack bytes synchronously, count output is writable.
-        let result = unsafe { stream.write(bytes.as_mut_ptr().cast(), 2, &mut written) };
-        if result == kResultOk && written == 2 {
+        // SAFETY: stream reads length initialized stack bytes synchronously; count output is writable.
+        let result = unsafe { stream.write(bytes.as_mut_ptr().cast(), length, &mut written) };
+        if result == kResultOk && written == length {
             kResultOk
         } else {
             kResultFalse

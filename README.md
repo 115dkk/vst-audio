@@ -11,8 +11,13 @@ The contract is one worker per plugin instance, safe application-side
 Rust APIs, bounded audio IPC and worker-owned native editor windows. Any Rust GUI
 can request an editor over the same control protocol. Native editor embedding
 inside an application's window is a separate, platform-specific capability.
-Process isolation contains crashes and hangs; it is not a security sandbox for
-hostile code.
+Process isolation contains crashes and hangs. An opt-in OS sandbox restricts
+worker network access, program execution and filesystem writes; it is off by
+default for plugin compatibility. Set `Configuration::sandbox` (or
+`ProcessingOptions::sandbox`) to `Some(SandboxPolicy::default())`, and use
+`Host::scan_sandboxed` for discovery. Unsupported restrictions fail startup
+rather than silently running unsandboxed. See the support guide for platform
+exceptions and remaining security limits.
 
 See [architecture](https://github.com/115dkk/vst-audio/blob/main/docs/architecture.md), [implementation and evidence](https://github.com/115dkk/vst-audio/blob/main/docs/roadmap.md)
 and [support and verification](https://github.com/115dkk/vst-audio/blob/main/docs/support.md).

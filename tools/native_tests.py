@@ -25,6 +25,19 @@ run("cargo", "test", "--locked", "-p", "vst-audio", "--test", "features", "--", 
 
 run("cargo", "test", "--locked", "-p", "vst-audio", "--test", "stress", "--", "--ignored", "--nocapture", "--test-threads=1", env=env)
 
+# Reserve a loopback probe port and let the Rust test own the listener. A separate
+# environment keeps probe inputs out of unrelated worker tests.
+import socket
+import tempfile
+with tempfile.TemporaryDirectory(prefix="vst-audio-probe-") as directory:
+    with socket.socket() as reservation:
+        reservation.bind(("127.0.0.1", 0))
+        port = reservation.getsockname()[1]
+    probe_env = dict(env, VST_AUDIO_PROBE_PORT=str(port),
+                     VST_AUDIO_PROBE_FILE=str(Path(directory) / "probe.txt"))
+    run("cargo", "test", "--locked", "-p", "vst-audio", "--test", "sandbox",
+        "--", "--ignored", "--nocapture", "--test-threads=1", env=probe_env)
+
 # Encode only our public fixture captures. No third-party pixels or binaries.
 import struct
 import zlib

@@ -74,7 +74,19 @@ Crashes and hangs are confined to one worker. Effects can use latency-aligned
 bypass, silence or caller-provided fallback; instruments use silence. Recovery
 creates a new process and session, restores the last successful state and
 reconciles transport/notes. Past MIDI/automation is not blindly replayed.
-Hostile-process protection requires additional OS sandboxing and resource limits.
+`Configuration::sandbox` and `ProcessingOptions::sandbox` optionally select an
+OS sandbox; `None` preserves plugin compatibility. `SandboxPolicy` denies
+network access, execution of other programs and writes outside per-worker
+temporary storage / explicit writable directories by default. Sandboxed scans
+use `Host::scan_sandboxed`, since module loading itself executes foreign code.
+Unix workers install restrictions after opening IPC and before spawning helper
+threads or loading plugins; Windows installs the token and job restrictions at
+process creation. A pre-load confirmation supplies `Started::sandbox`, and
+setup failures return `StartError` without loading the plugin. Recovery retains
+the policy and creates fresh temporary storage. The parent owns that storage
+until the child is terminated and reaped. Resource limits and full desktop
+session isolation remain outside this policy; see the platform exceptions in
+`support.md`.
 
 ## Platforms and delivery
 
