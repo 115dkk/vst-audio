@@ -107,8 +107,12 @@ fn binary(path: &Path) -> Result<PathBuf, PluginError> {
             .ok_or_else(|| PluginError("invalid VST3 bundle".into()))?;
         #[cfg(all(windows, target_arch = "aarch64"))]
         let architectures = ["arm64-win", "arm64ec-win"];
-        #[cfg(all(windows, not(target_arch = "aarch64")))]
+        #[cfg(all(windows, target_arch = "x86_64"))]
         let architectures = ["x86_64-win"];
+        #[cfg(all(windows, target_arch = "x86"))]
+        let architectures = ["x86-win"];
+        #[cfg(all(target_os = "linux", target_arch = "x86"))]
+        let architectures = ["i386-linux"];
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         let architectures = ["x86_64-linux"];
         #[cfg(all(target_os = "linux", target_arch = "aarch64"))]

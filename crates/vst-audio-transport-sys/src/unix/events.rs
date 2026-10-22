@@ -23,10 +23,10 @@ impl Event {
             peer: None,
         })
     }
-    pub fn open(value: usize) -> io::Result<Self> {
+    pub fn open(value: u64) -> io::Result<Self> {
         Ok(Self {
-            read: crate::runtime::duplicate_value(value & 0xffff_ffff, false)?,
-            write: crate::runtime::duplicate_value(value >> 32, false)?,
+            read: crate::runtime::duplicate_value((value & 0xffff_ffff) as usize, false)?,
+            write: crate::runtime::duplicate_value((value >> 32) as usize, false)?,
             peer: None,
         })
     }
@@ -34,8 +34,8 @@ impl Event {
         self.peer = Some(peer);
         self
     }
-    pub fn handle_value(&self) -> usize {
-        self.read.as_raw_fd() as usize | ((self.write.as_raw_fd() as usize) << 32)
+    pub fn handle_value(&self) -> u64 {
+        self.read.as_raw_fd() as u64 | ((self.write.as_raw_fd() as u64) << 32)
     }
 }
 impl Signal for Event {
@@ -97,6 +97,25 @@ impl Wait for Event {
         }
     }
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn event_token_preserves_both_descriptors() {
+        let event = Event::create().unwrap();
+        let token = event.handle_value();
+        assert_eq!(token & 0xffff_ffff, event.read.as_raw_fd() as u64);
+        assert_eq!(token >> 32, event.write.as_raw_fd() as u64);
+        let opened = Event::open(token).unwrap();
+        event.signal();
+        assert_eq!(opened.wait(Duration::from_secs(1)), Waited::Signalled);
+        opened.signal();
+        assert_eq!(event.wait(Duration::from_secs(1)), Waited::Signalled);
+        assert!(Event::open(u64::MAX).is_err());
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SharedEvent(pub Arc<Event>);
 impl Signal for SharedEvent {

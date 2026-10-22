@@ -6,6 +6,7 @@ from this repository. Required CI executes the implementation on Windows x64, Li
 | Area | Implementation and required evidence |
 |---|---|
 | VST2 / VST3 | Disposable scan, effects and instruments, state and native bundles; both formats execute numeric audio tests |
+| Architectures | Bounded PE, ELF and Mach-O (including universal) header inspection; `Host::with_worker` registers architecture-specific workers and native slices are preferred. x86_64 Linux application + i686 worker verified with VST2/VST3 numeric audio, events, state and editors; Windows emulation and macOS Rosetta combinations require native CI verification and are not certified by cross-compilation |
 | Isolation | One worker per instance; crash/hang A while parent and B keep processing |
 | Audio | Planar f32/f64, variable callback sizes, preallocated reblocking and explicit fallback; allocator guard covers the callback |
 | Events | Sample offsets and bus indices, MIDI channel messages and owned SysEx (up to 256 bytes); bounded 256-event packets and explicit host overflow |
@@ -31,10 +32,19 @@ native-format fixtures. `events_dropped` reports host-detected rejection and
 overflow, not events a plugin internally ignores. VST3 automation fidelity
 ultimately depends on the plugin honoring the supplied sample offsets.
 
+Architecture routing permits x86 workers on x86_64 Windows/Linux, x86 and
+x86_64 workers on Windows ARM64, and x86_64 workers on Apple Silicon. The OS
+must supply the necessary multilib/emulation/Rosetta support; `runs_on_host`
+describes platform compatibility, not an installation probe. Unreadable or
+unsupported binary headers retain the native-worker fallback. Run
+`xvfb-run -a python3 tools/cross_arch_tests.py i686-unknown-linux-gnu` on Linux;
+on Windows/macOS run the script without Xvfb with the desired Rust target.
+
 Native embedding into an application's own window, native Wayland editor
-hosting, cross-architecture bridging and adversarial-code sandboxing remain
-outside this 0.1.0 scope. Recovery starts a new instance and does not replay old
-MIDI notes; applications can send current musical state after `Recovered`.
+hosting, Linux aarch64-to-x86_64 emulation, 32-bit macOS and adversarial-code
+sandboxing remain outside this 0.1.0 scope. Recovery starts a new instance and
+does not replay old MIDI notes; applications can send current musical state
+after `Recovered`.
 A changed layout requires a newly prepared application audio endpoint.
 
 CI pixel captures verify real native view content and lifecycle. They do not

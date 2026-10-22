@@ -234,7 +234,7 @@ fn cstring(bytes: &[u8], field: &str) -> io::Result<CString> {
 }
 
 #[cfg(target_os = "macos")]
-fn selected_descriptors(values: &[usize]) -> Vec<libc::c_int> {
+fn selected_descriptors(values: &[u64]) -> Vec<libc::c_int> {
     let mut descriptors = Vec::new();
     for value in values {
         // Event tokens carry their read/write descriptors in two 32-bit halves.
@@ -250,7 +250,7 @@ fn selected_descriptors(values: &[usize]) -> Vec<libc::c_int> {
 fn spawn_handles_macos(
     exe: &Path,
     args: &[OsString],
-    values: &[usize],
+    values: &[u64],
     parent: ParentHandle,
 ) -> io::Result<ChildProcess> {
     let mut argv_strings = Vec::with_capacity(args.len() + 1);
@@ -426,7 +426,7 @@ pub struct ChildProcess {
 pub fn spawn_handles(
     exe: &Path,
     args: &[OsString],
-    values: &[usize],
+    values: &[u64],
     parent: ParentHandle,
 ) -> io::Result<ChildProcess> {
     #[cfg(target_os = "macos")]

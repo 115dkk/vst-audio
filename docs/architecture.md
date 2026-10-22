@@ -84,6 +84,9 @@ separately. macOS uses native IPC, bundles, AppKit on the main thread and a
 packaged worker app. The same IPC state machine is used on all three.
 
 The consumer packages a matching worker executable beside their application.
-Startup negotiates protocol/version/architecture. Cargo dependencies alone do
-not install executables. Development ad-hoc signing and production Developer ID
-signing/notarization are separate paths.
+Plugin headers select a registered architecture-specific worker when no native
+slice exists; fixed-width IPC permits cross-architecture execution where the OS
+supports it, and recovery keeps the selected worker path.
+Startup negotiates protocol/version, without requiring matching architectures.
+Cargo dependencies alone do not install executables. Development ad-hoc signing
+and production Developer ID signing/notarization are separate paths.

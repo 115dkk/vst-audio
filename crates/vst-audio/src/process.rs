@@ -757,13 +757,13 @@ fn spawn(
     let ready = Arc::new(Event::create().map_err(error)?);
     let parent = runtime::parent_handle().map_err(error)?;
     let values = [
-        input.child_value(),
-        output.child_value(),
-        region.handle_value(),
+        input.child_value() as u64,
+        output.child_value() as u64,
+        region.handle_value() as u64,
         work.handle_value(),
         done.handle_value(),
         ready.handle_value(),
-        runtime::parent_value(&parent),
+        runtime::parent_value(&parent) as u64,
     ];
     let names = [
         "--control-in",

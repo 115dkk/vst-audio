@@ -10,6 +10,9 @@ pub use process::{
 };
 pub use vst_audio_transport_sys::{Event, SharedEvent, SharedRegion};
 
+mod architecture;
+pub use architecture::{Architecture, plugin_architectures};
+
 mod api;
 pub use api::{
     Command, Configuration, Controller, Fallback, Host, HostEvent, Instance, LoadTask,

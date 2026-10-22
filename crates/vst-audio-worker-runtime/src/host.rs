@@ -15,11 +15,11 @@ pub struct Args {
     #[arg(long)]
     pub region_bytes: usize,
     #[arg(long)]
-    pub work: usize,
+    pub work: u64,
     #[arg(long)]
-    pub done: usize,
+    pub done: u64,
     #[arg(long)]
-    pub ready: usize,
+    pub ready: u64,
     #[arg(long)]
     pub parent: usize,
 }
@@ -251,7 +251,7 @@ mod tests {
             "--region-bytes",
             "16384",
             "--work",
-            "4",
+            "21474836484",
             "--done",
             "5",
             "--ready",
@@ -262,6 +262,7 @@ mod tests {
         .unwrap();
         assert_eq!(args.region_bytes, 16384);
         assert_eq!(args.parent, 7);
+        assert_eq!(args.work, 4 | (5u64 << 32));
         assert!(Args::try_parse_from(["host", "--control-in", "-1"]).is_err());
     }
     #[derive(Default)]

@@ -1,6 +1,6 @@
 //! GUI- and executor-independent application API.
 use crate::audio::{AudioEndpoint, PreparedAudio};
-use crate::{PluginFormat, PluginProcess, StartError, Started};
+use crate::{Architecture, PluginFormat, PluginProcess, StartError, Started, plugin_architectures};
 use std::{
     path::{Path, PathBuf},
     sync::{
@@ -51,7 +51,7 @@ pub enum RecoveryPolicy {
 }
 #[derive(Clone, Debug)]
 pub(crate) struct Launch {
-    pub host: Host,
+    pub worker: PathBuf,
     pub plugin: PluginDescriptor,
     pub configuration: Configuration,
 }
@@ -62,7 +62,7 @@ impl Launch {
         cancel: Arc<AtomicBool>,
     ) -> Result<Started, StartError> {
         PluginProcess::start_configured(
-            &self.host.worker,
+            &self.worker,
             &self.plugin.path,
             self.plugin.format,
             self.plugin.class_id,
@@ -111,19 +111,61 @@ impl PluginDescriptor {
 #[derive(Clone, Debug)]
 pub struct Host {
     worker: PathBuf,
+    workers: Vec<(Architecture, PathBuf)>,
 }
 impl Host {
     pub fn new(worker: impl Into<PathBuf>) -> Self {
         Self {
             worker: worker.into(),
+            workers: Vec::new(),
         }
+    }
+    /// A worker that runs plugins built for `architecture`; `new`'s worker is
+    /// the host's own. Registering an architecture again replaces its worker.
+    pub fn with_worker(mut self, architecture: Architecture, worker: impl Into<PathBuf>) -> Self {
+        if architecture == Architecture::host() {
+            self.worker = worker.into();
+        } else if let Some(entry) = self
+            .workers
+            .iter_mut()
+            .find(|entry| entry.0 == architecture)
+        {
+            entry.1 = worker.into();
+        } else {
+            self.workers.push((architecture, worker.into()));
+        }
+        self
+    }
+    /// Select the native worker when possible (also when the binary header
+    /// cannot be read), otherwise the first registered compatible worker.
+    /// This inspects files on the control thread, never on an audio callback.
+    pub fn worker_for(&self, plugin: &PluginDescriptor) -> Result<PathBuf, StartError> {
+        let Ok(architectures) = plugin_architectures(&plugin.path, plugin.format) else {
+            return Ok(self.worker.clone());
+        };
+        if architectures.contains(&Architecture::host()) {
+            return Ok(self.worker.clone());
+        }
+        if let Some((_, worker)) = self.workers.iter().find(|(architecture, _)| {
+            architectures.contains(architecture) && architecture.runs_on_host()
+        }) {
+            return Ok(worker.clone());
+        }
+        Err(StartError(format!(
+            "plugin is built for {}; no worker for those architectures is configured",
+            architectures
+                .iter()
+                .map(|architecture| architecture.name())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )))
     }
     pub fn worker_path(&self) -> &Path {
         &self.worker
     }
     /// Blocking control-thread operation. The scan itself runs out of process.
     pub fn scan(&self, plugin: &PluginDescriptor) -> Result<Vec<crate::ClassInfo>, StartError> {
-        PluginProcess::scan(&self.worker, &plugin.path, plugin.format)
+        PluginProcess::scan(&self.worker_for(plugin)?, &plugin.path, plugin.format)
     }
     /// Blocking startup. GUI applications should use `spawn_async`.
     pub fn spawn(
@@ -146,7 +188,7 @@ impl Host {
             return Err(StartError("invalid recovery policy".into()));
         }
         let launch = Launch {
-            host: self.clone(),
+            worker: self.worker_for(plugin)?,
             plugin: plugin.clone(),
             configuration: config.clone(),
         };

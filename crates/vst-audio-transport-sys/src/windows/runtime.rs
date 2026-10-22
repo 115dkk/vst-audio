@@ -164,13 +164,17 @@ impl Drop for Attributes {
 pub fn spawn_handles(
     exe: &Path,
     args: &[OsString],
-    values: &[usize],
+    values: &[u64],
     _parent: OwnedHandle,
 ) -> windows::core::Result<ChildProcess> {
-    let handles: Vec<HANDLE> = values
+    let handles = values
         .iter()
-        .map(|value| HANDLE(*value as *mut _))
-        .collect();
+        .map(|value| {
+            usize::try_from(*value)
+                .map(|value| HANDLE(value as *mut _))
+                .map_err(|_| windows::core::Error::from_hresult(E_INVALIDARG))
+        })
+        .collect::<windows::core::Result<Vec<_>>>()?;
     ChildProcess::spawn(exe, args, &handles)
 }
 

@@ -4,7 +4,15 @@ use vst_audio::*;
 #[global_allocator]
 static ALLOC: assert_no_alloc::AllocDisabler = assert_no_alloc::AllocDisabler;
 fn host() -> Host {
-    Host::new(PathBuf::from(std::env::var_os("VST_AUDIO_WORKER").unwrap()))
+    let worker = PathBuf::from(std::env::var_os("VST_AUDIO_WORKER").unwrap());
+    let host = Host::new(&worker);
+    if std::env::var_os("VST_AUDIO_CROSS_ARCH").is_some() {
+        let architectures = plugin_architectures(&worker, PluginFormat::Vst2).unwrap();
+        assert_eq!(architectures.len(), 1);
+        host.with_worker(architectures[0], worker)
+    } else {
+        host
+    }
 }
 
 #[test]
