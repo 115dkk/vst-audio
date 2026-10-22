@@ -1,6 +1,4 @@
-# 0.1.0 implementation and evidence plan
-
-No version tag or package publication until the applicable release gates pass.
+# 0.1.0 implementation and evidence
 
 | Phase | Deliverable | Gate |
 |---|---|---|
@@ -52,7 +50,5 @@ artifact. Only trusted release jobs receive signing credentials.
   execute native tests. Rust 1.99.0 is the tested minimum. The macOS helper has an
   ad-hoc hardened-runtime signature and documented distributor signing steps.
 
-Remaining release operations are choosing the final tagged commit, publishing
-crates in dependency order and applying distributor signing/notarization where
-needed. These operations are not performed by the validation jobs. See
+Distributors apply their own signing/notarization where needed. See
 `support.md` for the supported bounds and explicitly separate future work.

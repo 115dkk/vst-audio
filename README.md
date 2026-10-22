@@ -3,10 +3,9 @@
 A GUI-independent Rust library for hosting VST2 and VST3 plugins
 in separate processes on Windows, macOS and Linux.
 
-**0.1.0 implementation candidate.** Required CI executes native Windows x64,
-Linux x64, macOS ARM64 and macOS Intel tests, two unrelated Rust GUI consumers,
-and independently built open-source plugins. This repository has not yet been
-published to crates.io.
+Required CI executes native Windows x64, Linux x64, macOS ARM64 and macOS Intel
+tests, two unrelated Rust GUI consumers, and independently built open-source
+plugins.
 
 The contract is one worker per plugin instance, safe application-side
 Rust APIs, bounded audio IPC and worker-owned native editor windows. Any Rust GUI
@@ -15,11 +14,11 @@ inside an application's window is a separate, platform-specific capability.
 Process isolation contains crashes and hangs; it is not a security sandbox for
 hostile code.
 
-See [architecture](https://github.com/115dkk/vst-audio/blob/main/docs/architecture.md), [implementation plan](https://github.com/115dkk/vst-audio/blob/main/docs/roadmap.md)
+See [architecture](https://github.com/115dkk/vst-audio/blob/main/docs/architecture.md), [implementation and evidence](https://github.com/115dkk/vst-audio/blob/main/docs/roadmap.md)
 and [support and verification](https://github.com/115dkk/vst-audio/blob/main/docs/support.md).
 [Independent plugin measurements](https://github.com/115dkk/vst-audio/blob/main/docs/independent-plugins.md),
 [extended checks](https://github.com/115dkk/vst-audio/blob/main/docs/extended-tests.md) and
-[worker distribution](https://github.com/115dkk/vst-audio/blob/main/docs/distribution.md) describe the required release gates.
+[worker distribution](https://github.com/115dkk/vst-audio/blob/main/docs/distribution.md) describe the release gates.
 Source and license provenance is recorded in [NOTICE](https://github.com/115dkk/vst-audio/blob/main/NOTICE).
 
 The application API has a nonblocking loading task, bounded control requests,

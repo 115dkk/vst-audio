@@ -64,6 +64,6 @@ Cargo manifests and package contents before any registry mutation.
 
 The dependency order is ring, protocol, transport-sys, application library,
 worker-sys, worker-runtime, worker executable. The test plugins always remain
-`publish = false`. Actual crates.io publication and a version tag are separate
-release operations after the final native CI run is green. No CI job publishes
-to a registry or attaches files to a GitHub release.
+`publish = false`. The validation jobs never publish. A `v*` tag runs
+`release.yml`, which publishes the workspace through crates.io trusted
+publishing; no registry token is stored in the repository.

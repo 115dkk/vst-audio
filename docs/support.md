@@ -1,8 +1,7 @@
 # Support and verification
 
-The approved 0.1.0 implementation is present. Registry publication, a version
-tag and distributor credentials are separate release operations. Required CI
-executes the implementation on Windows x64, Linux x64/X11, macOS ARM64 and Intel.
+Version 0.1.0 is published on crates.io. Distributor credentials are separate
+from this repository. Required CI executes the implementation on Windows x64, Linux x64/X11, macOS ARM64 and Intel.
 
 | Area | Implementation and required evidence |
 |---|---|
