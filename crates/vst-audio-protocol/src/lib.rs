@@ -933,6 +933,9 @@ const STARTING_MS: u64 = 5_000;
 const LOADING_MS: u64 = 60_000;
 const CONFIGURING_MS: u64 = 10_000;
 const HEARTBEAT_MS: u64 = 500;
+/// A longer gap between two heartbeat observations means the host itself (or
+/// the whole machine) was not running, so it is not counted as silence.
+const OBSERVER_GAP_MS: u64 = HEARTBEAT_MS / 2;
 const REQUEST_MS: u64 = 10_000;
 const STOPPING_MS: u64 = 2_000;
 const PARAM_QUIET_MS: u64 = 2_000;
@@ -945,6 +948,7 @@ pub struct HostWatch {
     entered_at: u64,
     heartbeat_value: u64,
     heartbeat_at: u64,
+    observed_at: u64,
     pending_requests: Vec<(u32, u64)>,
     params_changed_at: Option<u64>,
     missed_blocks: u8,
@@ -961,6 +965,7 @@ impl HostWatch {
             entered_at: now_ms,
             heartbeat_value: 0,
             heartbeat_at: now_ms,
+            observed_at: now_ms,
             pending_requests: Vec::new(),
             params_changed_at: None,
             missed_blocks: 0,
@@ -986,6 +991,7 @@ impl HostWatch {
             Received::Configured if self.state == WatchState::Configuring => {
                 self.enter(WatchState::Running, now_ms);
                 self.heartbeat_at = now_ms;
+                self.observed_at = now_ms;
                 return Action::SaveStateNow;
             }
             Received::Response { request } => {
@@ -998,7 +1004,15 @@ impl HostWatch {
         Action::None
     }
 
+    /// Silence is counted only across time the host was observing: when the
+    /// host polls late, the worker may have been frozen together with it
+    /// (a stalled machine), which is no evidence that the worker stopped.
     pub fn heartbeat(&mut self, now_ms: u64, value: u64) -> Action {
+        let gap = now_ms.saturating_sub(self.observed_at);
+        if gap > OBSERVER_GAP_MS {
+            self.heartbeat_at = self.heartbeat_at.saturating_add(gap).min(now_ms);
+        }
+        self.observed_at = now_ms;
         if value != self.heartbeat_value {
             self.heartbeat_value = value;
             self.heartbeat_at = now_ms;

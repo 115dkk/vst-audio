@@ -219,6 +219,42 @@ fn every_deadline_fires_at_its_edge() {
 }
 
 #[test]
+fn heartbeat_silence_counts_only_while_the_host_observes() {
+    let mut watch = running(0);
+    watch.heartbeat(100, 1);
+    watch.heartbeat(200, 1);
+    // The host polls 600 ms late: the worker was not observed in that time.
+    watch.heartbeat(800, 1);
+    assert_eq!(watch.tick(800), Action::None);
+    let mut now = 800;
+    while now < 1_150 {
+        now += 50;
+        watch.heartbeat(now, 1);
+        assert_eq!(watch.tick(now), Action::None);
+    }
+    // 100 ms before the gap and 400 ms after it: 500 ms of observed silence.
+    watch.heartbeat(1_200, 1);
+    assert_eq!(
+        watch.tick(1_200),
+        Action::Kill {
+            reason: KillReason::HeartbeatTimeout
+        }
+    );
+
+    // Polls at most OBSERVER_GAP_MS apart count in full.
+    let mut watch = running(0);
+    watch.heartbeat(250, 0);
+    assert_eq!(watch.tick(250), Action::None);
+    watch.heartbeat(500, 0);
+    assert_eq!(
+        watch.tick(500),
+        Action::Kill {
+            reason: KillReason::HeartbeatTimeout
+        }
+    );
+}
+
+#[test]
 fn running_request_deadline_is_independent_of_heartbeat() {
     let mut watch = running(0);
     watch.request_sent(0, 7, RequestKind::Editor);

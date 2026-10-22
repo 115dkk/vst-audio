@@ -108,6 +108,7 @@ mod tests {
         let mut watch = ControlWatch::new(0);
         running(&mut watch, 0);
         assert_eq!(watch.latency(), 64);
+        assert_eq!(watch.poll(250, 0, None), []);
         assert_eq!(
             watch.poll(500, 0, None),
             [Action::Kill {
