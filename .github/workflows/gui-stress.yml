@@ -1,0 +1,39 @@
+name: GUI stress
+# Repeats the macOS GUI smoke many times to catch intermittent editor and
+# worker failures, keeping logs and crash reports of the first failure.
+on:
+  workflow_dispatch:
+  push:
+    branches: ["fix/**"]
+permissions:
+  contents: read
+jobs:
+  stress:
+    name: GUI stress (${{ matrix.os }} #${{ matrix.shard }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15-intel, macos-15]
+        shard: [1, 2, 3, 4]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          workspaces: |
+            . -> target
+            examples/gui -> target
+          shared-key: gui
+          save-if: false
+      - name: GUI smoke, repeated
+        env:
+          GUI_TEST_ROUNDS: "10"
+        run: python tools/gui_tests.py
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: gui-stress-${{ matrix.os }}-${{ matrix.shard }}
+          path: test-results/
+          if-no-files-found: warn
