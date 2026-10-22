@@ -1,5 +1,14 @@
-//! Framework-independent floating editor operations. Unsupported native features
+//! Framework-independent native editor operations. Unsupported native features
 //! return RequestError; no operation falls back to loading code in the parent.
+/// A native window of the application that an editor may live inside.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ParentWindow {
+    /// An HWND of another process.
+    Win32 { hwnd: u64 },
+    /// An X11 window ID on the worker's display.
+    X11 { window: u64 },
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum EditorAction {
     Show,
@@ -13,6 +22,7 @@ pub enum EditorAction {
 #[derive(Clone, Debug, PartialEq)]
 pub struct EditorStatus {
     pub visible: bool,
+    pub embedded: bool,
     pub width: u32,
     pub height: u32,
     pub scale: f32,

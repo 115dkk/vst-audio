@@ -395,6 +395,7 @@ dependencies = [
  "thiserror",
  "vst-audio-protocol",
  "vst-audio-ring",
+ "vst-audio-test-window",
  "vst-audio-transport-sys",
 ]
 
@@ -421,6 +422,15 @@ dependencies = [
  "vst-audio-ring",
  "vst-audio-worker-sys",
  "vst3",
+]
+
+[[package]]
+name = "vst-audio-test-window"
+version = "0.1.1"
+dependencies = [
+ "vst-audio-protocol",
+ "windows",
+ "x11rb",
 ]
 
 [[package]]

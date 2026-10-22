@@ -21,5 +21,6 @@ thiserror.workspace = true
 vst-audio-transport-sys.workspace = true
 
 [dev-dependencies]
+vst-audio-test-window = { path = "../vst-audio-test-window" }
 assert_no_alloc.workspace = true
 tempfile = "3"

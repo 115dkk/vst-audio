@@ -61,6 +61,21 @@ fn codec_round_trips_every_message() {
         },
         Message::GetState,
         Message::OpenEditor,
+        Message::OpenEditorIn {
+            parent: vst_audio_protocol::ParentWindow::Win32 { hwnd: u64::MAX },
+        },
+        Message::OpenEditorIn {
+            parent: vst_audio_protocol::ParentWindow::X11 { window: 0x12345678 },
+        },
+        Message::EditorStatus(vst_audio_protocol::EditorStatus {
+            visible: true,
+            embedded: true,
+            width: 640,
+            height: 480,
+            scale: 1.5,
+            resize_supported: true,
+            scale_supported: false,
+        }),
         Message::CloseEditor,
         Message::Shutdown,
         Message::Scan {
@@ -97,6 +112,25 @@ fn codec_round_trips_every_message() {
         },
     ] {
         round_trip(message);
+    }
+}
+
+#[test]
+fn embedding_rejects_unknown_platform_tags() {
+    let mut bytes = encode_frame(&Frame {
+        flags: 0,
+        request: 1,
+        message: Message::OpenEditorIn {
+            parent: vst_audio_protocol::ParentWindow::Win32 { hwnd: 1 },
+        },
+    })
+    .unwrap();
+    for tag in [2, 127, 255] {
+        bytes[12] = tag;
+        assert!(matches!(
+            decode_frame(&bytes),
+            Err(CodecError::InvalidValue)
+        ));
     }
 }
 

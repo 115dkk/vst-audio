@@ -361,6 +361,12 @@ impl PluginControl {
     pub fn open_editor(&mut self) -> Result<u32, StartError> {
         self.request(Message::OpenEditor, RequestKind::Editor)
     }
+    pub fn open_editor_in(
+        &mut self,
+        parent: vst_audio_protocol::ParentWindow,
+    ) -> Result<u32, StartError> {
+        self.request(Message::OpenEditorIn { parent }, RequestKind::Editor)
+    }
     pub fn latency(&self) -> u32 {
         self.watch.latency()
     }

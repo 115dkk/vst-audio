@@ -93,6 +93,18 @@ impl EditorWindow {
             })
         })
     }
+    pub fn open_embedded(
+        _parent: vst_audio_protocol::ParentWindow,
+        _width: i32,
+        _height: i32,
+    ) -> io::Result<Self> {
+        Err(io::Error::other(
+            "embedding into another process's window is not supported on macOS",
+        ))
+    }
+    pub fn parent(&self) -> Option<vst_audio_protocol::ParentWindow> {
+        None
+    }
     pub fn handle_value(&self) -> usize {
         Retained::as_ptr(&self.view) as usize
     }

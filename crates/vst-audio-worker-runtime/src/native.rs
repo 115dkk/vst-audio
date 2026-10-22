@@ -198,6 +198,12 @@ impl Plugin for Vst2 {
     fn open_editor(&mut self) -> Result<(), PluginError> {
         self.inner.open_editor().map_err(plugin_error)
     }
+    fn open_editor_in(
+        &mut self,
+        parent: vst_audio_protocol::ParentWindow,
+    ) -> Result<(), PluginError> {
+        self.inner.open_editor_in(parent).map_err(plugin_error)
+    }
     fn editor_action(
         &mut self,
         action: vst_audio_protocol::EditorAction,
@@ -346,6 +352,7 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
                             | Message::ListParameters { .. }
                             | Message::SetParameter { .. }
                             | Message::OpenEditor
+                            | Message::OpenEditorIn { .. }
                             | Message::CloseEditor
                     );
                     let message = match frame.message {
@@ -562,6 +569,27 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
                                 .ok_or_else(|| StartError("Load required".into()))?
                                 .open_editor()
                                 .map_err(error)?;
+                            Ok(Message::Ack)
+                        }
+                        Message::OpenEditorIn { parent } => {
+                            let plugin = plugin
+                                .as_mut()
+                                .ok_or_else(|| StartError("Load required".into()))?;
+                            plugin.open_editor_in(parent).map_err(|failure| {
+                                // Windows may refuse a Low-integrity child of a higher
+                                // parent; the native error stays in diagnostics.
+                                #[cfg(windows)]
+                                if args.sandbox
+                                    && failure.0.starts_with("embedded window creation failed:")
+                                {
+                                    eprintln!("sandboxed editor: {failure}");
+                                    return StartError(
+                                        "parent window is not accessible from the sandboxed worker"
+                                            .into(),
+                                    );
+                                }
+                                error(failure)
+                            })?;
                             Ok(Message::Ack)
                         }
                         Message::CloseEditor => {

@@ -121,6 +121,7 @@ pub(crate) fn supervise(
             let result = match command {
                 Command::Editor(action) => control.editor_action(action),
                 Command::OpenEditor => control.open_editor(),
+                Command::OpenEditorIn(parent) => control.open_editor_in(parent),
                 Command::CloseEditor => control.request_close_editor(),
                 Command::ListParameters { start, count } => control.parameters(start, count),
                 Command::SetParameter { id, value } => control.set_parameter(id, value),
@@ -227,6 +228,9 @@ pub(crate) fn supervise(
                         drop(new_control);
                         continue;
                     }
+                    shared
+                        .worker_pid
+                        .store(new_control.pid(), Ordering::Release);
                     control = Some(new_control);
                     restoration_pending = true;
                     prepared_generation = Some(generation);

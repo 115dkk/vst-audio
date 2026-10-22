@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering},
         mpsc,
     },
     thread,
@@ -272,6 +272,7 @@ pub struct RequestId(pub u64);
 pub enum Command {
     Editor(vst_audio_protocol::EditorAction),
     OpenEditor,
+    OpenEditorIn(vst_audio_protocol::ParentWindow),
     CloseEditor,
     ListParameters { start: u32, count: u16 },
     SetParameter { id: u32, value: f64 },
@@ -333,6 +334,7 @@ pub enum Status {
 pub(crate) struct Shared {
     pub(crate) stop: Arc<AtomicBool>,
     pub(crate) status: AtomicU8,
+    pub(crate) worker_pid: AtomicU32,
     pub(crate) overflow: AtomicBool,
     next_request: AtomicU64,
     pub(crate) generation: AtomicU64,
@@ -373,6 +375,10 @@ impl Controller {
             .map_err(|_| StartError("control queue full or closed".into()))?;
         Ok(id)
     }
+    /// Current worker identity; may change after recovery.
+    pub fn worker_pid(&self) -> u32 {
+        self.shared.worker_pid.load(Ordering::Acquire)
+    }
     pub fn status(&self) -> Status {
         status(&self.shared)
     }
@@ -404,6 +410,7 @@ impl Instance {
         let shared = Arc::new(Shared {
             stop: cancel,
             status: AtomicU8::new(0),
+            worker_pid: AtomicU32::new(started.control.pid()),
             overflow: AtomicBool::new(false),
             next_request: AtomicU64::new(1),
             generation: AtomicU64::new(1),

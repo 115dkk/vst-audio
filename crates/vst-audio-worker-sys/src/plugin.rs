@@ -489,8 +489,29 @@ impl Vst2Plugin {
         Ok(())
     }
     pub fn open_editor(&mut self) -> Result<(), PluginError> {
-        if self.editor.is_some() {
+        self.open_editor_at(None)
+    }
+    pub fn open_editor_in(
+        &mut self,
+        parent: vst_audio_protocol::ParentWindow,
+    ) -> Result<(), PluginError> {
+        self.open_editor_at(Some(parent))
+    }
+    fn open_editor_at(
+        &mut self,
+        parent: Option<vst_audio_protocol::ParentWindow>,
+    ) -> Result<(), PluginError> {
+        if self
+            .editor
+            .as_ref()
+            .is_some_and(|editor| editor.parent() == parent)
+        {
             return Ok(());
+        }
+        if self.editor.is_some() {
+            let control = self.shared.control();
+            control.call(EDIT_CLOSE, 0, 0, std::ptr::null_mut(), 0.0);
+            self.editor = None;
         }
         let control = self.shared.control();
         if control.effect().flags & HAS_EDITOR == 0 {
@@ -519,8 +540,12 @@ impl Vst2Plugin {
             i32::from(rect.right) - i32::from(rect.left),
             i32::from(rect.bottom) - i32::from(rect.top),
         );
-        let editor = EditorWindow::open(&self.info.name, width, height)
-            .map_err(|e| PluginError(e.to_string()))?;
+        let editor = match parent {
+            Some(parent) => EditorWindow::open_embedded(parent, width, height)
+                .map_err(|e| PluginError(e.to_string()))?,
+            None => EditorWindow::open(&self.info.name, width, height)
+                .map_err(|e| PluginError(e.to_string()))?,
+        };
         control.call(EDIT_OPEN, 0, 0, editor.handle_value() as *mut c_void, 0.0);
         self.editor = Some(editor);
         Ok(())
@@ -554,6 +579,7 @@ impl Vst2Plugin {
         let (visible, width, height) = window.status().map_err(|e| PluginError(e.to_string()))?;
         Ok(EditorReply::Status(EditorStatus {
             visible,
+            embedded: window.parent().is_some(),
             width,
             height,
             scale: 1.0,

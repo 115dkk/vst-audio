@@ -972,9 +972,26 @@ impl Vst3Plugin {
         Ok(())
     }
     pub fn open_editor(&mut self) -> Result<(), PluginError> {
-        if self.editor.is_some() {
+        self.open_editor_at(None)
+    }
+    pub fn open_editor_in(
+        &mut self,
+        parent: vst_audio_protocol::ParentWindow,
+    ) -> Result<(), PluginError> {
+        self.open_editor_at(Some(parent))
+    }
+    fn open_editor_at(
+        &mut self,
+        parent: Option<vst_audio_protocol::ParentWindow>,
+    ) -> Result<(), PluginError> {
+        if self
+            .editor
+            .as_ref()
+            .is_some_and(|editor| editor.window.parent() == parent)
+        {
             return Ok(());
         }
+        self.editor = None;
         let controller = self
             .controller
             .as_ref()
@@ -1007,10 +1024,12 @@ impl Vst3Plugin {
             .checked_sub(size.top)
             .filter(|v| (1..=8192).contains(v))
             .ok_or_else(|| PluginError("invalid editor height".into()))?;
-        let window = Rc::new(
-            EditorWindow::open(&self.info.class.name, width, height)
+        let window = Rc::new(match parent {
+            Some(parent) => EditorWindow::open_embedded(parent, width, height)
                 .map_err(|e| PluginError(e.to_string()))?,
-        );
+            None => EditorWindow::open(&self.info.class.name, width, height)
+                .map_err(|e| PluginError(e.to_string()))?,
+        });
         let frame = ComWrapper::new(Frame {
             window: window.clone(),
             #[cfg(target_os = "linux")]
@@ -1128,6 +1147,7 @@ impl Vst3Plugin {
             .map_err(|e| PluginError(e.to_string()))?;
         Ok(EditorReply::Status(EditorStatus {
             visible,
+            embedded: editor.window.parent().is_some(),
             width,
             height,
             scale: editor.scale,

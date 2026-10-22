@@ -25,6 +25,9 @@ run("cargo", "test", "--locked", "-p", "vst-audio", "--test", "features", "--", 
 
 run("cargo", "test", "--locked", "-p", "vst-audio", "--test", "stress", "--", "--ignored", "--nocapture", "--test-threads=1", env=env)
 
+run("cargo", "test", "--locked", "-p", "vst-audio", "--test", "embedding",
+    "--", "--ignored", "--nocapture", "--test-threads=1", env=env)
+
 # Reserve a loopback probe port and let the Rust test own the listener. A separate
 # environment keeps probe inputs out of unrelated worker tests.
 import socket

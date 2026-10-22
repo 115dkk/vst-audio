@@ -32,13 +32,38 @@ Requests are nonblocking and identified by session/generation/request IDs.
 Events are polled or delivered to an application-owned event loop adapter.
 Opening, showing, hiding, resizing, focusing and closing an editor are control
 requests. Focus is a request to the OS, not a guarantee of focus stealing.
-Opening a native editor creates a floating window in the worker process.
-Closing it leaves audio processing alive. Worker death invalidates its editors.
+`OpenEditor` creates a floating window in the worker process. `OpenEditorIn`
+accepts a framework-independent `ParentWindow` integer handle and creates a
+worker-owned child inside the application's HWND (Windows) or X11 window (on
+the worker's display). The plugin and its view remain entirely in the worker;
+no plugin code is loaded into the application. There is one editor per worker:
+changing parent or switching between floating and embedded closes the old view
+before attaching the new one. Closing either editor leaves audio processing
+alive. Worker death invalidates its editors.
 
-A raw NSView or wl_surface pointer cannot cross process boundaries. HWND/X11
-embedding needs separate platform-specific lifetime, input and DPI handling.
-Floating editors and a caller-rendered parameter UI are the portable contract;
-embedding is negotiated and must not silently load a plugin into the parent.
+`EditorStatus.embedded` identifies this mode. Size negotiation, visibility,
+focus requests and bounded capture use the same contract in both modes. The
+application sizes its placeholder from the reported width and height. Destroying
+the parent destroys the child and emits `EditorClosed`. Hiding the parent
+(minimizing, switching views) leaves the editor open; it reappears with the
+parent. Handles must remain valid while opening, and applications must continue
+pumping their native message loop.
+
+**Windows cross-process parent/child windows attach their input queues. A hung
+worker can therefore stall application input. Independent supervision must
+terminate the hung worker to release that coupling.** This is crash containment,
+not input isolation. Mixed-DPI hosting is a property of the parent at creation;
+changing `SetThreadDpiHostingBehavior` in the worker cannot retrofit the application's
+parent. The worker leaves DPI context/hosting behavior unchanged. Applications
+must create a compatible parent; mixed-DPI combinations require native testing.
+A sandboxed worker may be denied access to a higher-integrity parent by Windows;
+that creation failure is an explicit request failure, with the native error
+retained in worker diagnostics, never a floating-window fallback.
+
+A raw NSView or wl_surface pointer cannot cross process boundaries. macOS
+embedding explicitly returns unsupported because an NSView belongs to its
+own process; native Wayland embedding is outside this contract. Floating editors
+and a caller-rendered parameter UI remain the portable alternatives.
 
 ## Data planes
 

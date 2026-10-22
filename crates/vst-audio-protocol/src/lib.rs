@@ -10,7 +10,7 @@ use std::time::Duration;
 pub mod editor;
 pub mod layout;
 pub mod processing;
-pub use editor::{EditorAction, EditorImage, EditorReply, EditorStatus};
+pub use editor::{EditorAction, EditorImage, EditorReply, EditorStatus, ParentWindow};
 pub use processing::{BusConfiguration, Capabilities, ProcessingSetup, SampleFormat};
 pub mod state;
 #[derive(Clone, Debug, thiserror::Error)]
@@ -123,6 +123,9 @@ pub enum Message {
     },
     GetState,
     OpenEditor,
+    OpenEditorIn {
+        parent: ParentWindow,
+    },
     CloseEditor,
     ListParameters {
         start: u32,
@@ -197,6 +200,7 @@ impl Message {
             Self::SetState { .. } => 5,
             Self::GetState => 6,
             Self::OpenEditor => 7,
+            Self::OpenEditorIn { .. } => 30,
             Self::CloseEditor => 18,
             Self::ListParameters { .. } => 19,
             Self::Parameters { .. } => 20,
@@ -466,8 +470,17 @@ fn encode_message(message: &Message, out: &mut Vec<u8>) -> Result<(), CodecError
             EditorAction::Inspect => out.push(5),
             EditorAction::Capture => out.push(6),
         },
+        Message::OpenEditorIn { parent } => {
+            let (tag, handle) = match parent {
+                ParentWindow::Win32 { hwnd } => (0, hwnd),
+                ParentWindow::X11 { window } => (1, window),
+            };
+            out.push(tag);
+            put_u64(out, *handle);
+        }
         Message::EditorStatus(status) => {
             out.push(u8::from(status.visible));
+            out.push(u8::from(status.embedded));
             put_u32(out, status.width);
             put_u32(out, status.height);
             put_u32(out, status.scale.to_bits());
@@ -661,8 +674,20 @@ fn decode_message(kind: u16, body: &[u8]) -> Result<Option<Message>, CodecError>
             6 => EditorAction::Capture,
             _ => return Err(CodecError::InvalidValue),
         }),
+        30 => Message::OpenEditorIn {
+            parent: match cursor.u8()? {
+                0 => ParentWindow::Win32 {
+                    hwnd: cursor.u64()?,
+                },
+                1 => ParentWindow::X11 {
+                    window: cursor.u64()?,
+                },
+                _ => return Err(CodecError::InvalidValue),
+            },
+        },
         27 => Message::EditorStatus(EditorStatus {
             visible: cursor.boolean()?,
+            embedded: cursor.boolean()?,
             width: cursor.u32()?,
             height: cursor.u32()?,
             scale: f32::from_bits(cursor.u32()?),

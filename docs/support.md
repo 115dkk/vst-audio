@@ -15,6 +15,7 @@ from this repository. Required CI executes the implementation on Windows x64, Li
 | Buses | Multiple buses, sidechains, auxiliary outputs, active flags and general speaker masks; declared bus kind, name and default-active flag; activation chosen after loading (`BusSelector`, `BusSelector::main_only`); native order retained and negotiated layouts read back |
 | Parameters | Paged IDs, values, steps, units and read-only/automatable/hidden attributes; invalid and read-only edits return errors |
 | Editors | Floating worker-owned windows; open, hide, show, focus, close, status and bounded native-view capture |
+| Editor embedding | Worker-owned child of an application HWND or X11 window; parent destruction closes only the editor. Linux x86_64/X11 VST2/VST3 parent pixels, lifecycle and default sandbox are native-tested. Windows implementation is cross-checked by clippy; execution, mixed DPI and sandbox success/access-denied outcomes require native CI. macOS returns explicit unsupported; no floating fallback |
 | Editor negotiation | VST3 constrained resize and optional content-scale interface; VST2 returns explicit unsupported results for host-driven resize/scale |
 | GUI consumers | Separate egui and iced example workspace; the same IPC API runs each editor lifecycle on all four native targets |
 | Linux event loop | VST3 IRunLoop on host context and editor frame, with timers and file descriptors |
@@ -41,7 +42,7 @@ unsupported binary headers retain the native-worker fallback. Run
 `xvfb-run -a python3 tools/cross_arch_tests.py i686-unknown-linux-gnu` on Linux;
 on Windows/macOS run the script without Xvfb with the desired Rust target.
 
-Native embedding into an application's own window, native Wayland editor
+Native macOS cross-process editor embedding, native Wayland editor
 hosting, Linux aarch64-to-x86_64 emulation and 32-bit macOS remain outside this
 0.1.0 scope. The optional sandbox does not bound CPU or memory exhaustion,
 isolate same-session window messages/input, or protect against kernel vulnerabilities. Recovery starts a new instance and

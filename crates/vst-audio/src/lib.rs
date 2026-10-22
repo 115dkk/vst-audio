@@ -32,4 +32,4 @@ pub use audio::{AudioEndpoint, AudioStatus, ProcessReport};
 
 mod supervision;
 
-pub use vst_audio_protocol::{EditorAction, EditorImage, EditorStatus};
+pub use vst_audio_protocol::{EditorAction, EditorImage, EditorStatus, ParentWindow};

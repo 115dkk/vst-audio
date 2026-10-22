@@ -1,0 +1,27 @@
+[package]
+name = "vst-audio-test-window"
+description = "Native application window fixture for embedding tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"
+missing_safety_doc = "deny"
+dbg_macro = "deny"
+
+[dependencies]
+vst-audio-protocol.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = "0.13"

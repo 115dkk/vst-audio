@@ -120,6 +120,10 @@ impl<P: Plugin> Session<P> {
                 self.plugin.open_editor()?;
                 Ok(Message::Ack)
             }
+            Message::OpenEditorIn { parent } if self.phase != Phase::Closed => {
+                self.plugin.open_editor_in(parent)?;
+                Ok(Message::Ack)
+            }
             Message::Shutdown => {
                 self.plugin.deactivate();
                 self.phase = Phase::Closed;

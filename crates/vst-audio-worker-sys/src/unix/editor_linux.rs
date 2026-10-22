@@ -1,4 +1,4 @@
-//! Worker-owned X11 top-level window. No application GUI framework is involved.
+//! Worker-owned X11 floating or embedded window. No application GUI framework is involved.
 use std::{cell::Cell, io};
 use x11rb::{
     COPY_DEPTH_FROM_PARENT,
@@ -15,6 +15,7 @@ pub struct EditorWindow {
     delete: u32,
     protocols: u32,
     closed: Cell<bool>,
+    parent: Option<vst_audio_protocol::ParentWindow>,
 }
 fn error(e: impl std::fmt::Display) -> io::Error {
     io::Error::other(e.to_string())
@@ -79,7 +80,80 @@ impl EditorWindow {
             protocols,
             delete,
             closed: Cell::new(false),
+            parent: None,
         })
+    }
+    pub fn open_embedded(
+        parent: vst_audio_protocol::ParentWindow,
+        width: i32,
+        height: i32,
+    ) -> io::Result<Self> {
+        let vst_audio_protocol::ParentWindow::X11 { window: id } = parent else {
+            return Err(error("parent window platform does not match the worker"));
+        };
+        let id = u32::try_from(id)
+            .ok()
+            .filter(|id| *id != 0)
+            .ok_or_else(|| error("parent window is not a window"))?;
+        let (connection, _) = x11rb::connect(None).map_err(error)?;
+        connection
+            .get_geometry(id)
+            .map_err(error)?
+            .reply()
+            .map_err(|_| error("parent window is not a window"))?;
+        // Geometry accepts pixmaps too; require an actual InputOutput window.
+        let attributes = connection
+            .get_window_attributes(id)
+            .map_err(error)?
+            .reply()
+            .map_err(|_| error("parent window is not a window"))?;
+        if attributes.class != WindowClass::INPUT_OUTPUT {
+            return Err(error("parent window is not a window"));
+        }
+        connection
+            .change_window_attributes(
+                id,
+                &ChangeWindowAttributesAux::new().event_mask(EventMask::STRUCTURE_NOTIFY),
+            )
+            .map_err(error)?
+            .check()
+            .map_err(error)?;
+        let window = connection.generate_id().map_err(error)?;
+        connection
+            .create_window(
+                COPY_DEPTH_FROM_PARENT,
+                window,
+                id,
+                0,
+                0,
+                width.clamp(1, 8192) as u16,
+                height.clamp(1, 8192) as u16,
+                0,
+                WindowClass::INPUT_OUTPUT,
+                0,
+                &CreateWindowAux::new()
+                    .event_mask(EventMask::EXPOSURE | EventMask::STRUCTURE_NOTIFY),
+            )
+            .map_err(error)?
+            .check()
+            .map_err(error)?;
+        connection
+            .map_window(window)
+            .map_err(error)?
+            .check()
+            .map_err(error)?;
+        connection.flush().map_err(error)?;
+        Ok(Self {
+            connection,
+            window,
+            delete: 0,
+            protocols: 0,
+            closed: Cell::new(false),
+            parent: Some(parent),
+        })
+    }
+    pub fn parent(&self) -> Option<vst_audio_protocol::ParentWindow> {
+        self.parent
     }
     pub fn handle_value(&self) -> usize {
         self.window as usize
@@ -93,6 +167,8 @@ impl EditorWindow {
                 {
                     self.closed.set(true)
                 }
+                // Only destruction closes an embedded editor: the application
+                // may unmap its parent to minimize or switch views.
                 Event::DestroyNotify(_) => self.closed.set(true),
                 _ => {}
             }
