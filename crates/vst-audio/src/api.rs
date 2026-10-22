@@ -21,6 +21,7 @@ pub struct Configuration {
     pub recovery: RecoveryPolicy,
     pub sample_format: vst_audio_protocol::SampleFormat,
     pub offline: bool,
+    pub buses: Option<crate::BusSelector>,
     pub inputs: Option<Vec<vst_audio_protocol::BusConfiguration>>,
     pub outputs: Option<Vec<vst_audio_protocol::BusConfiguration>>,
 }
@@ -33,6 +34,7 @@ impl Default for Configuration {
             recovery: RecoveryPolicy::Manual,
             sample_format: vst_audio_protocol::SampleFormat::F32,
             offline: false,
+            buses: None,
             inputs: None,
             outputs: None,
         }
@@ -77,6 +79,7 @@ impl Configuration {
             quantum: self.quantum,
             sample_format: self.sample_format,
             offline: self.offline,
+            buses: self.buses.clone(),
             inputs: self.inputs.clone(),
             outputs: self.outputs.clone(),
         }

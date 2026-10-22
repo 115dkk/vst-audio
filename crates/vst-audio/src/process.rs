@@ -16,7 +16,9 @@ use vst_audio_protocol::{
     Action, ClassInfo, CodecError, DecodedFrame, Frame, Message, PluginFormat, RequestKind,
     read_frame, write_frame,
 };
-use vst_audio_protocol::{BusConfiguration, Capabilities, ProcessingSetup, SampleFormat};
+use vst_audio_protocol::{
+    BusConfiguration, BusInfo, BusKind, Capabilities, ProcessingSetup, SampleFormat,
+};
 use vst_audio_ring::{Geometry, Producer, Publisher, Signal, Waited};
 use vst_audio_transport_sys::{
     Event, SharedRegion,
@@ -132,6 +134,55 @@ impl Transport {
     }
 }
 
+/// The buses to activate, chosen after the plugin has loaded: one
+/// configuration per declared bus, in declared order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BusChoice {
+    pub inputs: Vec<BusConfiguration>,
+    pub outputs: Vec<BusConfiguration>,
+}
+
+type SelectBuses = dyn Fn(&[BusInfo], &[BusInfo]) -> Result<BusChoice, String> + Send + Sync;
+
+/// Chooses, once the plugin has loaded and declared its buses, which of them
+/// to activate and which arrangement to request for each. It runs on the
+/// starting thread between loading and preparing, so it must decide at once.
+/// Recovery starts a new worker with the same selector.
+#[derive(Clone)]
+pub struct BusSelector(Arc<SelectBuses>);
+
+impl BusSelector {
+    pub fn new(
+        select: impl Fn(&[BusInfo], &[BusInfo]) -> Result<BusChoice, String> + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(select))
+    }
+
+    /// Each direction's first `Main` bus active, every other bus inactive,
+    /// arrangements as declared. A direction without a main bus activates none.
+    pub fn main_only() -> Self {
+        Self::new(|inputs, outputs| {
+            let choose = |buses: &[BusInfo]| {
+                let first_main = buses.iter().position(|bus| bus.kind == BusKind::Main);
+                buses
+                    .iter()
+                    .enumerate()
+                    .map(|(index, bus)| bus.configuration(Some(index) == first_main))
+                    .collect()
+            };
+            Ok(BusChoice {
+                inputs: choose(inputs),
+                outputs: choose(outputs),
+            })
+        })
+    }
+}
+impl std::fmt::Debug for BusSelector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BusSelector(..)")
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ProcessingOptions {
     pub cancel: Option<Arc<AtomicBool>>,
@@ -139,6 +190,7 @@ pub struct ProcessingOptions {
     pub quantum: u32,
     pub sample_format: SampleFormat,
     pub offline: bool,
+    pub buses: Option<BusSelector>,
     pub inputs: Option<Vec<BusConfiguration>>,
     pub outputs: Option<Vec<BusConfiguration>>,
 }
@@ -150,11 +202,50 @@ impl Default for ProcessingOptions {
             quantum: 128,
             sample_format: SampleFormat::F32,
             offline: false,
+            buses: None,
             inputs: None,
             outputs: None,
         }
     }
 }
+fn resolve_buses(
+    inputs: &[BusInfo],
+    outputs: &[BusInfo],
+    options: &ProcessingOptions,
+) -> Result<(Vec<BusConfiguration>, Vec<BusConfiguration>), StartError> {
+    let selected = options
+        .buses
+        .as_ref()
+        .map(|selector| (selector.0)(inputs, outputs))
+        .transpose()
+        .map_err(|reason| StartError(format!("bus selection: {reason}")))?;
+    if selected.as_ref().is_some_and(|choice| {
+        choice.inputs.len() != inputs.len() || choice.outputs.len() != outputs.len()
+    }) {
+        return Err(StartError(
+            "bus selection must configure every declared bus".into(),
+        ));
+    }
+    let default = |buses: &[BusInfo]| {
+        buses
+            .iter()
+            .map(|bus| bus.configuration(true))
+            .collect::<Vec<_>>()
+    };
+    Ok((
+        options.inputs.clone().unwrap_or_else(|| {
+            selected
+                .as_ref()
+                .map_or_else(|| default(inputs), |choice| choice.inputs.clone())
+        }),
+        options.outputs.clone().unwrap_or_else(|| {
+            selected
+                .as_ref()
+                .map_or_else(|| default(outputs), |choice| choice.outputs.clone())
+        }),
+    ))
+}
+
 fn speaker_bits(buses: &[BusConfiguration]) -> Vec<u32> {
     buses
         .iter()
@@ -177,6 +268,8 @@ fn speaker_bits(buses: &[BusConfiguration]) -> Vec<u32> {
 #[derive(Debug)]
 pub struct Started {
     pub setup: ProcessingSetup,
+    pub declared_inputs: Vec<BusInfo>,
+    pub declared_outputs: Vec<BusInfo>,
     pub capabilities: Capabilities,
     pub region: Arc<SharedRegion>,
     pub work: Arc<Event>,
@@ -489,19 +582,14 @@ impl PluginProcess {
         if options.sample_format == SampleFormat::F64 && !capabilities.f64 {
             return Err(StartError("plugin does not support f64".into()));
         }
+        let (selected_inputs, selected_outputs) = resolve_buses(&inputs, &outputs, options)?;
         let setup = ProcessingSetup {
             sample_rate: rate,
             quantum: frames,
             sample_format: options.sample_format,
             offline: options.offline,
-            inputs: options
-                .inputs
-                .clone()
-                .unwrap_or_else(|| inputs.into_iter().map(Into::into).collect()),
-            outputs: options
-                .outputs
-                .clone()
-                .unwrap_or_else(|| outputs.into_iter().map(Into::into).collect()),
+            inputs: selected_inputs,
+            outputs: selected_outputs,
         };
         if !setup.valid() {
             return Err(StartError("invalid processing setup".into()));
@@ -572,6 +660,8 @@ impl PluginProcess {
         }
         Ok(Started {
             setup,
+            declared_inputs: inputs,
+            declared_outputs: outputs,
             capabilities,
             region,
             work,
@@ -696,4 +786,106 @@ fn spawn(
     drop(output.child);
     let transport = Transport::new(output.parent, input.parent, cancel, process.clone());
     Ok((process, transport, region, work, done, ready))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vst_audio_protocol::Bus;
+
+    fn bus(kind: BusKind) -> BusInfo {
+        BusInfo {
+            layout: Bus {
+                channels: 2,
+                arrangement: 3,
+            },
+            kind,
+            name: String::new(),
+            default_active: true,
+        }
+    }
+
+    #[test]
+    fn main_only_activates_the_first_main_bus_wherever_it_is() {
+        let options = ProcessingOptions {
+            buses: Some(BusSelector::main_only()),
+            ..Default::default()
+        };
+        let (inputs, outputs) = resolve_buses(
+            &[bus(BusKind::Aux), bus(BusKind::Main), bus(BusKind::Main)],
+            &[bus(BusKind::Main), bus(BusKind::Aux)],
+            &options,
+        )
+        .unwrap();
+        assert_eq!(
+            inputs.iter().map(|bus| bus.active).collect::<Vec<_>>(),
+            [false, true, false]
+        );
+        assert_eq!(
+            outputs.iter().map(|bus| bus.active).collect::<Vec<_>>(),
+            [true, false]
+        );
+        assert_eq!(resolve_buses(&[], &[], &options).unwrap(), (vec![], vec![]));
+    }
+
+    #[test]
+    fn explicit_buses_win_over_the_selector_per_direction() {
+        let explicit = vec![bus(BusKind::Aux).configuration(true)];
+        let options = ProcessingOptions {
+            buses: Some(BusSelector::main_only()),
+            inputs: Some(explicit.clone()),
+            ..Default::default()
+        };
+        let (inputs, outputs) = resolve_buses(
+            &[bus(BusKind::Aux)],
+            &[bus(BusKind::Main), bus(BusKind::Aux)],
+            &options,
+        )
+        .unwrap();
+        assert_eq!(inputs, explicit);
+        assert_eq!(
+            outputs.iter().map(|bus| bus.active).collect::<Vec<_>>(),
+            [true, false]
+        );
+    }
+
+    #[test]
+    fn a_selection_must_configure_every_declared_bus() {
+        let wrong_length = ProcessingOptions {
+            buses: Some(BusSelector::new(|_, _| {
+                Ok(BusChoice {
+                    inputs: vec![],
+                    outputs: vec![],
+                })
+            })),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_buses(&[bus(BusKind::Main)], &[], &wrong_length)
+                .unwrap_err()
+                .0,
+            "bus selection must configure every declared bus"
+        );
+        let failed = ProcessingOptions {
+            buses: Some(BusSelector::new(|_, _| Err("no suitable buses".into()))),
+            ..Default::default()
+        };
+        assert!(
+            resolve_buses(&[], &[], &failed)
+                .unwrap_err()
+                .0
+                .starts_with("bus selection:")
+        );
+    }
+
+    #[test]
+    fn without_a_selector_every_declared_bus_is_active() {
+        let (inputs, outputs) = resolve_buses(
+            &[bus(BusKind::Aux), bus(BusKind::Main)],
+            &[bus(BusKind::Aux)],
+            &ProcessingOptions::default(),
+        )
+        .unwrap();
+        assert!(inputs.iter().chain(&outputs).all(|bus| bus.active));
+    }
 }

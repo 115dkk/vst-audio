@@ -18,7 +18,7 @@ pub mod state;
 pub struct PluginError(pub String);
 
 pub const MAGIC: [u8; 4] = *b"SSRP";
-pub const PROTOCOL_MAJOR: u16 = 3;
+pub const PROTOCOL_MAJOR: u16 = 4;
 pub const PROTOCOL_MINOR: u16 = 0;
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 pub const MAX_STATE_BYTES: usize = 64 * 1024 * 1024;
@@ -38,6 +38,34 @@ pub enum PluginFormat {
 pub struct Bus {
     pub channels: u16,
     pub arrangement: u64,
+}
+
+/// What a declared audio bus is for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BusKind {
+    Main,
+    /// Sidechain inputs and auxiliary outputs.
+    Aux,
+}
+
+/// A bus as the plugin declares it, before any is activated.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BusInfo {
+    pub layout: Bus,
+    pub kind: BusKind,
+    /// The plugin's own name for the bus; may be empty.
+    pub name: String,
+    /// The plugin asks for this bus to be active unless the host decides otherwise.
+    pub default_active: bool,
+}
+
+impl BusInfo {
+    pub fn configuration(&self, active: bool) -> BusConfiguration {
+        BusConfiguration {
+            layout: self.layout.clone(),
+            active,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -116,8 +144,8 @@ pub enum Message {
         name: String,
         vendor: String,
         latency_frames: u32,
-        inputs: Vec<Bus>,
-        outputs: Vec<Bus>,
+        inputs: Vec<BusInfo>,
+        outputs: Vec<BusInfo>,
     },
     Classes {
         entries: Vec<ClassInfo>,
@@ -400,8 +428,8 @@ fn encode_message(message: &Message, out: &mut Vec<u8>) -> Result<(), CodecError
             put_string(out, name)?;
             put_string(out, vendor)?;
             put_u32(out, *latency_frames);
-            put_buses(out, inputs)?;
-            put_buses(out, outputs)?;
+            put_bus_infos(out, inputs)?;
+            put_bus_infos(out, outputs)?;
         }
         Message::Classes { entries } => {
             put_u16(
@@ -581,8 +609,8 @@ fn decode_message(kind: u16, body: &[u8]) -> Result<Option<Message>, CodecError>
             name: cursor.string()?,
             vendor: cursor.string()?,
             latency_frames: cursor.u32()?,
-            inputs: cursor.buses()?,
-            outputs: cursor.buses()?,
+            inputs: cursor.bus_infos()?,
+            outputs: cursor.bus_infos()?,
         },
         11 => {
             let count = cursor.u16()? as usize;
@@ -784,14 +812,20 @@ fn put_string(out: &mut Vec<u8>, value: &str) -> Result<(), CodecError> {
     Ok(())
 }
 
-fn put_buses(out: &mut Vec<u8>, buses: &[Bus]) -> Result<(), CodecError> {
+fn put_bus_infos(out: &mut Vec<u8>, buses: &[BusInfo]) -> Result<(), CodecError> {
     put_u16(
         out,
         u16::try_from(buses.len()).map_err(|_| CodecError::InvalidValue)?,
     );
     for bus in buses {
-        put_u16(out, bus.channels);
-        put_u64(out, bus.arrangement);
+        put_u16(out, bus.layout.channels);
+        put_u64(out, bus.layout.arrangement);
+        out.push(match bus.kind {
+            BusKind::Main => 0,
+            BusKind::Aux => 1,
+        });
+        out.push(u8::from(bus.default_active));
+        put_string(out, &bus.name)?;
     }
     Ok(())
 }
@@ -857,13 +891,28 @@ impl<'a> Cursor<'a> {
         }
         String::from_utf8(self.take(length)?.to_vec()).map_err(|_| CodecError::InvalidUtf8)
     }
-    fn buses(&mut self) -> Result<Vec<Bus>, CodecError> {
+    fn bus_infos(&mut self) -> Result<Vec<BusInfo>, CodecError> {
         let count = self.u16()? as usize;
         let mut buses = Vec::with_capacity(count);
         for _ in 0..count {
-            buses.push(Bus {
+            let layout = Bus {
                 channels: self.u16()?,
                 arrangement: self.u64()?,
+            };
+            let kind = match self.u8()? {
+                0 => BusKind::Main,
+                1 => BusKind::Aux,
+                _ => return Err(CodecError::InvalidValue),
+            };
+            let flags = self.u8()?;
+            if flags & !1 != 0 {
+                return Err(CodecError::InvalidValue);
+            }
+            buses.push(BusInfo {
+                layout,
+                kind,
+                name: self.string()?,
+                default_active: flags & 1 != 0,
             });
         }
         Ok(buses)

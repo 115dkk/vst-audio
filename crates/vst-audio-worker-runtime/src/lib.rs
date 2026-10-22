@@ -3,14 +3,16 @@
 pub mod host;
 mod native;
 mod vst3;
-pub use vst_audio_protocol::{Bus, ClassInfo, PluginError, PluginFormat, layout, state};
+pub use vst_audio_protocol::{
+    Bus, BusInfo, BusKind, ClassInfo, PluginError, PluginFormat, layout, state,
+};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PluginInfo {
     pub name: String,
     pub vendor: String,
     pub latency_frames: u32,
-    pub inputs: Vec<Bus>,
-    pub outputs: Vec<Bus>,
+    pub inputs: Vec<BusInfo>,
+    pub outputs: Vec<BusInfo>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]

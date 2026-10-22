@@ -2,12 +2,11 @@
 //! Host-owned COM objects. Controller callbacks are UI-thread-only (SDK threading model).
 use crate::{editor::EditorWindow, state_buffer::StateBuffer};
 use std::{
-    cell::RefCell,
     ffi::c_void,
     io::{Read, Seek, SeekFrom, Write},
     rc::Rc,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
     },
 };
@@ -137,10 +136,16 @@ impl IComponentHandlerTrait for Handler {
     }
 }
 
-pub(crate) struct Stream(pub RefCell<StateBuffer>);
+pub(crate) struct Stream(pub Mutex<StateBuffer>);
 impl Stream {
     pub fn new(bytes: Vec<u8>) -> ComWrapper<Self> {
-        ComWrapper::new(Self(RefCell::new(StateBuffer::new(bytes))))
+        ComWrapper::new(Self(Mutex::new(StateBuffer::new(bytes))))
+    }
+
+    pub fn try_from_slice(bytes: &[u8]) -> std::io::Result<ComWrapper<Self>> {
+        Ok(ComWrapper::new(Self(Mutex::new(
+            StateBuffer::try_from_slice(bytes)?,
+        ))))
     }
 }
 impl Class for Stream {
@@ -158,7 +163,10 @@ impl IBStreamTrait for Stream {
             // SAFETY: IBStream caller provides count writable bytes; used only in this call.
             unsafe { std::slice::from_raw_parts_mut(buffer.cast::<u8>(), count as usize) }
         };
-        let Ok(n) = self.0.borrow_mut().read(bytes) else {
+        let Ok(mut stream) = self.0.try_lock() else {
+            return kResultFalse;
+        };
+        let Ok(n) = stream.read(bytes) else {
             return kResultFalse;
         };
         if !actual.is_null() {
@@ -181,8 +189,13 @@ impl IBStreamTrait for Stream {
             // SAFETY: IBStream caller provides count readable bytes for this synchronous write.
             unsafe { std::slice::from_raw_parts(buffer.cast::<u8>(), count as usize) }
         };
-        let Ok(n) = self.0.borrow_mut().write(bytes) else {
+        let Ok(mut stream) = self.0.try_lock() else {
             return kResultFalse;
+        };
+        let n = match stream.write(bytes) {
+            Ok(n) => n,
+            Err(error) if error.kind() == std::io::ErrorKind::OutOfMemory => return kOutOfMemory,
+            Err(_) => return kResultFalse,
         };
         if !actual.is_null() {
             // SAFETY: optional writable byte-count output supplied by the caller.
@@ -197,7 +210,10 @@ impl IBStreamTrait for Stream {
             2 => SeekFrom::End(position),
             _ => return kInvalidArgument,
         };
-        let Ok(position) = self.0.borrow_mut().seek(from) else {
+        let Ok(mut stream) = self.0.try_lock() else {
+            return kResultFalse;
+        };
+        let Ok(position) = stream.seek(from) else {
             return kInvalidArgument;
         };
         if !actual.is_null() {
@@ -210,8 +226,11 @@ impl IBStreamTrait for Stream {
         if position.is_null() {
             return kInvalidArgument;
         }
+        let Ok(stream) = self.0.try_lock() else {
+            return kResultFalse;
+        };
         // SAFETY: non-null writable position output required by IBStream.
-        unsafe { *position = self.0.borrow().position() as i64 };
+        unsafe { *position = stream.position() as i64 };
         kResultOk
     }
 }
@@ -256,5 +275,34 @@ impl IPlugFrameTrait for Frame {
         }
         // SAFETY: main-thread callback, rectangle remains valid; window has been resized first.
         unsafe { view.onSize(rect) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_locked_stream_refuses_instead_of_racing() {
+        let stream = Stream(Mutex::new(StateBuffer::default()));
+        let _locked = stream.0.lock().unwrap();
+        let mut byte = 1_u8;
+        let mut actual = 0;
+        let mut position = 0;
+        assert_eq!(
+            // SAFETY: pointers refer to live one-byte and output storage for this synchronous call.
+            unsafe { IBStreamTrait::write(&stream, (&mut byte as *mut u8).cast(), 1, &mut actual) },
+            kResultFalse
+        );
+        assert_eq!(
+            // SAFETY: pointers refer to live one-byte and output storage for this synchronous call.
+            unsafe { IBStreamTrait::read(&stream, (&mut byte as *mut u8).cast(), 1, &mut actual) },
+            kResultFalse
+        );
+        assert_eq!(
+            // SAFETY: position points to live writable storage for this synchronous call.
+            unsafe { IBStreamTrait::tell(&stream, &mut position) },
+            kResultFalse
+        );
     }
 }

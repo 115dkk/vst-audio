@@ -7,8 +7,20 @@ impl StateBuffer {
     pub fn new(bytes: Vec<u8>) -> Self {
         Self(std::io::Cursor::new(bytes))
     }
-    pub fn snapshot(&self) -> Vec<u8> {
-        self.0.get_ref().clone()
+    pub fn try_from_slice(bytes: &[u8]) -> io::Result<Self> {
+        let mut copy = Vec::new();
+        copy.try_reserve_exact(bytes.len())
+            .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+        copy.extend_from_slice(bytes);
+        Ok(Self::new(copy))
+    }
+    pub fn try_snapshot(&self) -> io::Result<Vec<u8>> {
+        let bytes = self.0.get_ref();
+        let mut copy = Vec::new();
+        copy.try_reserve_exact(bytes.len())
+            .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+        copy.extend_from_slice(bytes);
+        Ok(copy)
     }
     pub fn position(&self) -> u64 {
         self.0.position()
@@ -21,8 +33,16 @@ impl Read for StateBuffer {
 }
 impl Write for StateBuffer {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if self.position().saturating_add(bytes.len() as u64) > LIMIT {
+        let end = self.position().saturating_add(bytes.len() as u64);
+        if end > LIMIT {
             return Err(io::Error::other("state buffer limit"));
+        }
+        let length = self.0.get_ref().len() as u64;
+        if end > length {
+            self.0
+                .get_mut()
+                .try_reserve((end - length) as usize)
+                .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
         }
         self.0.write(bytes)
     }
@@ -54,11 +74,17 @@ mod tests {
         assert_eq!(stream.read(&mut bytes).unwrap(), 0);
         stream.seek(SeekFrom::End(2)).unwrap();
         stream.write_all(&[3]).unwrap();
-        assert_eq!(stream.snapshot(), [1, 2, 0, 0, 3]);
+        assert_eq!(stream.try_snapshot().unwrap(), [1, 2, 0, 0, 3]);
         assert_eq!(stream.seek(SeekFrom::Current(-1)).unwrap(), 4);
         assert!(stream.seek(SeekFrom::Current(-5)).is_err());
         assert!(stream.seek(SeekFrom::Start(LIMIT + 1)).is_err());
         stream.seek(SeekFrom::Start(LIMIT)).unwrap();
         assert!(stream.write(&[1]).is_err());
+    }
+
+    #[test]
+    fn try_snapshot_and_try_from_slice_round_trip() {
+        let stream = StateBuffer::try_from_slice(&[1, 2, 3, 4]).unwrap();
+        assert_eq!(stream.try_snapshot().unwrap(), [1, 2, 3, 4]);
     }
 }

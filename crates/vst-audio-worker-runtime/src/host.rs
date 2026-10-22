@@ -235,7 +235,7 @@ pub fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Bus, PluginEvents, PluginInfo, Processor};
+    use crate::{Bus, BusInfo, BusKind, PluginEvents, PluginInfo, Processor};
     use std::io::Cursor;
     use vst_audio_ring::{Consumer, Geometry, InProcessEvent, Producer, RegionBuf};
     #[test]
@@ -288,13 +288,23 @@ mod tests {
                 name: "Fake".into(),
                 vendor: "Tests".into(),
                 latency_frames: 0,
-                inputs: vec![Bus {
-                    channels: 2,
-                    arrangement: 3,
+                inputs: vec![BusInfo {
+                    layout: Bus {
+                        channels: 2,
+                        arrangement: 3,
+                    },
+                    kind: BusKind::Main,
+                    name: String::new(),
+                    default_active: true,
                 }],
-                outputs: vec![Bus {
-                    channels: 2,
-                    arrangement: 3,
+                outputs: vec![BusInfo {
+                    layout: Bus {
+                        channels: 2,
+                        arrangement: 3,
+                    },
+                    kind: BusKind::Main,
+                    name: String::new(),
+                    default_active: true,
                 }],
             }
         }
@@ -401,47 +411,87 @@ mod tests {
     #[test]
     fn loaded_main_bus_layouts_come_from_plugin() {
         let mut info = Fake::default().info();
-        info.inputs[0] = Bus {
+        info.inputs[0].layout = Bus {
             channels: 6,
             arrangement: 63,
         };
-        info.outputs[0] = Bus {
+        info.outputs[0].layout = Bus {
             channels: 2,
             arrangement: 3,
         };
         assert_eq!(
-            crate::layout::main_bus(&info.inputs, "input").unwrap(),
+            crate::layout::main_bus(
+                &info
+                    .inputs
+                    .iter()
+                    .map(|b| b.layout.clone())
+                    .collect::<Vec<_>>(),
+                "input"
+            )
+            .unwrap(),
             [1, 2, 4, 8, 16, 32]
         );
         assert_eq!(
-            crate::layout::main_bus(&info.outputs, "output").unwrap(),
+            crate::layout::main_bus(
+                &info
+                    .outputs
+                    .iter()
+                    .map(|b| b.layout.clone())
+                    .collect::<Vec<_>>(),
+                "output"
+            )
+            .unwrap(),
             [1, 2]
         );
-        info.inputs[0] = Bus {
+        info.inputs[0].layout = Bus {
             channels: 1,
             arrangement: 1 << 18,
         };
         assert!(
-            crate::layout::main_bus(&info.inputs, "input")
-                .unwrap_err()
-                .to_string()
-                .contains("18")
+            crate::layout::main_bus(
+                &info
+                    .inputs
+                    .iter()
+                    .map(|b| b.layout.clone())
+                    .collect::<Vec<_>>(),
+                "input"
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("18")
         );
-        info.inputs[0] = Bus {
+        info.inputs[0].layout = Bus {
             channels: 0,
             arrangement: 0,
         };
         assert!(
-            crate::layout::main_bus(&info.inputs, "input")
-                .unwrap_err()
-                .to_string()
-                .contains("0 channels")
+            crate::layout::main_bus(
+                &info
+                    .inputs
+                    .iter()
+                    .map(|b| b.layout.clone())
+                    .collect::<Vec<_>>(),
+                "input"
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("0 channels")
         );
-        info.inputs[0] = Bus {
+        info.inputs[0].layout = Bus {
             channels: 3,
             arrangement: 3,
         };
-        assert!(crate::layout::main_bus(&info.inputs, "input").is_err());
+        assert!(
+            crate::layout::main_bus(
+                &info
+                    .inputs
+                    .iter()
+                    .map(|b| b.layout.clone())
+                    .collect::<Vec<_>>(),
+                "input"
+            )
+            .is_err()
+        );
         assert!(crate::layout::main_bus(&[], "input").is_err());
     }
 

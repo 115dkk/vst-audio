@@ -3,9 +3,9 @@
 use std::io::Cursor;
 
 use vst_audio_protocol::{
-    Action, Bus, ClassInfo, CodecError, DecodedFrame, DisableReason, Frame, HostWatch, KillReason,
-    MAX_STRING_BYTES, Message, PluginFormat, Received, RequestKind, StateHistory, WatchState,
-    decode_frame, encode_frame, read_frame,
+    Action, Bus, BusInfo, BusKind, ClassInfo, CodecError, DecodedFrame, DisableReason, Frame,
+    HostWatch, KillReason, MAX_STRING_BYTES, Message, PluginFormat, Received, RequestKind,
+    StateHistory, WatchState, decode_frame, encode_frame, read_frame,
 };
 
 fn round_trip(message: Message) {
@@ -30,9 +30,14 @@ fn round_trip(message: Message) {
 #[test]
 fn codec_round_trips_every_message() {
     let id = [9; 16];
-    let buses = vec![Bus {
-        channels: 6,
-        arrangement: 0x3f,
+    let buses = vec![BusInfo {
+        layout: Bus {
+            channels: 6,
+            arrangement: 0x3f,
+        },
+        kind: BusKind::Aux,
+        name: "Sidechain".into(),
+        default_active: false,
     }];
     for message in [
         Message::hello(),
@@ -143,6 +148,47 @@ fn malicious_frames_are_rejected_and_unknown_kinds_skip() {
         })
         .is_err()
     );
+}
+
+#[test]
+fn bus_info_rejects_unknown_kinds_and_flags() {
+    let frame = Frame {
+        flags: 0,
+        request: 1,
+        message: Message::Loaded {
+            name: String::new(),
+            vendor: String::new(),
+            latency_frames: 0,
+            inputs: vec![BusInfo {
+                layout: Bus {
+                    channels: 2,
+                    arrangement: 3,
+                },
+                kind: BusKind::Main,
+                name: String::new(),
+                default_active: true,
+            }],
+            outputs: Vec::new(),
+        },
+    };
+    let encoded = encode_frame(&frame).unwrap();
+    // Header (12), two empty strings (4), latency (4), count (2), layout (10).
+    let kind = 32;
+    let flags = kind + 1;
+
+    let mut unknown_kind = encoded.clone();
+    unknown_kind[kind] = 2;
+    assert!(matches!(
+        decode_frame(&unknown_kind),
+        Err(CodecError::InvalidValue)
+    ));
+
+    let mut unknown_flags = encoded;
+    unknown_flags[flags] = 2;
+    assert!(matches!(
+        decode_frame(&unknown_flags),
+        Err(CodecError::InvalidValue)
+    ));
 }
 
 fn running(now: u64) -> HostWatch {

@@ -53,8 +53,8 @@ pub struct Info {
     pub inputs: u16,
     pub outputs: u16,
     pub latency: u32,
-    pub input_buses: Vec<vst_audio_protocol::Bus>,
-    pub output_buses: Vec<vst_audio_protocol::Bus>,
+    pub input_buses: Vec<vst_audio_protocol::BusInfo>,
+    pub output_buses: Vec<vst_audio_protocol::BusInfo>,
 }
 #[derive(Debug, Default)]
 pub struct Events {
@@ -460,7 +460,7 @@ impl Vst3Plugin {
         plugin.info.latency = unsafe { plugin.shared.processor.getLatencySamples() };
         Ok(plugin)
     }
-    fn buses(&self, direction: i32) -> Result<Vec<vst_audio_protocol::Bus>, PluginError> {
+    fn buses(&self, direction: i32) -> Result<Vec<vst_audio_protocol::BusInfo>, PluginError> {
         // SAFETY: initialized component queried on its owning thread.
         let count = unsafe { self.component.getBusCount(0, direction) };
         if !(0..=32).contains(&count) {
@@ -498,9 +498,33 @@ impl Vst3Plugin {
                     "bus arrangement disagrees with channel count".into(),
                 ));
             }
-            buses.push(vst_audio_protocol::Bus {
-                channels: info.channelCount as u16,
-                arrangement,
+            let mut name = String::from_utf16_lossy(
+                &info.name[..info
+                    .name
+                    .iter()
+                    .position(|unit| *unit == 0)
+                    .unwrap_or(info.name.len())],
+            );
+            if name.len() > 128 {
+                let mut end = 128;
+                while !name.is_char_boundary(end) {
+                    end -= 1;
+                }
+                name.truncate(end);
+            }
+            buses.push(vst_audio_protocol::BusInfo {
+                layout: vst_audio_protocol::Bus {
+                    channels: info.channelCount as u16,
+                    arrangement,
+                },
+                kind: if info.busType == BusTypes_::kMain as i32 {
+                    vst_audio_protocol::BusKind::Main
+                } else {
+                    vst_audio_protocol::BusKind::Aux
+                },
+                name,
+                default_active: (info.flags as i64) & (BusInfo_::BusFlags_::kDefaultActive as i64)
+                    != 0,
             });
         }
         Ok(buses)
@@ -508,10 +532,28 @@ impl Vst3Plugin {
     fn refresh_buses(&mut self) -> Result<(), PluginError> {
         self.info.input_buses = self.buses(0)?;
         self.info.output_buses = self.buses(1)?;
-        self.info.inputs = self.info.input_buses.iter().map(|b| b.channels).sum();
-        self.info.outputs = self.info.output_buses.iter().map(|b| b.channels).sum();
-        self.info.input = self.info.input_buses.first().map_or(0, |b| b.arrangement);
-        self.info.output = self.info.output_buses.first().map_or(0, |b| b.arrangement);
+        self.info.inputs = self
+            .info
+            .input_buses
+            .iter()
+            .map(|b| b.layout.channels)
+            .sum();
+        self.info.outputs = self
+            .info
+            .output_buses
+            .iter()
+            .map(|b| b.layout.channels)
+            .sum();
+        self.info.input = self
+            .info
+            .input_buses
+            .first()
+            .map_or(0, |b| b.layout.arrangement);
+        self.info.output = self
+            .info
+            .output_buses
+            .first()
+            .map_or(0, |b| b.layout.arrangement);
         Ok(())
     }
     pub fn capabilities(&self) -> vst_audio_protocol::Capabilities {
@@ -539,15 +581,13 @@ impl Vst3Plugin {
                 .info
                 .input_buses
                 .iter()
-                .cloned()
-                .map(Into::into)
+                .map(|bus| bus.configuration(true))
                 .collect(),
             outputs: self
                 .info
                 .output_buses
                 .iter()
-                .cloned()
-                .map(Into::into)
+                .map(|bus| bus.configuration(true))
                 .collect(),
         })
     }
@@ -590,9 +630,9 @@ impl Vst3Plugin {
             .zip(&self.info.input_buses)
             .chain(configuration.outputs.iter().zip(&self.info.output_buses))
         {
-            if requested.layout.channels != actual.channels
+            if requested.layout.channels != actual.layout.channels
                 || (requested.layout.arrangement != 0
-                    && requested.layout.arrangement != actual.arrangement)
+                    && requested.layout.arrangement != actual.layout.arrangement)
             {
                 return Err(PluginError("plugin rejected bus arrangement".into()));
             }
@@ -887,15 +927,20 @@ impl Vst3Plugin {
                 check(result, "controller getState")?;
             }
         }
-        let result = (
-            component.0.borrow().snapshot(),
-            controller.0.borrow().snapshot(),
-        );
-        Ok(result)
+        let snapshot = |stream: &Stream| -> Result<Vec<u8>, PluginError> {
+            stream
+                .0
+                .try_lock()
+                .map_err(|_| PluginError("plugin state stream is still in use".into()))?
+                .try_snapshot()
+                .map_err(|_| PluginError("out of memory for plugin state".into()))
+        };
+        Ok((snapshot(&component)?, snapshot(&controller)?))
     }
     pub fn set_state(&mut self, component: &[u8], controller: &[u8]) -> Result<(), PluginError> {
         let _control = self.shared.control();
-        let stream = Stream::new(component.to_vec());
+        let stream = Stream::try_from_slice(component)
+            .map_err(|_| PluginError("out of memory for plugin state".into()))?;
         let pointer = stream.to_com_ptr::<IBStream>().expect("stream interface");
         check(
             // SAFETY: main thread, admitted processing excluded, stream owns component bytes.
@@ -903,14 +948,16 @@ impl Vst3Plugin {
             "component setState",
         )?;
         if let Some(editor) = &self.controller {
-            let stream = Stream::new(component.to_vec());
+            let stream = Stream::try_from_slice(component)
+                .map_err(|_| PluginError("out of memory for plugin state".into()))?;
             let pointer = stream.to_com_ptr::<IBStream>().expect("stream interface");
             // SAFETY: main thread; fresh stream rewound to start of component state.
             let result = unsafe { editor.setComponentState(pointer.as_ptr()) };
             if result != kNotImplemented {
                 check(result, "setComponentState")?;
             }
-            let stream = Stream::new(controller.to_vec());
+            let stream = Stream::try_from_slice(controller)
+                .map_err(|_| PluginError("out of memory for plugin state".into()))?;
             let pointer = stream.to_com_ptr::<IBStream>().expect("stream interface");
             // SAFETY: controller UI state restored after the component state, on main thread.
             let result = unsafe { editor.setState(pointer.as_ptr()) };

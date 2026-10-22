@@ -51,18 +51,36 @@ impl Vst2 {
                 )
                 .unwrap_or(0))
         };
+        let input_arrangement = arrangement(info.input_types, info.inputs)?;
+        let output_arrangement = arrangement(info.output_types, info.outputs)?;
         let info = PluginInfo {
             name: info.name,
             vendor: info.vendor,
             latency_frames: info.latency,
-            inputs: vec![Bus {
-                channels: info.inputs,
-                arrangement: arrangement(info.input_types, info.inputs)?,
-            }],
-            outputs: vec![Bus {
-                channels: info.outputs,
-                arrangement: arrangement(info.output_types, info.outputs)?,
-            }],
+            inputs: (info.inputs != 0)
+                .then(|| vst_audio_protocol::BusInfo {
+                    layout: Bus {
+                        channels: info.inputs,
+                        arrangement: input_arrangement,
+                    },
+                    kind: vst_audio_protocol::BusKind::Main,
+                    name: String::new(),
+                    default_active: true,
+                })
+                .into_iter()
+                .collect(),
+            outputs: (info.outputs != 0)
+                .then(|| vst_audio_protocol::BusInfo {
+                    layout: Bus {
+                        channels: info.outputs,
+                        arrangement: output_arrangement,
+                    },
+                    kind: vst_audio_protocol::BusKind::Main,
+                    name: String::new(),
+                    default_active: true,
+                })
+                .into_iter()
+                .collect(),
         };
         Ok(Self {
             inner,

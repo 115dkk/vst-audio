@@ -10,7 +10,7 @@ from this repository. Required CI executes the implementation on Windows x64, Li
 | Audio | Planar f32/f64, variable callback sizes, preallocated reblocking and explicit fallback; allocator guard covers the callback |
 | Events | Sample offsets and bus indices, MIDI channel messages and owned SysEx (up to 256 bytes); bounded 256-event packets and explicit host overflow |
 | Automation / transport | VST3 parameter queues retain offsets; VST2 splits at automation boundaries; in-block transport changes split both formats |
-| Buses | Multiple buses, sidechains, auxiliary outputs, active flags and general speaker masks; native order retained and negotiated layouts read back |
+| Buses | Multiple buses, sidechains, auxiliary outputs, active flags and general speaker masks; declared bus kind, name and default-active flag; activation chosen after loading (`BusSelector`, `BusSelector::main_only`); native order retained and negotiated layouts read back |
 | Parameters | Paged IDs, values, steps, units and read-only/automatable/hidden attributes; invalid and read-only edits return errors |
 | Editors | Floating worker-owned windows; open, hide, show, focus, close, status and bounded native-view capture |
 | Editor negotiation | VST3 constrained resize and optional content-scale interface; VST2 returns explicit unsupported results for host-driven resize/scale |

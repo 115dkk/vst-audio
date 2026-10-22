@@ -2,10 +2,11 @@
 //! Safe application-side orchestration for isolated audio plugins.
 pub mod watch;
 pub use layout::wave_bits;
-pub use vst_audio_protocol::{Bus, ClassInfo, PluginFormat, layout, state};
+pub use vst_audio_protocol::{Bus, BusInfo, BusKind, ClassInfo, PluginFormat, layout, state};
 mod process;
 pub use process::{
-    ControlEvent, PluginControl, PluginProcess, ProcessingOptions, StartError, Started,
+    BusChoice, BusSelector, ControlEvent, PluginControl, PluginProcess, ProcessingOptions,
+    StartError, Started,
 };
 pub use vst_audio_transport_sys::{Event, SharedEvent, SharedRegion};
 
