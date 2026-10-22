@@ -37,7 +37,9 @@ with tempfile.TemporaryDirectory(prefix="vst-audio-probe-") as directory:
         reservation.bind(("127.0.0.1", 0))
         port = reservation.getsockname()[1]
     probe_env = dict(env, VST_AUDIO_PROBE_PORT=str(port),
-                     VST_AUDIO_PROBE_FILE=str(Path(directory) / "probe.txt"))
+                     VST_AUDIO_PROBE_FILE=str(Path(directory) / "probe.txt"),
+                     # Temporary: locate the failing Windows restricted-token request.
+                     VST_AUDIO_TRACE="1")
     run("cargo", "test", "--locked", "-p", "vst-audio", "--test", "sandbox",
         "--", "--ignored", "--nocapture", "--test-threads=1", env=probe_env)
 

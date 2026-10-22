@@ -184,7 +184,8 @@ impl Message {
         }
     }
 
-    fn kind(&self) -> u16 {
+    /// The wire kind number, for diagnostics.
+    pub fn kind(&self) -> u16 {
         match self {
             Self::Sandboxed { .. } => 29,
             Self::Hello { .. } => 1,

@@ -345,6 +345,7 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
                         );
                     }
                     let request = frame.request;
+                    let kind = frame.message.kind();
                     let shutdown = matches!(frame.message, Message::Shutdown);
                     let recoverable = matches!(
                         &frame.message,
@@ -630,7 +631,7 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
                         } else {
                             Message::Fault {
                                 code: 1,
-                                text: error.to_string(),
+                                text: format!("{error} (request kind {kind})"),
                             }
                         }
                     });

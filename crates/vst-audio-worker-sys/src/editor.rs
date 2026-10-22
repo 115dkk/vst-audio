@@ -112,7 +112,8 @@ impl EditorWindow {
             SetWindowLongPtrW(
                 window,
                 GWLP_USERDATA,
-                (&*destroyed as *const Cell<bool>) as isize,
+                // LONG_PTR: i32 on 32-bit Windows, isize on 64-bit.
+                (&*destroyed as *const Cell<bool>) as _,
             )
         };
         Self {
