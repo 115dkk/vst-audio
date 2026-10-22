@@ -13,7 +13,7 @@ use windows::{
         Foundation::*,
         Security::{Authorization::*, Isolation::*, *},
         Storage::FileSystem::{
-            DELETE, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+            DELETE, FILE_ALL_ACCESS, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
         },
         System::{
             SystemServices::{SE_GROUP_INTEGRITY, SECURITY_MANDATORY_LOW_RID},
@@ -89,19 +89,14 @@ impl LaunchSecurity {
                 Err(error) => return Err(error),
             };
             let sid = Sid(sid);
-            grant(exe, sid.0, false)?;
             // Sibling DLLs and plugin bundle resources need the same read/execute access.
-            if let Some(directory) = exe.parent() {
-                grant(directory, sid.0, false)?;
-            }
-            grant(&launch.plugin, sid.0, false)?;
-            if let Some(directory) = launch.plugin.parent() {
-                grant(directory, sid.0, false)?;
+            for path in executables(exe, &launch.plugin) {
+                grant(path, sid.0, false, true)?;
             }
             for path in
                 std::iter::once(temporary).chain(policy.writable.iter().map(|path| path.as_path()))
             {
-                grant(path, sid.0, true)?;
+                grant(path, sid.0, true, false)?;
                 low_label(path)?;
             }
             security.capabilities = Some(SECURITY_CAPABILITIES {
@@ -115,13 +110,97 @@ impl LaunchSecurity {
             {
                 low_label(path)?;
             }
-            security.token = Some(restricted_token()?);
+            let token = restricted_token()?;
+            // An elevated application may reach its own files only through
+            // Administrators, which the worker token denies. Grant the user
+            // read/execute only where the real access check fails.
+            let mut user = [0usize; 16];
+            let mut bytes = 0;
+            // SAFETY: aligned storage exceeds TOKEN_USER plus maximum SID size.
+            unsafe {
+                GetTokenInformation(
+                    raw(&token),
+                    TokenUser,
+                    Some(user.as_mut_ptr().cast()),
+                    size_of_val(&user) as u32,
+                    &mut bytes,
+                )
+            }?;
+            // SAFETY: successful TokenUser query initialized a TOKEN_USER in aligned storage.
+            let user = unsafe { &*user.as_ptr().cast::<TOKEN_USER>() }.User.Sid;
+            for path in executables(exe, &launch.plugin) {
+                if !readable(&token, path)? {
+                    grant(path, user, false, false)?;
+                }
+            }
+            security.token = Some(token);
         }
         Ok(security)
     }
 }
 
-fn grant(path: &Path, sid: PSID, writable: bool) -> windows::core::Result<()> {
+fn executables<'a>(exe: &'a Path, plugin: &'a Path) -> impl Iterator<Item = &'a Path> {
+    [Some(exe), exe.parent(), Some(plugin), plugin.parent()]
+        .into_iter()
+        .flatten()
+}
+
+/// The real access check for the worker token, including deny-only groups and
+/// its integrity label, rather than an inspection of individual ACEs.
+fn readable(token: &OwnedHandle, path: &Path) -> windows::core::Result<bool> {
+    let name = wide(path)?;
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: terminated path and writable descriptor output; returned descriptor is LocalFree'd.
+    unsafe {
+        GetNamedSecurityInfoW(
+            PCWSTR(name.as_ptr()),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION
+                | GROUP_SECURITY_INFORMATION
+                | DACL_SECURITY_INFORMATION
+                | LABEL_SECURITY_INFORMATION,
+            None,
+            None,
+            None,
+            None,
+            &mut descriptor,
+        )
+    }
+    .ok()?;
+    let _descriptor = Local(HLOCAL(descriptor.0));
+    let mut impersonation = HANDLE::default();
+    // SAFETY: the restricted token was created with duplicate access; output uniquely owned.
+    unsafe { DuplicateToken(raw(token), SecurityImpersonation, &mut impersonation) }?;
+    let impersonation = own(impersonation);
+    let mapping = GENERIC_MAPPING {
+        GenericRead: FILE_GENERIC_READ.0,
+        GenericWrite: FILE_GENERIC_WRITE.0,
+        GenericExecute: FILE_GENERIC_EXECUTE.0,
+        GenericAll: FILE_ALL_ACCESS.0,
+    };
+    let mut privileges = [0usize; 8];
+    let mut length = size_of_val(&privileges) as u32;
+    let mut granted = 0;
+    let mut status = windows::core::BOOL::default();
+    // SAFETY: live descriptor and impersonation token; outputs point to writable storage.
+    unsafe {
+        AccessCheck(
+            descriptor,
+            raw(&impersonation),
+            FILE_GENERIC_READ.0 | FILE_GENERIC_EXECUTE.0,
+            &mapping,
+            Some(privileges.as_mut_ptr().cast()),
+            &mut length,
+            &mut granted,
+            &mut status,
+        )
+    }?;
+    Ok(status.as_bool())
+}
+
+/// `packages`: an existing ALL APPLICATION PACKAGES grant already covers an
+/// AppContainer `sid`, so no entry is added.
+fn grant(path: &Path, sid: PSID, writable: bool, packages: bool) -> windows::core::Result<()> {
     let name = wide(path)?;
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
     let mut acl = std::ptr::null_mut();
@@ -147,10 +226,10 @@ fn grant(path: &Path, sid: PSID, writable: bool) -> windows::core::Result<()> {
         } else {
             0
         };
-    if !writable {
-        let mut packages = [0u32; 17];
-        let mut size = size_of_val(&packages) as u32;
-        let package_sid = PSID(packages.as_mut_ptr().cast());
+    if packages {
+        let mut storage = [0u32; 17];
+        let mut size = size_of_val(&storage) as u32;
+        let package_sid = PSID(storage.as_mut_ptr().cast());
         // SAFETY: aligned SID_MAX_SUB_AUTHORITIES-sized buffer and writable size.
         unsafe { CreateWellKnownSid(WinBuiltinAnyPackageSid, None, Some(package_sid), &mut size) }?;
         let trustee = TRUSTEE_W {

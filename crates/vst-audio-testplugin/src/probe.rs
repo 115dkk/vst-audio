@@ -12,8 +12,9 @@ pub fn run() -> [u8; 3] {
         });
     let file = std::env::var_os("VST_AUDIO_PROBE_FILE")
         .is_some_and(|path| std::fs::write(path, b"sandbox probe").is_ok());
+    // macOS has no /bin/true.
     #[cfg(unix)]
-    let process = std::process::Command::new("/bin/true").status();
+    let process = std::process::Command::new("/usr/bin/true").status();
     #[cfg(windows)]
     let process = std::process::Command::new("cmd.exe")
         .args(["/c", "exit", "0"])

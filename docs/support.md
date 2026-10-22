@@ -93,7 +93,10 @@ unsandboxed fallback.
   enabled, the restricted token disables Administrators, removes privileges
   (except Windows' retained traversal privilege) and runs at Low integrity;
   existing Low-integrity writable paths are also writable, not just this policy's
-  list. The one-active-process job blocks children when `processes` is false.
+  list. Where that token's access check cannot read/execute the worker, the
+  plugin or their directories (an elevated application whose files are reachable
+  only through Administrators), the user receives a read/execute ACE, likewise
+  not removed. The one-active-process job blocks children when `processes` is false.
   Inherited IPC handles retain their granted access. Native execution, GUI,
   inherited-handle behavior and ACL propagation still require Windows CI.
 - **macOS:** uses the deprecated but available `sandbox_init` SBPL API. Reads
