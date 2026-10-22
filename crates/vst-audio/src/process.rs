@@ -95,7 +95,9 @@ impl Transport {
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return Err(StartError("worker response timed out".into()));
+                return Err(StartError(format!(
+                    "worker response to request {request} timed out"
+                )));
             }
             let frame = match self
                 .receive
