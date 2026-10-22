@@ -364,17 +364,22 @@ pub(crate) fn supervise(
                     ControlEvent::Exited(code) => {
                         exited = Some(code);
                     }
-                    ControlEvent::Action(Action::Kill { .. } | Action::Disable { .. }) => {
+                    ControlEvent::Action(
+                        action @ (Action::Kill { .. } | Action::Disable { .. }),
+                    ) => {
                         shared.status.store(1, Ordering::Release);
                         if !stopping && !failure_reported {
                             failure_reported = true;
-                            emit(
-                                &events,
-                                &shared,
-                                HostEvent::Failed {
-                                    reason: "worker deadline exceeded".into(),
-                                },
-                            );
+                            let reason = match action {
+                                Action::Kill { reason } => {
+                                    format!("worker deadline exceeded ({reason:?})")
+                                }
+                                Action::Disable { reason } => {
+                                    format!("worker disabled ({reason:?})")
+                                }
+                                _ => unreachable!(),
+                            };
+                            emit(&events, &shared, HostEvent::Failed { reason });
                         }
                     }
                     _ => {}

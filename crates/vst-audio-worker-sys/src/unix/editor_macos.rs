@@ -1,5 +1,6 @@
 #![allow(unsafe_code)]
 //! AppKit belongs to the worker's main thread, independent of the caller's GUI.
+use objc2::runtime::{NSObjectProtocol, ProtocolObject};
 use objc2::{
     MainThreadMarker, MainThreadOnly,
     rc::{Retained, autoreleasepool},
@@ -8,18 +9,43 @@ use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSEventMask, NSView,
     NSWindow, NSWindowStyleMask,
 };
-use objc2_foundation::{NSDate, NSDefaultRunLoopMode, NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{
+    NSActivityOptions, NSDate, NSDefaultRunLoopMode, NSPoint, NSProcessInfo, NSRect, NSSize,
+    NSString,
+};
 use std::{cell::Cell, io};
 
-pub fn initialize() -> io::Result<()> {
+/// Keeps App Nap and timer coalescing off while it lives. A worker has no
+/// visible window, so without it macOS may delay the audio thread's wakeups
+/// past the heartbeat deadline.
+pub struct Activity(Retained<ProtocolObject<dyn NSObjectProtocol>>);
+impl std::fmt::Debug for Activity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Activity")
+    }
+}
+impl Drop for Activity {
+    fn drop(&mut self) {
+        // SAFETY: the token was returned by beginActivityWithOptions:reason: and
+        // is ended exactly once, here.
+        unsafe { NSProcessInfo::processInfo().endActivity(&self.0) };
+    }
+}
+
+pub fn initialize() -> io::Result<Activity> {
     let mtm = MainThreadMarker::new()
         .ok_or_else(|| io::Error::other("worker must start on macOS main thread"))?;
     autoreleasepool(|_| {
         let app = NSApplication::sharedApplication(mtm);
         app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
         app.finishLaunching();
-    });
-    Ok(())
+        let token = NSProcessInfo::processInfo().beginActivityWithOptions_reason(
+            NSActivityOptions::UserInitiatedAllowingIdleSystemSleep
+                | NSActivityOptions::LatencyCritical,
+            &NSString::from_str("vst-audio plugin worker"),
+        );
+        Ok(Activity(token))
+    })
 }
 
 #[derive(Debug)]

@@ -211,7 +211,7 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
         eprintln!("worker {} starting", std::process::id());
     }
     #[cfg(target_os = "macos")]
-    vst_audio_worker_sys::editor::initialize().map_err(error)?;
+    let _activity = vst_audio_worker_sys::editor::initialize().map_err(error)?;
     let input = runtime::inherited_file(args.control_in).map_err(error)?;
     let mut output = runtime::inherited_file(args.control_out).map_err(error)?;
     // Main-thread writes are acceptable in the disposable host. The app's reader
