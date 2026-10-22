@@ -13,7 +13,7 @@ use windows::{
         Foundation::*,
         Security::{Authorization::*, Isolation::*, *},
         Storage::FileSystem::{
-            DELETE, FILE_ALL_ACCESS, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+            DELETE, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
         },
         System::{
             SystemServices::{SE_GROUP_INTEGRITY, SECURITY_MANDATORY_LOW_RID},
@@ -89,14 +89,19 @@ impl LaunchSecurity {
                 Err(error) => return Err(error),
             };
             let sid = Sid(sid);
+            grant(exe, sid.0, false)?;
             // Sibling DLLs and plugin bundle resources need the same read/execute access.
-            for path in executables(exe, &launch.plugin) {
-                grant(path, sid.0, false, true)?;
+            if let Some(directory) = exe.parent() {
+                grant(directory, sid.0, false)?;
+            }
+            grant(&launch.plugin, sid.0, false)?;
+            if let Some(directory) = launch.plugin.parent() {
+                grant(directory, sid.0, false)?;
             }
             for path in
                 std::iter::once(temporary).chain(policy.writable.iter().map(|path| path.as_path()))
             {
-                grant(path, sid.0, true, false)?;
+                grant(path, sid.0, true)?;
                 low_label(path)?;
             }
             security.capabilities = Some(SECURITY_CAPABILITIES {
@@ -110,97 +115,13 @@ impl LaunchSecurity {
             {
                 low_label(path)?;
             }
-            let token = restricted_token()?;
-            // An elevated application may reach its own files only through
-            // Administrators, which the worker token denies. Grant the user
-            // read/execute only where the real access check fails.
-            let mut user = [0usize; 16];
-            let mut bytes = 0;
-            // SAFETY: aligned storage exceeds TOKEN_USER plus maximum SID size.
-            unsafe {
-                GetTokenInformation(
-                    raw(&token),
-                    TokenUser,
-                    Some(user.as_mut_ptr().cast()),
-                    size_of_val(&user) as u32,
-                    &mut bytes,
-                )
-            }?;
-            // SAFETY: successful TokenUser query initialized a TOKEN_USER in aligned storage.
-            let user = unsafe { &*user.as_ptr().cast::<TOKEN_USER>() }.User.Sid;
-            for path in executables(exe, &launch.plugin) {
-                if !readable(&token, path)? {
-                    grant(path, user, false, false)?;
-                }
-            }
-            security.token = Some(token);
+            security.token = Some(restricted_token()?);
         }
         Ok(security)
     }
 }
 
-fn executables<'a>(exe: &'a Path, plugin: &'a Path) -> impl Iterator<Item = &'a Path> {
-    [Some(exe), exe.parent(), Some(plugin), plugin.parent()]
-        .into_iter()
-        .flatten()
-}
-
-/// The real access check for the worker token, including deny-only groups and
-/// its integrity label, rather than an inspection of individual ACEs.
-fn readable(token: &OwnedHandle, path: &Path) -> windows::core::Result<bool> {
-    let name = wide(path)?;
-    let mut descriptor = PSECURITY_DESCRIPTOR::default();
-    // SAFETY: terminated path and writable descriptor output; returned descriptor is LocalFree'd.
-    unsafe {
-        GetNamedSecurityInfoW(
-            PCWSTR(name.as_ptr()),
-            SE_FILE_OBJECT,
-            OWNER_SECURITY_INFORMATION
-                | GROUP_SECURITY_INFORMATION
-                | DACL_SECURITY_INFORMATION
-                | LABEL_SECURITY_INFORMATION,
-            None,
-            None,
-            None,
-            None,
-            &mut descriptor,
-        )
-    }
-    .ok()?;
-    let _descriptor = Local(HLOCAL(descriptor.0));
-    let mut impersonation = HANDLE::default();
-    // SAFETY: the restricted token was created with duplicate access; output uniquely owned.
-    unsafe { DuplicateToken(raw(token), SecurityImpersonation, &mut impersonation) }?;
-    let impersonation = own(impersonation);
-    let mapping = GENERIC_MAPPING {
-        GenericRead: FILE_GENERIC_READ.0,
-        GenericWrite: FILE_GENERIC_WRITE.0,
-        GenericExecute: FILE_GENERIC_EXECUTE.0,
-        GenericAll: FILE_ALL_ACCESS.0,
-    };
-    let mut privileges = [0usize; 8];
-    let mut length = size_of_val(&privileges) as u32;
-    let mut granted = 0;
-    let mut status = windows::core::BOOL::default();
-    // SAFETY: live descriptor and impersonation token; outputs point to writable storage.
-    unsafe {
-        AccessCheck(
-            descriptor,
-            raw(&impersonation),
-            FILE_GENERIC_READ.0 | FILE_GENERIC_EXECUTE.0,
-            &mapping,
-            Some(privileges.as_mut_ptr().cast()),
-            &mut length,
-            &mut granted,
-            &mut status,
-        )
-    }?;
-    Ok(status.as_bool())
-}
-
-/// `packages`: an existing ALL APPLICATION PACKAGES grant already covers an
-/// AppContainer `sid`, so no entry is added.
-fn grant(path: &Path, sid: PSID, writable: bool, packages: bool) -> windows::core::Result<()> {
+fn grant(path: &Path, sid: PSID, writable: bool) -> windows::core::Result<()> {
     let name = wide(path)?;
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
     let mut acl = std::ptr::null_mut();
@@ -226,10 +147,10 @@ fn grant(path: &Path, sid: PSID, writable: bool, packages: bool) -> windows::cor
         } else {
             0
         };
-    if packages {
-        let mut storage = [0u32; 17];
-        let mut size = size_of_val(&storage) as u32;
-        let package_sid = PSID(storage.as_mut_ptr().cast());
+    if !writable {
+        let mut packages = [0u32; 17];
+        let mut size = size_of_val(&packages) as u32;
+        let package_sid = PSID(packages.as_mut_ptr().cast());
         // SAFETY: aligned SID_MAX_SUB_AUTHORITIES-sized buffer and writable size.
         unsafe { CreateWellKnownSid(WinBuiltinAnyPackageSid, None, Some(package_sid), &mut size) }?;
         let trustee = TRUSTEE_W {
@@ -360,6 +281,53 @@ fn restricted_token() -> windows::core::Result<OwnedHandle> {
             TokenIntegrityLevel,
             (&label as *const TOKEN_MANDATORY_LABEL).cast(),
             size_of_val(&label) as u32 + bytes,
+        )
+    }?;
+    // An elevated token gives new objects (the worker process and its threads)
+    // to Administrators and SYSTEM. With Administrators deny-only the worker could
+    // not open its own threads, which the loader does for DLLs with static TLS.
+    let mut user = [0u64; 16];
+    let mut bytes = 0;
+    // SAFETY: aligned storage exceeds TOKEN_USER plus maximum SID size.
+    unsafe {
+        GetTokenInformation(
+            raw(&token),
+            TokenUser,
+            Some(user.as_mut_ptr().cast()),
+            size_of_val(&user) as u32,
+            &mut bytes,
+        )
+    }?;
+    // SAFETY: successful TokenUser query initialized a TOKEN_USER in aligned storage.
+    let user_sid = unsafe { &*user.as_ptr().cast::<TOKEN_USER>() }.User.Sid;
+    let mut system = [0u32; 17];
+    let mut bytes = size_of_val(&system) as u32;
+    let system_sid = PSID(system.as_mut_ptr().cast());
+    // SAFETY: aligned maximum-sized SID storage and writable size.
+    unsafe { CreateWellKnownSid(WinLocalSystemSid, None, Some(system_sid), &mut bytes) }?;
+    let entries = [user_sid, system_sid].map(|sid| EXPLICIT_ACCESS_W {
+        grfAccessPermissions: GENERIC_ALL.0,
+        grfAccessMode: SET_ACCESS,
+        grfInheritance: NO_INHERITANCE,
+        Trustee: TRUSTEE_W {
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_UNKNOWN,
+            ptstrName: PWSTR(sid.0.cast()),
+            ..Default::default()
+        },
+    });
+    let mut acl = std::ptr::null_mut();
+    // SAFETY: entries and their SIDs are live; the new ACL is LocalFree'd below.
+    unsafe { SetEntriesInAclW(Some(&entries), None, &mut acl) }.ok()?;
+    let _acl = Local(HLOCAL(acl.cast()));
+    let dacl = TOKEN_DEFAULT_DACL { DefaultDacl: acl };
+    // SAFETY: the ACL outlives the call, which copies it into the token.
+    unsafe {
+        SetTokenInformation(
+            raw(&token),
+            TokenDefaultDacl,
+            (&dacl as *const TOKEN_DEFAULT_DACL).cast(),
+            size_of_val(&dacl) as u32,
         )
     }?;
     Ok(token)
