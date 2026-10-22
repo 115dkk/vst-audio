@@ -64,6 +64,14 @@ Cargo manifests and package contents before any registry mutation.
 
 The dependency order is ring, protocol, transport-sys, application library,
 worker-sys, worker-runtime, worker executable. The test plugins always remain
-`publish = false`. The validation jobs never publish. A `v*` tag runs
-`release.yml`, which publishes the workspace through crates.io trusted
-publishing; no registry token is stored in the repository.
+`publish = false`.
+
+Every push to `main` runs `release.yml`. Its gate (`tools/release_gate.py`)
+releases the workspace version when it has no tag yet; otherwise, when a
+shipped file changed since that tag, it commits a version bump to `main`
+(`feat:` bumps minor, anything else patch) and releases that. The whole of
+`ci.yml` then runs on the release commit, and only after it passes are the
+crates published through crates.io trusted publishing (no registry token is
+stored in the repository) and the tag and GitHub release created with the
+worker archives of all four targets. Pull requests and other branches run
+`ci.yml` alone and never publish.

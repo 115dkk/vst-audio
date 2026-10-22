@@ -1,30 +1,168 @@
 name: Release
+
+# Every push to main is built and tested, and released when it changes a
+# shipped file.
+#
+#   gate     tools/release_gate.py: release the workspace version if it has no
+#            tag yet; otherwise, when shipped files changed since its tag,
+#            bump it (feat: minor, else patch), commit the bump to main as
+#            github-actions[bot] and release that.
+#   ci       the whole of ci.yml on release_sha: four native targets, GUI
+#            consumers, independent plugins, fuzz/ASan, packaged consumer and
+#            the release worker archives.
+#   crates   cargo publish of the workspace through crates.io trusted
+#            publishing (no stored token); versions already on crates.io are
+#            skipped, so a re-run finishes a partial publication.
+#   github   the tag and the GitHub release with the worker archives of all
+#            four targets and SHA256SUMS.txt. While the major version is 0 it
+#            is a prerelease.
+#
+# Every job checks out release_sha, the commit the gate decided on (the bump
+# commit when it bumped), so a push that lands meanwhile cannot slip in. The
+# bump is pushed with the workflow token, which starts no workflow, so it does
+# not release itself. A failed release is retried by re-running its run.
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 permissions:
   contents: read
+
 jobs:
-  publish:
-    name: crates.io
+  gate:
+    name: Release gate
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    permissions:
+      contents: write
+    outputs:
+      should_release: ${{ steps.gate.outputs.should_release }}
+      version: ${{ steps.gate.outputs.version }}
+      tag: ${{ steps.gate.outputs.tag }}
+      prerelease: ${{ steps.gate.outputs.prerelease }}
+      previous_tag: ${{ steps.gate.outputs.previous_tag }}
+      release_sha: ${{ steps.gate.outputs.release_sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+      - name: Gate unit tests
+        working-directory: tools
+        run: python3 -m unittest test_release_gate
+      - name: Decide (and bump on main)
+        id: gate
+        run: python3 tools/release_gate.py
+
+  ci:
+    name: Build and test
+    needs: gate
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.gate.outputs.release_sha }}
+
+  crates:
+    name: Publish to crates.io
+    needs: [gate, ci]
+    if: needs.gate.outputs.should_release == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     permissions:
       contents: read
       id-token: write
+    env:
+      VERSION: ${{ needs.gate.outputs.version }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ needs.gate.outputs.release_sha }}
       - name: Toolchain
         run: |
           rustup toolchain install
           rustc -vV
-      - name: Tag matches workspace version
+      - name: Crates still to publish
+        id: pending
         run: |
-          version=$(cargo metadata --locked --no-deps --format-version 1 \
-            | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "vst-audio"))')
-          test "v$version" = "$GITHUB_REF_NAME"
+          set -euo pipefail
+          exclude=()
+          pending=0
+          for name in $(cargo metadata --locked --no-deps --format-version 1 \
+              | python3 -c 'import json,sys; [print(p["name"]) for p in json.load(sys.stdin)["packages"] if p["publish"] != []]'); do
+            status=$(curl -s -o /dev/null -w '%{http_code}' \
+              -A "vst-audio release (https://github.com/${GITHUB_REPOSITORY})" \
+              "https://crates.io/api/v1/crates/$name/$VERSION")
+            if [ "$status" = 200 ]; then
+              echo "$name $VERSION is already on crates.io"
+              exclude+=(--exclude "$name")
+            else
+              pending=$((pending + 1))
+            fi
+          done
+          echo "pending=$pending" >> "$GITHUB_OUTPUT"
+          echo "exclude=${exclude[*]}" >> "$GITHUB_OUTPUT"
       - uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+        if: steps.pending.outputs.pending != '0'
         id: auth
-      - run: cargo publish --locked --workspace
+      - name: cargo publish
+        if: steps.pending.outputs.pending != '0'
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          EXCLUDE: ${{ steps.pending.outputs.exclude }}
+        # EXCLUDE is unquoted on purpose: it holds `--exclude <name>` pairs.
+        run: cargo publish --locked --workspace $EXCLUDE
+
+  github:
+    name: GitHub release
+    needs: [gate, ci, crates]
+    if: needs.gate.outputs.should_release == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.gate.outputs.tag }}
+      VERSION: ${{ needs.gate.outputs.version }}
+      PRERELEASE: ${{ needs.gate.outputs.prerelease }}
+      PREVIOUS: ${{ needs.gate.outputs.previous_tag }}
+      RELEASE_SHA: ${{ needs.gate.outputs.release_sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ needs.gate.outputs.release_sha }}
+          fetch-depth: 0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: worker-distribution-*
+          path: release
+          merge-multiple: true
+      - name: Checksums and notes
+        run: |
+          set -euo pipefail
+          (cd release && sha256sum -- *.zip > SHA256SUMS.txt && cat SHA256SUMS.txt)
+          range="$RELEASE_SHA"
+          if [ -n "$PREVIOUS" ]; then range="$PREVIOUS..$RELEASE_SHA"; fi
+          {
+            echo "Built from ${RELEASE_SHA}."
+            echo
+            echo "Crates: https://crates.io/crates/vst-audio/${VERSION}"
+            echo
+            echo "## Changes"
+            git log --no-merges --pretty=format:'- %s' "$range" | grep -v '^- chore(release): ' || true
+            echo
+          } > notes.md
+          cat notes.md
+      - name: Create or update the release
+        run: |
+          set -euo pipefail
+          flags=(--latest)
+          if [ "$PRERELEASE" = "true" ]; then flags=(--prerelease --latest=false); fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" release/* --clobber
+            gh release edit "$TAG" --notes-file notes.md "${flags[@]}"
+          else
+            gh release create "$TAG" release/* --target "$RELEASE_SHA" \
+              --title "vst-audio $VERSION" --notes-file notes.md "${flags[@]}"
+          fi
+          gh release view "$TAG" --json assets,isPrerelease -q '{prerelease: .isPrerelease, assets: [.assets[].name]}'
