@@ -89,11 +89,14 @@ fn repeated_crash_recovery_keeps_variable_callbacks_and_healthy_peer_running() {
         let mut injections = 0;
         let mut recovered = 0;
         let mut last_injected_generation = 0;
-        let deadline = Instant::now() + Duration::from_secs(45);
+        // The budget counts callbacks, not wall time: each iteration sleeps
+        // 5 ms, which macOS runners stretch to 14 ms or more. About 1,700
+        // iterations suffice on every platform; the wall clock only catches hangs.
+        let deadline = Instant::now() + Duration::from_secs(300);
         while completed < 400 || recovered < 4 {
             assert!(
-                Instant::now() < deadline,
-                "{format:?}: {completed} blocks, {recovered} recoveries"
+                blocks < 5_000 && Instant::now() < deadline,
+                "{format:?}: {completed} blocks, {recovered} recoveries after {blocks} callbacks"
             );
             let count = [1, 7, 37, 83, 129, 256][blocks % 6];
             let input = [&source[..count], &source[..count]];

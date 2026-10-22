@@ -2,7 +2,7 @@
 
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use vst_audio_ring::{
     Consumer, Fault, Geometry, HeaderError, InProcessEvent, Pipeline, Producer, Publish, Region,
@@ -41,6 +41,9 @@ fn readiness_in_order_late_drop_fault_and_close() {
     assert_eq!(producer.wait_ready(Duration::ZERO), Waited::TimedOut);
 
     let order = Arc::new(Mutex::new(Vec::new()));
+    // A failed assertion below must fail the test, not leave the consumer
+    // waiting for a block that never comes while the scope joins it.
+    let deadline = Instant::now() + Duration::from_secs(10);
     thread::scope(|scope| {
         let order = Arc::clone(&order);
         let storage_ref = &storage;
@@ -67,7 +70,9 @@ fn readiness_in_order_late_drop_fault_and_close() {
                         consumer.complete(0, sequence);
                         break;
                     }
-                    if storage_ref.region().state() == Some(State::Closing) {
+                    if storage_ref.region().state() == Some(State::Closing)
+                        || Instant::now() > deadline
+                    {
                         return;
                     }
                     let _ = vst_audio_ring::Wait::wait(work_ref, Duration::from_millis(20));
@@ -88,12 +93,15 @@ fn readiness_in_order_late_drop_fault_and_close() {
             Publish::Published
         );
         assert_eq!(producer.try_publish(0, 3, |_| {}), Publish::Dropped);
-        thread::sleep(Duration::from_millis(30));
-        assert_eq!(
-            producer.try_publish(0, 3, |slot| assert!(slot.copy_from(&vec![6.0; 384]))),
-            Publish::Published
-        );
+        // Late: 3 fits once the consumer completes 1, however long that takes.
+        while producer.try_publish(0, 3, |slot| assert!(slot.copy_from(&vec![6.0; 384])))
+            != Publish::Published
+        {
+            assert!(Instant::now() < deadline, "the consumer never freed a slot");
+            let _ = vst_audio_ring::Wait::wait(&done, Duration::from_millis(20));
+        }
         while producer.completed(0) < 3 {
+            assert!(Instant::now() < deadline, "the consumer never completed 3");
             let _ = vst_audio_ring::Wait::wait(&done, Duration::from_millis(20));
         }
         let mut first = 0.0;
