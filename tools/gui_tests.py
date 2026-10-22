@@ -39,13 +39,20 @@ for round_ in range(1, rounds + 1):
         for index, plugin in enumerate(fixtures):
             command = [str(gui_target / f"vst-audio-{gui}-example{extension}"),
                        "--worker", str(worker), "--plugin", str(plugin), "--smoke"]
-            result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, timeout=35, env=dict(os.environ,VST_AUDIO_TRACE="1",RUST_BACKTRACE="1"))
+            try:
+                result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, timeout=35, env=dict(os.environ,VST_AUDIO_TRACE="1",RUST_BACKTRACE="1"))
+                code, stdout, stderr = result.returncode, result.stdout, result.stderr
+            except subprocess.TimeoutExpired as hung:
+                # Keep what the hung GUI printed; it is the only evidence.
+                def text(value):
+                    return value.decode("utf-8", "replace") if isinstance(value, bytes) else value or ""
+                code, stdout, stderr = "timeout", text(hung.stdout), text(hung.stderr)
             (output / f"{gui}-vst{2 + index}.log").write_text(
-                result.stdout + result.stderr, encoding="utf-8")
-            print(f"round {round_} {gui} / VST{2 + index}: exit {result.returncode}", flush=True)
-            if result.returncode:
-                print(result.stderr)
+                stdout + stderr, encoding="utf-8")
+            print(f"round {round_} {gui} / VST{2 + index}: exit {code}", flush=True)
+            if code:
+                print(stderr)
                 if sys.platform == "darwin":
                     time.sleep(10)  # ReportCrash writes asynchronously.
                     crash_reports()
-                raise SystemExit(result.returncode)
+                raise SystemExit(1)

@@ -1,5 +1,5 @@
 name: GUI stress
-# Repeats the macOS GUI smoke many times to catch intermittent editor and
+# Repeats the GUI smoke on macOS and Windows many times to catch intermittent editor and
 # worker failures, keeping logs and crash reports of the first failure.
 on:
   workflow_dispatch:
@@ -13,7 +13,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-15-intel, macos-15]
+        os: [macos-15-intel, macos-15, windows-2025]
         shard: [1, 2, 3, 4, 5, 6, 7, 8]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
