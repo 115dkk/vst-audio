@@ -7,47 +7,105 @@ use windows::{
 };
 
 // These user32 signatures and pseudo-handles match windows 0.62.2 UI::HiDpi.
-// Explicit FFI avoids enabling a new workspace Cargo feature. Windows 10 1809+
-// supplies mixed hosting and UNAWARE_GDISCALED.
-#[link(name = "user32")]
-unsafe extern "system" {
-    fn SetThreadDpiAwarenessContext(context: isize) -> isize;
-    fn GetWindowDpiAwarenessContext(window: HWND) -> isize;
-    fn AreDpiAwarenessContextsEqual(a: isize, b: isize) -> windows::core::BOOL;
-    fn SetThreadDpiHostingBehavior(behavior: i32) -> i32;
-    fn GetDpiForWindow(window: HWND) -> u32;
-    fn AdjustWindowRectExForDpi(
-        rect: *mut RECT,
-        style: u32,
-        menu: windows::core::BOOL,
-        extended: u32,
-        dpi: u32,
-    ) -> windows::core::BOOL;
+// They are resolved at run time, not imported: a static import of a function
+// newer than the running Windows would stop the worker from starting at all,
+// audio included. Without them (before Windows 10 1607) editors open with the
+// process's default awareness and scale 1; mixed hosting needs 1803 and
+// UNAWARE_GDISCALED 1809, and a refusal leaves the thread's context unchanged.
+type SetThreadContext = unsafe extern "system" fn(isize) -> isize;
+type WindowContext = unsafe extern "system" fn(HWND) -> isize;
+type ContextsEqual = unsafe extern "system" fn(isize, isize) -> windows::core::BOOL;
+type SetHosting = unsafe extern "system" fn(i32) -> i32;
+type DpiForWindow = unsafe extern "system" fn(HWND) -> u32;
+type AdjustForDpi =
+    unsafe extern "system" fn(*mut RECT, u32, windows::core::BOOL, u32, u32) -> windows::core::BOOL;
+struct DpiApi {
+    set_thread_context: Option<SetThreadContext>,
+    window_context: Option<WindowContext>,
+    contexts_equal: Option<ContextsEqual>,
+    set_hosting: Option<SetHosting>,
+    dpi_for_window: Option<DpiForWindow>,
+    adjust_for_dpi: Option<AdjustForDpi>,
+}
+fn dpi_api() -> &'static DpiApi {
+    static API: std::sync::OnceLock<DpiApi> = std::sync::OnceLock::new();
+    API.get_or_init(|| {
+        use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+        // SAFETY: user32 is linked by this crate and stays loaded for the process.
+        let module = unsafe { GetModuleHandleW(w!("user32.dll")) }.ok();
+        let find = |name: windows::core::PCSTR| {
+            // SAFETY: valid module handle and a static NUL-terminated export name.
+            module.and_then(|module| unsafe { GetProcAddress(module, name) })
+        };
+        macro_rules! export {
+            ($name:literal, $kind:ty) => {
+                find(windows::core::s!($name)).map(|f| {
+                    // SAFETY: the export has exactly this documented signature;
+                    // both are plain function pointers.
+                    unsafe { std::mem::transmute::<unsafe extern "system" fn() -> isize, $kind>(f) }
+                })
+            };
+        }
+        DpiApi {
+            set_thread_context: export!("SetThreadDpiAwarenessContext", SetThreadContext),
+            window_context: export!("GetWindowDpiAwarenessContext", WindowContext),
+            contexts_equal: export!("AreDpiAwarenessContextsEqual", ContextsEqual),
+            set_hosting: export!("SetThreadDpiHostingBehavior", SetHosting),
+            dpi_for_window: export!("GetDpiForWindow", DpiForWindow),
+            adjust_for_dpi: export!("AdjustWindowRectExForDpi", AdjustForDpi),
+        }
+    })
 }
 const PER_MONITOR_V2: isize = -4;
 const UNAWARE_GDISCALED: isize = -5;
+/// The window's awareness context, or 0 when the system cannot say.
+fn window_context(window: HWND) -> isize {
+    // SAFETY: the export takes any HWND value and returns 0 for an invalid one.
+    dpi_api().window_context.map_or(0, |f| unsafe { f(window) })
+}
+/// The window's DPI, or 0 when the system cannot say.
+fn dpi_for_window(window: HWND) -> u32 {
+    // SAFETY: the export takes any HWND value and returns 0 for an invalid one.
+    dpi_api().dpi_for_window.map_or(0, |f| unsafe { f(window) })
+}
 #[derive(Debug)]
 pub(crate) struct DpiScope(isize);
 impl DpiScope {
     fn enter(context: isize) -> Self {
         // SAFETY: documented DPI pseudo-handle or a context obtained from a live window.
-        Self(unsafe { SetThreadDpiAwarenessContext(context) })
+        Self(
+            dpi_api()
+                .set_thread_context
+                .filter(|_| context != 0)
+                .map_or(0, |f| unsafe { f(context) }),
+        )
     }
 }
 impl Drop for DpiScope {
     fn drop(&mut self) {
-        if self.0 != 0 {
+        if self.0 != 0
+            && let Some(f) = dpi_api().set_thread_context
+        {
             // SAFETY: restore the context returned by the matching call on this thread.
-            unsafe { SetThreadDpiAwarenessContext(self.0) };
+            unsafe { f(self.0) };
         }
     }
 }
 struct HostingScope(i32);
+impl HostingScope {
+    /// DPI_HOSTING_BEHAVIOR_MIXED (1) for this thread, when the system has it.
+    fn mixed() -> Option<Self> {
+        // SAFETY: 1 is DPI_HOSTING_BEHAVIOR_MIXED; restored on drop.
+        dpi_api().set_hosting.map(|f| Self(unsafe { f(1) }))
+    }
+}
 impl Drop for HostingScope {
     fn drop(&mut self) {
-        if self.0 >= 0 {
+        if self.0 >= 0
+            && let Some(f) = dpi_api().set_hosting
+        {
             // SAFETY: restore this thread's previous hosting behavior.
-            unsafe { SetThreadDpiHostingBehavior(self.0) };
+            unsafe { f(self.0) };
         }
     }
 }
@@ -230,18 +288,16 @@ impl EditorWindow {
         let _ = unsafe { RegisterClassW(&class) };
         let _dpi = DpiScope::enter(PER_MONITOR_V2);
         // SAFETY: validated live parent HWND; query returns its opaque awareness context.
-        let parent_context = unsafe { GetWindowDpiAwarenessContext(parent_hwnd) };
+        let parent_context = window_context(parent_hwnd);
         // SAFETY: both values are documented/queried awareness contexts.
-        let mixed =
-            !unsafe { AreDpiAwarenessContextsEqual(parent_context, PER_MONITOR_V2) }.as_bool();
+        let mixed = parent_context != 0
+            && dpi_api().contexts_equal.is_some_and(|equal| {
+                // SAFETY: both values are documented or queried awareness contexts.
+                !unsafe { equal(parent_context, PER_MONITOR_V2) }.as_bool()
+            });
         // This scope affects only child creation. It cannot retrofit the foreign
         // parent's hosting policy; the application must create a compatible parent.
-        let _hosting = if mixed {
-            // SAFETY: DPI_HOSTING_BEHAVIOR_MIXED is 1; restored on all exit paths.
-            Some(HostingScope(unsafe { SetThreadDpiHostingBehavior(1) }))
-        } else {
-            None
-        };
+        let _hosting = if mixed { HostingScope::mixed() } else { None };
         // SAFETY: validated parent HWND, registered class, bounded dimensions, no borrowed creation data.
         let window = unsafe {
             CreateWindowExW(
@@ -264,7 +320,7 @@ impl EditorWindow {
     }
     pub(crate) fn dpi_scope(&self) -> DpiScope {
         // SAFETY: owned window is live while used by the main-thread owner.
-        DpiScope::enter(unsafe { GetWindowDpiAwarenessContext(self.window) })
+        DpiScope::enter(window_context(self.window))
     }
     pub fn scale(&self) -> f32 {
         let window = match self.parent {
@@ -272,7 +328,7 @@ impl EditorWindow {
             _ => self.window,
         };
         // SAFETY: owned window or validated parent; zero indicates an unavailable DPI.
-        let dpi = unsafe { GetDpiForWindow(window) };
+        let dpi = dpi_for_window(window);
         if dpi == 0 {
             1.0
         } else {
@@ -447,10 +503,15 @@ impl EditorWindow {
         let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
         if self.parent.is_none() {
             // SAFETY: owned live HWND; unaware windows return 96, PMv2 returns actual DPI.
-            let dpi = unsafe { GetDpiForWindow(self.window) }.max(96);
-            // SAFETY: writable client rectangle, matching style and window-specific DPI.
-            unsafe { AdjustWindowRectExForDpi(&mut rectangle, style.0, false.into(), 0, dpi) }
-                .ok()?;
+            if let Some(adjust) = dpi_api().adjust_for_dpi {
+                // Unaware windows report 96, per-monitor ones their monitor's DPI.
+                let dpi = dpi_for_window(self.window).max(96);
+                // SAFETY: writable client rectangle, matching style and window-specific DPI.
+                unsafe { adjust(&mut rectangle, style.0, false.into(), 0, dpi) }.ok()?;
+            } else {
+                // SAFETY: writable client rectangle and matching non-resizable style.
+                unsafe { AdjustWindowRectEx(&mut rectangle, style, false, WINDOW_EX_STYLE(0)) }?;
+            }
         }
         // SAFETY: owned window, bounded dimensions, no z-order or position change.
         unsafe {

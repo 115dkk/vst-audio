@@ -82,7 +82,10 @@ stretched Windows editor recreates the window in plugin-scaling mode.
 VST3 requires `IPlugViewContentScaleSupport` and a successful
 `setContentScaleFactor`, offered before attachment.
 
-Windows editor DPI handling requires Windows 10 version 1809 or later.
+Windows editor DPI handling needs Windows 10 version 1809 or later; the worker
+looks its functions up at run time, so on older systems it still starts and
+editors open with the default awareness at scale 1 (mixed hosting needs 1803,
+stretched windows 1809).
 Editor creation scopes use per-monitor-v2 awareness, except stretched windows,
 which use `DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED`. The previous thread
 context is restored. For a differently aware parent, the child creation scope
