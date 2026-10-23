@@ -73,7 +73,8 @@ foreach ($case in @(@{ Name = "vst3"; Path = $Vst3 }, @{ Name = "vst2"; Path = $
     $cfg = Join-Path $Root "cfg-$($case.Name)"
     New-Item -ItemType Directory -Force -Path $cfg | Out-Null
     $config = Join-Path $cfg "config.txt"
-    Set-Content -LiteralPath $config -Encoding UTF8 -Value "VSTPlugin: Library `"$($case.Path)`""
+    # No byte-order mark: it would become part of the first command's name.
+    [System.IO.File]::WriteAllText($config, "VSTPlugin: Library `"$($case.Path)`"`r`n", (New-Object System.Text.UTF8Encoding($false)))
     Write-Host "PROBE ==== $($case.Name): $($case.Path)"
     $editor = Start-Process -FilePath (Join-Path $App "Editor.exe") -ArgumentList "`"$config`"" -WorkingDirectory $App -PassThru
     $deadline = (Get-Date).AddSeconds(40)
@@ -88,10 +89,38 @@ foreach ($case in @(@{ Name = "vst3"; Path = $Vst3 }, @{ Name = "vst2"; Path = $
     $editor.Refresh()
     Dump-Windows $editor "after start"
     $main = $editor.MainWindowHandle
-    Dump-Uia $main 700
-    $root = [System.Windows.Automation.AutomationElement]::FromHandle($main)
-    $condition = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty, "Open panel")
-    $button = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
+    $mainElement = [System.Windows.Automation.AutomationElement]::FromHandle($main)
+    # Dismiss start-up message boxes (an uninstalled Editor asks about the registry).
+    foreach ($attempt in 1..3) {
+        $boxes = $mainElement.FindAll([System.Windows.Automation.TreeScope]::Descendants,
+            (New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ClassNameProperty, "QMessageBox")))
+        if ($boxes.Count -eq 0) { break }
+        foreach ($box in $boxes) {
+            Write-Host "PROBE message box '$($box.Current.Name)'"
+            foreach ($label in @("No", "OK", "Cancel")) {
+                $answer = $box.FindFirst([System.Windows.Automation.TreeScope]::Descendants,
+                    (New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty, $label)))
+                if ($answer) {
+                    Write-Host "PROBE answering '$label'"
+                    try { $answer.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke() } catch { Write-Host "PROBE answer failed: $_" }
+                    break
+                }
+            }
+        }
+        Start-Sleep -Seconds 2
+    }
+    $nameCondition = { param($n) New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty, $n) }
+    $button = $mainElement.FindFirst([System.Windows.Automation.TreeScope]::Descendants, (& $nameCondition "Open panel"))
+    if (-not $button) {
+        $expand = $mainElement.FindFirst([System.Windows.Automation.TreeScope]::Descendants, (& $nameCondition ">"))
+        if ($expand) {
+            Write-Host "PROBE expanding the card"
+            try { $expand.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke() } catch { Write-Host "PROBE expand failed: $_" }
+            Start-Sleep -Seconds 3
+        }
+        Dump-Uia $main 400
+        $button = $mainElement.FindFirst([System.Windows.Automation.TreeScope]::Descendants, (& $nameCondition "Open panel"))
+    }
     if ($button) {
         $r = $button.Current.BoundingRectangle
         Write-Host "PROBE open panel at [$([int]$r.Left),$([int]$r.Top),$([int]$r.Right),$([int]$r.Bottom)] patterns $(($button.GetSupportedPatterns() | ForEach-Object { $_.ProgrammaticName }) -join ',')"
@@ -102,6 +131,7 @@ foreach ($case in @(@{ Name = "vst3"; Path = $Vst3 }, @{ Name = "vst2"; Path = $
         foreach ($h in [ProbeWin]::TopLevel([uint32]$editor.Id)) {
             if ($h -ne $main -and [ProbeWin]::IsWindowVisible($h)) { Dump-Uia $h 200 }
         }
+        Dump-Uia $main 400
     } else {
         Write-Host "PROBE no 'Open panel' element"
     }
