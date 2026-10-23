@@ -640,16 +640,29 @@ mod editor_input {
                     // Name the colors the capture did contain: a blank editor, the
                     // wrong window and a shifted layout read differently.
                     let image = self.parent.capture();
-                    let mut counts = std::collections::HashMap::<[u8; 3], usize>::new();
-                    for pixel in image.rgba.as_chunks::<4>().0 {
-                        *counts.entry([pixel[0], pixel[1], pixel[2]]).or_default() += 1;
+                    // Color -> (count, left, top, right, bottom).
+                    let mut colors = std::collections::HashMap::<[u8; 3], [u32; 5]>::new();
+                    for (index, pixel) in image.rgba.as_chunks::<4>().0.iter().enumerate() {
+                        let (x, y) = (index as u32 % image.width, index as u32 / image.width);
+                        let entry = colors
+                            .entry([pixel[0], pixel[1], pixel[2]])
+                            .or_insert([0, x, y, x, y]);
+                        *entry = [
+                            entry[0] + 1,
+                            entry[1].min(x),
+                            entry[2].min(y),
+                            entry[3].max(x),
+                            entry[4].max(y),
+                        ];
                     }
-                    let mut counts: Vec<_> = counts.into_iter().collect();
-                    counts.sort_by_key(|entry| std::cmp::Reverse(entry.1));
-                    counts.truncate(5);
+                    let mut colors: Vec<_> = colors.into_iter().collect();
+                    colors.sort_by_key(|entry| std::cmp::Reverse(entry.1[0]));
+                    colors.truncate(6);
                     panic!(
-                        "pixel {point:?}: {actual:?}, expected {expected:?}; capture {}x{} top colors {counts:?}",
-                        image.width, image.height
+                        "pixel {point:?}: {actual:?}, expected {expected:?}; capture {}x{}, children {:?}, top colors (count, left, top, right, bottom) {colors:?}",
+                        image.width,
+                        image.height,
+                        self.parent.children()
                     );
                 }
                 self.collect(Duration::from_millis(20));
