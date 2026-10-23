@@ -1,14 +1,15 @@
 #![allow(unsafe_code)]
-//! VST 2 calls are serialized with a non-waiting audio admission gate. Control
-//! closes admission and waits for an in-flight block; audio never waits and
-//! leaves blocks pending during control work. Foreign callbacks touch only atomics.
+//! VST 2 lifecycle calls close a non-waiting audio admission gate. UI and
+//! parameter calls may overlap DSP, using copied ABI function pointers rather
+//! than Rust references to foreign mutable storage. Callbacks use atomics/TLS.
 use crate::{editor::EditorWindow, library::Library, vst2::*};
 use std::{
-    ffi::c_void,
+    cell::Cell,
+    ffi::{CStr, CString, c_void},
     path::Path,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -31,31 +32,39 @@ pub struct Events {
     pub params: bool,
     pub latency: bool,
     pub closed: bool,
+    pub resized: Option<(u32, u32)>,
+    pub fault: bool,
 }
 #[derive(Debug)]
 struct CallbackState {
     flags: AtomicU32,
     rate: AtomicU32,
     frames: AtomicU32,
-    width: AtomicU32,
-    height: AtomicU32,
+    size: AtomicU64,
+    editor_open: AtomicBool,
+    io_pending: AtomicBool,
+    invalid: AtomicBool,
+    directory: Option<CString>,
     events: crate::vst2_events::CallbackEvents,
     offline: AtomicBool,
 }
 #[derive(Debug)]
 struct Shared {
     effect: usize,
+    metadata: AEffect,
     admitted: AtomicBool,
     processing: AtomicBool,
     active: AtomicBool,
     closed: AtomicBool,
-    callback: CallbackState,
+    callback: Arc<CallbackState>,
     _library: Library,
 }
-// SAFETY: the library stays loaded; raw plugin access is serialized by admission
-// and processing, and callbacks access only atomics. No borrowed Rust data crosses threads.
+// SAFETY: the module and callback allocation outlive calls. Lifecycle is gated;
+// VST2 permits UI/parameter calls alongside DSP. Metadata is an immutable copy,
+// and no Rust reference to foreign instance storage crosses a foreign call.
 unsafe impl Send for Shared {}
-// SAFETY: all plugin calls are serialized by the admission protocol; the rest is atomic.
+// SAFETY: lifecycle/header inspection is gated; concurrent calls use copied function
+// pointers. Shared host state is atomic or immutable, never a mutable Rust reference.
 unsafe impl Sync for Shared {}
 impl Shared {
     fn control(&self) -> Control<'_> {
@@ -63,22 +72,31 @@ impl Shared {
         while self.processing.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_millis(1));
         }
-        Control(self)
+        Control(self, true)
+    }
+    fn calls(&self) -> Control<'_> {
+        Control(self, false)
     }
     fn effect(&self) -> *mut AEffect {
         self.effect as *mut AEffect
     }
 }
-struct Control<'a>(&'a Shared);
+struct Control<'a>(&'a Shared, bool);
 impl Drop for Control<'_> {
     fn drop(&mut self) {
-        self.0.admitted.store(true, Ordering::SeqCst);
+        if self.1 {
+            self.0.admitted.store(true, Ordering::SeqCst);
+        }
     }
 }
 impl Control<'_> {
-    fn effect(&self) -> &AEffect {
-        // SAFETY: admission is closed and the audio thread has left its foreign call.
-        unsafe { &*self.0.effect() }
+    fn effect(&self) -> AEffect {
+        if self.1 {
+            // SAFETY: lifecycle gate excludes DSP; copy without borrowing foreign storage.
+            unsafe { self.0.effect().read() }
+        } else {
+            self.0.metadata
+        }
     }
     fn call(
         &self,
@@ -88,7 +106,7 @@ impl Control<'_> {
         pointer: *mut c_void,
         option: f32,
     ) -> isize {
-        let Some(dispatch) = self.effect().dispatcher else {
+        let Some(dispatch) = self.0.metadata.dispatcher else {
             return 0;
         };
         // SAFETY: validated dispatcher; caller supplies the payload required by this opcode.
@@ -128,6 +146,7 @@ pub struct Vst2Plugin {
     info: Info,
     editor: Option<EditorWindow>,
     closed: bool,
+    resized: Option<(u32, u32)>,
     configured: bool,
     parameter_count: u32,
     processor_taken: bool,
@@ -149,6 +168,10 @@ pub struct Vst2Processor {
 }
 impl Vst2Plugin {
     pub fn load(path: &Path) -> Result<Self, PluginError> {
+        Self::load_class(path, None)
+    }
+    pub fn load_class(path: &Path, class: Option<[u8; 16]>) -> Result<Self, PluginError> {
+        let selected = decode_class(class)?;
         let library = Library::load(path).map_err(|e| PluginError(e.to_string()))?;
         let symbol = library
             .symbol(c"VSTPluginMain")
@@ -157,12 +180,15 @@ impl Vst2Plugin {
         // SAFETY: symbol is the required VST 2 entry point in a disposable host process.
         let entry: Entry = unsafe { std::mem::transmute(symbol) };
         // SAFETY: host callback has the clean-room ABI and static lifetime.
+        let previous = CURRENT_ID.replace(selected.unwrap_or(0));
+        // SAFETY: entry uses the validated ABI and static callback.
         let effect = unsafe { entry(callback) };
+        CURRENT_ID.set(previous);
         if effect.is_null() {
             return Err(PluginError("null plugin instance".into()));
         }
         // SAFETY: successful entry returns an AEffect that remains live until CLOSE.
-        let fields = unsafe { &*effect };
+        let fields = unsafe { effect.read() };
         if fields.magic != MAGIC
             || fields.dispatcher.is_none()
             || (fields.process_replacing.is_none() && fields.process_double.is_none())
@@ -172,33 +198,50 @@ impl Vst2Plugin {
         {
             return Err(PluginError("invalid plugin ABI or channel count".into()));
         }
-        // Parameter and bus counts are frozen at load; unsupported IO changes
-        // are reported for replacement rather than silently resizing RT buffers.
-        let parameter_count = fields.num_params as u32;
-        let inputs = fields.num_inputs as u16;
-        let outputs = fields.num_outputs as u16;
-        let shared = Arc::new(Shared {
+        let directory = plugin_directory(path);
+        let mut shared = Arc::new(Shared {
             effect: effect as usize,
+            metadata: fields,
             admitted: AtomicBool::new(true),
             processing: AtomicBool::new(false),
             active: AtomicBool::new(false),
             closed: AtomicBool::new(false),
-            callback: CallbackState {
+            callback: Arc::new(CallbackState {
                 flags: AtomicU32::new(0),
                 rate: AtomicU32::new(48000),
                 frames: AtomicU32::new(480),
-                width: AtomicU32::new(0),
-                height: AtomicU32::new(0),
+                size: AtomicU64::new(0),
+                editor_open: AtomicBool::new(false),
+                io_pending: AtomicBool::new(false),
+                invalid: AtomicBool::new(false),
+                directory,
                 events: crate::vst2_events::CallbackEvents::default(),
                 offline: AtomicBool::new(false),
-            },
+            }),
             _library: library,
         });
         // SAFETY: before any processing; resvd1 is reserved for the host. Callback state
         // stays at a stable Arc allocation until after effClose and all processors drop.
-        unsafe { (*effect).resvd1 = (&shared.callback as *const CallbackState).cast_mut().cast() };
+        unsafe { (*effect).resvd1 = Arc::as_ptr(&shared.callback).cast_mut().cast() };
         let control = shared.control();
+        shared
+            .callback
+            .events
+            .context(vst_audio_ring::Transport::default(), 48000, 0);
         control.call(OPEN, 0, 0, std::ptr::null_mut(), 0.0);
+        let fields = control.effect();
+        if !(0..=64).contains(&fields.num_inputs)
+            || !(0..=64).contains(&fields.num_outputs)
+            || !(0..=16384).contains(&fields.num_params)
+            || selected.is_some_and(|id| id != fields.unique_id)
+        {
+            return Err(PluginError(
+                "invalid post-OPEN counts or shell child ID".into(),
+            ));
+        }
+        let parameter_count = fields.num_params as u32;
+        let inputs = fields.num_inputs as u16;
+        let outputs = fields.num_outputs as u16;
         let mut input = std::ptr::null_mut::<Arrangement>();
         let mut output = std::ptr::null_mut::<Arrangement>();
         let arrangements = control.call(
@@ -235,11 +278,16 @@ impl Vst2Plugin {
             output_types: types(output, outputs)?,
         };
         drop(control);
+        Arc::get_mut(&mut shared)
+            .expect("no processor yet")
+            .metadata = fields;
+        shared.callback.io_pending.store(false, Ordering::Release);
         Ok(Self {
             shared,
             info,
             editor: None,
             closed: false,
+            resized: None,
             configured: false,
             parameter_count,
             processor_taken: false,
@@ -248,9 +296,10 @@ impl Vst2Plugin {
         })
     }
     pub fn capabilities(&self) -> vst_audio_protocol::Capabilities {
-        let control = self.shared.control();
+        let control = self.shared.calls();
         vst_audio_protocol::Capabilities {
-            f64: control.effect().process_double.is_some(),
+            f64: control.effect().flags & DOUBLE_REPLACING != 0
+                && control.effect().process_double.is_some(),
             input_event_buses: 1,
             output_event_buses: 1,
             editor: control.effect().flags & HAS_EDITOR != 0,
@@ -298,9 +347,11 @@ impl Vst2Plugin {
         }
         let control = self.shared.control();
         if (format == vst_audio_ring::SampleFormat::F64
-            && control.effect().process_double.is_none())
+            && (control.effect().flags & DOUBLE_REPLACING == 0
+                || control.effect().process_double.is_none()))
             || (format == vst_audio_ring::SampleFormat::F32
-                && control.effect().process_replacing.is_none())
+                && (control.effect().flags & REPLACING == 0
+                    || control.effect().process_replacing.is_none()))
         {
             return Err(PluginError("sample precision unsupported".into()));
         }
@@ -318,6 +369,10 @@ impl Vst2Plugin {
         );
         self.shared.callback.rate.store(rate, Ordering::Relaxed);
         self.shared.callback.frames.store(frames, Ordering::Relaxed);
+        self.shared
+            .callback
+            .events
+            .context(vst_audio_ring::Transport::default(), rate, 0);
         control.call(SET_SAMPLE_RATE, 0, 0, std::ptr::null_mut(), rate as f32);
         control.call(
             SET_BLOCK_SIZE,
@@ -326,6 +381,7 @@ impl Vst2Plugin {
             std::ptr::null_mut(),
             0.0,
         );
+        refresh(&self.shared, &control, &mut self.info, self.parameter_count);
         self.configured = true;
         Ok(())
     }
@@ -334,6 +390,7 @@ impl Vst2Plugin {
         if !self.shared.active.swap(true, Ordering::SeqCst) {
             control.call(MAINS_CHANGED, 0, 1, std::ptr::null_mut(), 0.0);
             control.call(START_PROCESS, 0, 0, std::ptr::null_mut(), 0.0);
+            refresh(&self.shared, &control, &mut self.info, self.parameter_count);
         }
     }
     pub fn deactivate(&mut self) {
@@ -375,7 +432,7 @@ impl Vst2Plugin {
         if count == 0 || count > 32 || start > self.parameter_count {
             return Err(PluginError("invalid parameter page".into()));
         }
-        let control = self.shared.control();
+        let control = self.shared.calls();
         let get = control
             .effect()
             .get_parameter
@@ -386,7 +443,7 @@ impl Vst2Plugin {
                 .saturating_add(u32::from(count))
                 .min(self.parameter_count)
         {
-            // SAFETY: cached validated parameter index, serialized plugin call.
+            // SAFETY: cached validated parameter index; VST2 permits this query alongside DSP.
             let value = f64::from(unsafe { get(self.shared.effect(), id) });
             if !value.is_finite() || !(0.0..=1.0).contains(&value) {
                 return Err(PluginError("invalid parameter value".into()));
@@ -409,17 +466,17 @@ impl Vst2Plugin {
         if id >= self.parameter_count || !value.is_finite() || !(0.0..=1.0).contains(&value) {
             return Err(PluginError("invalid parameter edit".into()));
         }
-        let control = self.shared.control();
+        let control = self.shared.calls();
         let set = control
             .effect()
             .set_parameter
             .ok_or_else(|| PluginError("no parameter setter".into()))?;
-        // SAFETY: validated index/value, admission excludes audio during the call.
+        // SAFETY: validated index/value; the VST2 plugin synchronizes parameter writes with DSP.
         unsafe { set(self.shared.effect(), id, value as f32) };
         Ok(())
     }
     pub fn get_state(&mut self) -> Result<Vec<u8>, PluginError> {
-        let control = self.shared.control();
+        let control = self.shared.calls();
         if control.effect().flags & PROGRAM_CHUNKS != 0 {
             let mut data = std::ptr::null::<u8>();
             let size = control.call(GET_CHUNK, 0, 0, (&mut data as *mut *const u8).cast(), 0.0);
@@ -432,27 +489,25 @@ impl Vst2Plugin {
             // SAFETY: GET_CHUNK guarantees size readable bytes until the next dispatcher call.
             return Ok(unsafe { std::slice::from_raw_parts(data, size as usize) }.to_vec());
         }
-        let mut state = (control.call(GET_PROGRAM, 0, 0, std::ptr::null_mut(), 0.0) as i32)
-            .to_le_bytes()
-            .to_vec();
+        let program = if control.effect().num_programs > 0 {
+            control.call(GET_PROGRAM, 0, 0, std::ptr::null_mut(), 0.0) as i32
+        } else {
+            0
+        };
+        let mut state = program.to_le_bytes().to_vec();
         let count = control.effect().num_params;
         let get = control
             .effect()
             .get_parameter
             .ok_or_else(|| PluginError("missing getParameter".into()))?;
         for index in 0..count {
-            // SAFETY: validated parameter index; exclusive control access to plugin.
+            // SAFETY: validated parameter index; concurrent parameter reads are a VST2 plugin obligation.
             let value = unsafe { get(self.shared.effect(), index as u32) };
             state.extend(value.to_le_bytes());
         }
         Ok(state)
     }
     pub fn set_state(&mut self, blob: &[u8]) -> Result<(), PluginError> {
-        if blob.starts_with(b"SSV3") {
-            return Err(PluginError(
-                "VST 3 state cannot be restored into VST 2".into(),
-            ));
-        }
         if blob.len() >= 64 * 1024 * 1024 - 8 {
             return Err(PluginError("state too large".into()));
         }
@@ -467,15 +522,23 @@ impl Vst2Plugin {
                 0.0,
             );
         } else {
-            let count = control.effect().num_params as usize;
+            let count = self.parameter_count as usize;
             if blob.len() != 4 + count * 4 {
                 return Err(PluginError("invalid parameter state".into()));
             }
-            let program = i32::from_le_bytes(blob[..4].try_into().expect("four bytes"));
-            if program < 0 || program >= control.effect().num_programs {
-                return Err(PluginError("invalid program".into()));
+            if blob[4..].as_chunks::<4>().0.iter().any(|bytes| {
+                let value = f32::from_le_bytes(*bytes);
+                !value.is_finite() || !(0.0..=1.0).contains(&value)
+            }) {
+                return Err(PluginError("invalid parameter state value".into()));
             }
-            control.call(SET_PROGRAM, 0, program as isize, std::ptr::null_mut(), 0.0);
+            if control.effect().num_programs > 0 {
+                let program = i32::from_le_bytes(blob[..4].try_into().expect("four bytes"));
+                if program < 0 || program >= control.effect().num_programs {
+                    return Err(PluginError("invalid program".into()));
+                }
+                control.call(SET_PROGRAM, 0, program as isize, std::ptr::null_mut(), 0.0);
+            }
             let set = control
                 .effect()
                 .set_parameter
@@ -485,6 +548,10 @@ impl Vst2Plugin {
                 // SAFETY: exact state size checked; index is a valid parameter, control exclusive.
                 unsafe { set(self.shared.effect(), index as u32, value) };
             }
+        }
+        refresh(&self.shared, &control, &mut self.info, self.parameter_count);
+        if self.shared.callback.invalid.load(Ordering::Acquire) {
+            return Err(PluginError(RESTART_REQUIRED.into()));
         }
         Ok(())
     }
@@ -508,12 +575,17 @@ impl Vst2Plugin {
         {
             return Ok(());
         }
+        self.shared
+            .callback
+            .editor_open
+            .store(false, Ordering::Release);
+        self.shared.callback.size.store(0, Ordering::Release);
         if self.editor.is_some() {
-            let control = self.shared.control();
+            let control = self.shared.calls();
             control.call(EDIT_CLOSE, 0, 0, std::ptr::null_mut(), 0.0);
             self.editor = None;
         }
-        let control = self.shared.control();
+        let control = self.shared.calls();
         if control.effect().flags & HAS_EDITOR == 0 {
             return Err(PluginError("plugin has no editor".into()));
         }
@@ -546,7 +618,41 @@ impl Vst2Plugin {
             None => EditorWindow::open(&self.info.name, width, height)
                 .map_err(|e| PluginError(e.to_string()))?,
         };
-        control.call(EDIT_OPEN, 0, 0, editor.handle_value() as *mut c_void, 0.0);
+        self.shared
+            .callback
+            .editor_open
+            .store(true, Ordering::Release);
+        let opened = control.call(EDIT_OPEN, 0, 0, editor.handle_value() as *mut c_void, 0.0);
+        let mut after = std::ptr::null::<Rect>();
+        control.call(
+            EDIT_GET_RECT,
+            0,
+            0,
+            (&mut after as *mut *const Rect).cast(),
+            0.0,
+        );
+        if !after.is_null() {
+            // SAFETY: plugin owns the rectangle until its next dispatcher call; copy now.
+            let after = unsafe { after.read() };
+            let w = i32::from(after.right) - i32::from(after.left);
+            let h = i32::from(after.bottom) - i32::from(after.top);
+            if w > 0
+                && h > 0
+                && (w, h) != (width, height)
+                && let Err(error) = editor.resize(w, h)
+            {
+                eprintln!("VST2 post-open resize failed: {error}");
+            }
+        }
+        if opened == 0 && !crate::editor_probe::has_child(editor.handle_value()) {
+            control.call(EDIT_CLOSE, 0, 0, std::ptr::null_mut(), 0.0);
+            self.shared
+                .callback
+                .editor_open
+                .store(false, Ordering::Release);
+            self.shared.callback.size.store(0, Ordering::Release);
+            return Err(PluginError("plugin did not create an editor".into()));
+        }
         self.editor = Some(editor);
         Ok(())
     }
@@ -601,14 +707,24 @@ impl Vst2Plugin {
     }
     pub fn idle(&mut self) {
         if let Some(editor) = &self.editor {
-            let control = self.shared.control();
+            let control = self.shared.calls();
             control.call(EDIT_IDLE, 0, 0, std::ptr::null_mut(), 0.0);
-            let width = self.shared.callback.width.swap(0, Ordering::Relaxed);
-            let height = self.shared.callback.height.load(Ordering::Relaxed);
-            if width != 0 {
-                let _ = editor.resize(width as i32, height as i32);
+            let size = self.shared.callback.size.swap(0, Ordering::AcqRel);
+            if size != 0 {
+                let (width, height) = ((size >> 32) as u32, size as u32);
+                if let Err(error) = editor.resize(width as i32, height as i32) {
+                    eprintln!("VST2 sizeWindow failed: {error}");
+                }
+                if let Ok((_, width, height)) = editor.status() {
+                    self.resized = Some((width, height));
+                }
             }
             if editor.pump() {
+                self.shared
+                    .callback
+                    .editor_open
+                    .store(false, Ordering::Release);
+                self.shared.callback.size.store(0, Ordering::Release);
                 control.call(EDIT_CLOSE, 0, 0, std::ptr::null_mut(), 0.0);
                 self.editor = None;
                 self.closed = true;
@@ -616,20 +732,27 @@ impl Vst2Plugin {
         }
     }
     pub fn take_events(&mut self) -> Events {
-        let flags = self.shared.callback.flags.swap(0, Ordering::AcqRel);
-        if flags & 2 != 0 {
+        if self.shared.callback.io_pending.load(Ordering::Acquire) {
             let control = self.shared.control();
-            self.info.latency = control.effect().initial_delay.max(0) as u32;
+            refresh(&self.shared, &control, &mut self.info, self.parameter_count);
         }
+        let flags = self.shared.callback.flags.swap(0, Ordering::AcqRel);
         Events {
             params: flags & 1 != 0,
             latency: flags & 2 != 0,
             closed: std::mem::take(&mut self.closed),
+            resized: self.resized.take(),
+            fault: self.shared.callback.invalid.load(Ordering::Acquire),
         }
     }
 }
 impl Drop for Vst2Plugin {
     fn drop(&mut self) {
+        self.shared
+            .callback
+            .editor_open
+            .store(false, Ordering::Release);
+        self.shared.callback.size.store(0, Ordering::Release);
         if self.editor.is_some() {
             let control = self.shared.control();
             control.call(EDIT_CLOSE, 0, 0, std::ptr::null_mut(), 0.0);
@@ -696,11 +819,14 @@ impl Vst2Processor {
                 .windows(2)
                 .any(|p| p[0].sample_offset > p[1].sample_offset)
             || self.shared.closed.load(Ordering::SeqCst)
+            || self.shared.callback.io_pending.load(Ordering::Acquire)
+            || self.shared.callback.invalid.load(Ordering::Acquire)
             || !self.shared.admitted.load(Ordering::SeqCst)
             || self.shared.processing.swap(true, Ordering::SeqCst)
         {
             return false;
         }
+        let _thread = ProcessingThread::enter(self.shared.callback.offline.load(Ordering::Relaxed));
         let result = (|| {
             if !self.shared.admitted.load(Ordering::SeqCst)
                 || !self.shared.active.load(Ordering::SeqCst)
@@ -708,7 +834,7 @@ impl Vst2Processor {
             {
                 return false;
             }
-            // SAFETY: admission owns the live plugin and serializes all effect access.
+            // SAFETY: admission retains the live plugin and excludes lifecycle/header mutation.
             let dispatch =
                 unsafe { (*self.shared.effect()).dispatcher }.expect("validated dispatcher");
             // SAFETY: same admitted instance; the optional setter is copied before calls.
@@ -717,6 +843,11 @@ impl Vst2Processor {
             let mut context_origin = 0;
             let mut start = 0;
             while start < frames {
+                if self.shared.callback.io_pending.load(Ordering::Acquire)
+                    || self.shared.callback.invalid.load(Ordering::Acquire)
+                {
+                    return false;
+                }
                 for event in input.iter().filter(|e| e.sample_offset as usize == start) {
                     match event.data {
                         EventData::Parameter { id, value } => {
@@ -812,6 +943,9 @@ impl Vst2Processor {
                 {
                     *pointer = plane.as_mut_ptr().wrapping_add(start);
                 }
+                if self.shared.callback.io_pending.load(Ordering::Acquire) {
+                    return false;
+                }
                 // SAFETY: precision was configured, pointers cover every declared channel and the bounded segment.
                 unsafe {
                     T::invoke(
@@ -839,6 +973,19 @@ unsafe extern "C" fn callback(
     pointer: *mut c_void,
     _option: f32,
 ) -> isize {
+    if opcode == 2 {
+        return CURRENT_ID.get() as isize;
+    }
+    if opcode == 23 {
+        return PROCESS_LEVEL.get();
+    }
+    if opcode == 34 {
+        return host_version();
+    }
+    if opcode == 37 {
+        // SAFETY: canDo supplies a readable NUL-terminated capability string.
+        return unsafe { host_can_do(pointer) };
+    }
     if opcode == MASTER_VERSION {
         return 2400;
     }
@@ -867,13 +1014,16 @@ unsafe extern "C" fn callback(
             // SAFETY: host processEvents callback supplies a live VST2 event list.
             unsafe { state.events.receive(pointer) }
         }
-        23 => {
-            if state.offline.load(Ordering::Relaxed) {
-                4
-            } else {
-                2
-            }
+        23 => PROCESS_LEVEL.get(),
+        41 => state
+            .directory
+            .as_ref()
+            .map_or(0, |directory| directory.as_ptr() as isize),
+        42 | 44 => {
+            state.flags.fetch_or(1, Ordering::Release);
+            1
         }
+        43 => 1,
         MASTER_SAMPLE_RATE => state.rate.load(Ordering::Relaxed) as isize,
         MASTER_BLOCK_SIZE => state.frames.load(Ordering::Relaxed) as isize,
         MASTER_AUTOMATE => {
@@ -881,14 +1031,245 @@ unsafe extern "C" fn callback(
             1
         }
         MASTER_IO_CHANGED => {
-            state.flags.fetch_or(2, Ordering::Release);
+            state.io_pending.store(true, Ordering::Release);
             1
         }
-        MASTER_SIZE_WINDOW if index > 0 && value > 0 && index <= 8192 && value <= 8192 => {
-            state.height.store(value as u32, Ordering::Relaxed);
-            state.width.store(index as u32, Ordering::Release);
+        MASTER_SIZE_WINDOW
+            if state.editor_open.load(Ordering::Acquire)
+                && index > 0
+                && value > 0
+                && index <= 8192
+                && value <= 8192 =>
+        {
+            state
+                .size
+                .store(((index as u64) << 32) | value as u64, Ordering::Release);
             1
         }
         _ => 0,
+    }
+}
+
+const RESTART_REQUIRED: &str = "plugin changed its channel or parameter count; restart required";
+thread_local! {
+    static CURRENT_ID: Cell<i32> = const { Cell::new(0) };
+    static PROCESS_LEVEL: Cell<isize> = const { Cell::new(1) };
+}
+struct ProcessingThread(isize);
+impl ProcessingThread {
+    fn enter(offline: bool) -> Self {
+        Self(PROCESS_LEVEL.replace(if offline { 4 } else { 2 }))
+    }
+}
+impl Drop for ProcessingThread {
+    fn drop(&mut self) {
+        PROCESS_LEVEL.set(self.0);
+    }
+}
+fn host_version() -> isize {
+    let part = |s: &str| s.parse::<isize>().unwrap_or(0);
+    part(env!("CARGO_PKG_VERSION_MAJOR")) * 10000
+        + part(env!("CARGO_PKG_VERSION_MINOR")) * 100
+        + part(env!("CARGO_PKG_VERSION_PATCH"))
+}
+unsafe fn host_can_do(pointer: *mut c_void) -> isize {
+    if pointer.is_null() {
+        return 0;
+    }
+    let mut bytes = [0u8; 128];
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        // SAFETY: caller supplies a C string; stop at its terminator, bounded to 128 bytes.
+        *byte = unsafe { *pointer.cast::<u8>().wrapping_add(i) };
+        if *byte == 0 {
+            return isize::from(matches!(
+                &bytes[..i],
+                b"sendVstEvents"
+                    | b"sendVstMidiEvent"
+                    | b"receiveVstEvents"
+                    | b"receiveVstMidiEvent"
+                    | b"sendVstTimeInfo"
+                    | b"sizeWindow"
+                    | b"startStopProcess"
+                    | b"shellCategory"
+            ));
+        }
+    }
+    0
+}
+fn refresh(shared: &Shared, control: &Control<'_>, info: &mut Info, params: u32) {
+    shared.callback.io_pending.store(false, Ordering::Release);
+    let fields = control.effect();
+    if fields.num_inputs != i32::from(info.inputs)
+        || fields.num_outputs != i32::from(info.outputs)
+        || fields.num_params != params as i32
+    {
+        shared.callback.invalid.store(true, Ordering::Release);
+    }
+    let latency = fields.initial_delay.max(0) as u32;
+    if latency != info.latency {
+        info.latency = latency;
+        shared.callback.flags.fetch_or(2, Ordering::Release);
+    }
+}
+fn decode_class(class: Option<[u8; 16]>) -> Result<Option<i32>, PluginError> {
+    match class {
+        None => Ok(None),
+        Some(id) if id == [0; 16] => Ok(None),
+        Some(id) if &id[..4] == b"VST2" && id[8..] == [0; 8] => {
+            let value = i32::from_be_bytes(id[4..8].try_into().expect("four bytes"));
+            if value == 0 {
+                Err(PluginError("invalid VST2 shell ID".into()))
+            } else {
+                Ok(Some(value))
+            }
+        }
+        _ => Err(PluginError("invalid VST2 class ID".into())),
+    }
+}
+/// The plugin's directory for the host directory query, or none when it cannot be
+/// expressed as the platform's narrow string. Never fails a load. macOS hosts
+/// traditionally answered with a legacy file-system record, so none is given.
+fn plugin_directory(path: &Path) -> Option<CString> {
+    let parent = path.parent()?;
+    #[cfg(target_os = "macos")]
+    {
+        let _ = parent;
+        None
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        CString::new(parent.as_os_str().as_bytes()).ok()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::Win32::Globalization::{CP_ACP, WC_NO_BEST_FIT_CHARS, WideCharToMultiByte};
+        let wide: Vec<u16> = parent.as_os_str().encode_wide().collect();
+        let mut used = windows::core::BOOL(0);
+        // SAFETY: valid UTF-16 input, query-only call with no output buffer.
+        let size = unsafe {
+            WideCharToMultiByte(
+                CP_ACP,
+                WC_NO_BEST_FIT_CHARS,
+                &wide,
+                None,
+                None,
+                Some(&mut used),
+            )
+        };
+        if size <= 0 {
+            return None;
+        }
+        let mut bytes = vec![0; size as usize];
+        // SAFETY: output is sized by the identical conversion query; pointers live through call.
+        let written = unsafe {
+            WideCharToMultiByte(
+                CP_ACP,
+                WC_NO_BEST_FIT_CHARS,
+                &wide,
+                Some(&mut bytes),
+                None,
+                Some(&mut used),
+            )
+        };
+        (written == size && !used.as_bool())
+            .then(|| CString::new(bytes).ok())
+            .flatten()
+    }
+}
+impl Vst2Plugin {
+    /// Tri-state plugin canDo result, retaining unknown (0) and no (-1).
+    fn can_do(&self, name: &CStr) -> isize {
+        self.shared
+            .calls()
+            .call(51, 0, 0, name.as_ptr().cast_mut().cast(), 0.0)
+            .signum()
+    }
+    pub fn classes(&self) -> Result<Vec<vst_audio_protocol::ClassInfo>, PluginError> {
+        let calls = self.shared.calls();
+        let category = calls.call(35, 0, 0, std::ptr::null_mut(), 0.0);
+        let _shell_capability = self.can_do(c"shellCategory");
+        if category != 10 {
+            return Ok(vec![vst_audio_protocol::ClassInfo {
+                id: [0; 16],
+                name: self.info.name.clone(),
+                vendor: self.info.vendor.clone(),
+                category: if category == 2 || calls.effect().flags & (1 << 8) != 0 {
+                    "Instrument"
+                } else {
+                    "Audio Module"
+                }
+                .into(),
+            }]);
+        }
+        let mut entries = Vec::new();
+        for index in 0..=1024 {
+            let mut name = [0u8; 256];
+            let child = calls.call(70, 0, 0, name.as_mut_ptr().cast(), 0.0) as i32;
+            if child == 0 {
+                return Ok(entries);
+            }
+            if index == 1024 {
+                return Err(PluginError(
+                    "VST2 shell enumeration exceeded 1024 entries".into(),
+                ));
+            }
+            let mut id = [0; 16];
+            id[..4].copy_from_slice(b"VST2");
+            id[4..8].copy_from_slice(&child.to_be_bytes());
+            if entries
+                .iter()
+                .any(|e: &vst_audio_protocol::ClassInfo| e.id == id)
+            {
+                return Err(PluginError("duplicate VST2 shell child ID".into()));
+            }
+            let len = name.iter().position(|b| *b == 0).unwrap_or(name.len());
+            entries.push(vst_audio_protocol::ClassInfo {
+                id,
+                name: String::from_utf8_lossy(&name[..len]).into_owned(),
+                vendor: self.info.vendor.clone(),
+                category: "Audio Module".into(),
+            });
+        }
+        unreachable!("shell enumeration loop returns at its bound")
+    }
+    pub fn negotiate_layouts(&mut self, input: u64, output: u64) -> Result<(), PluginError> {
+        fn arrangement(mask: u64, count: u16) -> Result<Arrangement, PluginError> {
+            let (kind, types): (i32, &[i32]) = match (mask, count) {
+                (0, 0) => (-1, &[]),
+                (0 | 4, 1) => (0, &[0]),
+                (0 | 3, 2) => (ARR_STEREO, &[1, 2]),
+                (0 | 63, 6) => (ARR_51, &[1, 2, 3, 4, 5, 6]),
+                _ => {
+                    return Err(PluginError(
+                        "VST 2 speaker arrangement negotiation is unavailable for this layout"
+                            .into(),
+                    ));
+                }
+            };
+            Ok(Arrangement::new(kind, types))
+        }
+        // An unspecified layout retains the declaration, including uncommon channel counts.
+        if input == 0 && output == 0 {
+            return Ok(());
+        }
+        let mut input = arrangement(input, self.info.inputs)?;
+        let mut output = arrangement(output, self.info.outputs)?;
+        let control = self.shared.control();
+        if control.call(
+            SET_SPEAKER_ARRANGEMENT,
+            0,
+            (&mut input as *mut Arrangement) as isize,
+            (&mut output as *mut Arrangement).cast(),
+            0.0,
+        ) != 1
+        {
+            return Err(PluginError(
+                "VST2 plugin rejected speaker arrangement".into(),
+            ));
+        }
+        refresh(&self.shared, &control, &mut self.info, self.parameter_count);
+        Ok(())
     }
 }

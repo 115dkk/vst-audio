@@ -40,8 +40,8 @@ struct Vst2 {
     info: PluginInfo,
 }
 impl Vst2 {
-    fn load(path: &Path) -> Result<Self, PluginError> {
-        let inner = Vst2Plugin::load(path).map_err(plugin_error)?;
+    fn load(path: &Path, class: Option<[u8; 16]>) -> Result<Self, PluginError> {
+        let inner = Vst2Plugin::load_class(path, class).map_err(plugin_error)?;
         let info = inner.info();
         let arrangement = |types: Option<Vec<i32>>, count| -> Result<u64, PluginError> {
             Ok(types
@@ -118,7 +118,9 @@ impl Processor for Vst2ProcessorAdapter {
 struct Vst2ProcessorAdapter(Vst2Processor);
 impl Plugin for Vst2 {
     fn info(&self) -> PluginInfo {
-        self.info.clone()
+        let mut info = self.info.clone();
+        info.latency_frames = self.inner.info().latency;
+        info
     }
     fn configure(
         &mut self,
@@ -147,6 +149,26 @@ impl Plugin for Vst2 {
             return Err(PluginError(
                 "VST2 exposes one active audio port per direction".into(),
             ));
+        }
+        let unchanged = |requested: &[vst_audio_protocol::BusConfiguration],
+                         declared: &[vst_audio_protocol::BusInfo]| {
+            requested.len() == declared.len()
+                && requested
+                    .iter()
+                    .zip(declared)
+                    .all(|(a, b)| a.layout == b.layout)
+        };
+        // The application sends the declaration back even when no layout was selected.
+        // Keeping that default is not a request to change the plugin's arrangement.
+        if !unchanged(&setup.inputs, &self.info.inputs)
+            || !unchanged(&setup.outputs, &self.info.outputs)
+        {
+            self.inner
+                .negotiate_layouts(
+                    setup.inputs.first().map_or(0, |b| b.layout.arrangement),
+                    setup.outputs.first().map_or(0, |b| b.layout.arrangement),
+                )
+                .map_err(plugin_error)?;
         }
         self.inner
             .configure_precision(
@@ -223,7 +245,10 @@ impl Plugin for Vst2 {
             params_changed: events.params,
             latency_changed: events.latency.then_some(self.info.latency_frames),
             editor_closed: events.closed,
-            fault: None,
+            editor_resized: events.resized,
+            fault: events
+                .fault
+                .then_some("plugin changed its channel or parameter count; restart required"),
         }
     }
 }
@@ -411,15 +436,9 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
                                     .collect();
                                 return Ok(Message::Classes { entries });
                             }
-                            let scanned = Vst2::load(Path::new(&path)).map_err(error)?;
-                            let info = scanned.info();
+                            let scanned = Vst2Plugin::load(Path::new(&path)).map_err(error)?;
                             Ok(Message::Classes {
-                                entries: vec![ClassInfo {
-                                    id: [0; 16],
-                                    name: info.name,
-                                    vendor: info.vendor,
-                                    category: "Audio Module".into(),
-                                }],
+                                entries: scanned.classes().map_err(error)?,
                             })
                         }
                         Message::Load {
@@ -429,7 +448,7 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
                         } if plugin.is_none() => {
                             let loaded: Box<dyn Plugin> = match format {
                                 PluginFormat::Vst2 => {
-                                    Box::new(Vst2::load(Path::new(&path)).map_err(error)?)
+                                    Box::new(Vst2::load(Path::new(&path), class_id).map_err(error)?)
                                 }
                                 PluginFormat::Vst3 => Box::new(
                                     crate::vst3::Vst3::load(Path::new(&path), class_id)
@@ -699,6 +718,9 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
                 }
                 if let Some(frames) = events.latency_changed {
                     send(Message::LatencyChanged { frames })?;
+                }
+                if let Some((width, height)) = events.editor_resized {
+                    send(Message::EditorResized { width, height })?;
                 }
                 if events.editor_closed {
                     send(Message::EditorClosed)?;

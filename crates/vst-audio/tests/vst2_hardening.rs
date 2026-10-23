@@ -1,0 +1,417 @@
+#![forbid(unsafe_code)]
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
+use vst_audio::{
+    AudioStatus, Command, Configuration, ControlEvent, Host, HostEvent, PluginDescriptor,
+    PluginFormat, PluginProcess, RecoveryPolicy, Started,
+};
+use vst_audio_protocol::{EditorAction, Message};
+use vst_audio_ring::{Publish, Wait};
+fn paths() -> (PathBuf, PathBuf) {
+    (
+        std::env::var_os("VST_AUDIO_WORKER").unwrap().into(),
+        std::env::var_os("VST_AUDIO_TEST_VST2").unwrap().into(),
+    )
+}
+fn start(mode: u8) -> Started {
+    let (worker, plugin) = paths();
+    PluginProcess::start(
+        &worker,
+        &plugin,
+        PluginFormat::Vst2,
+        None,
+        48000,
+        Some(&[1, mode]),
+    )
+    .unwrap()
+}
+fn wait(s: &mut Started, mut accepts: impl FnMut(&Message) -> bool) -> Message {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        for event in s.control.poll(s.control.elapsed_ms()) {
+            if let ControlEvent::Message(frame) = event
+                && accepts(&frame.message)
+            {
+                return frame.message;
+            }
+        }
+        assert!(Instant::now() < deadline, "message timeout");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+fn state(s: &mut Started) -> Vec<u8> {
+    s.control.get_state().unwrap();
+    let Message::State { blob } = wait(s, |m| matches!(m, Message::State { .. })) else {
+        unreachable!()
+    };
+    blob
+}
+fn observation(blob: &[u8], index: usize) -> u32 {
+    u32::from_le_bytes(blob[2 + index * 4..6 + index * 4].try_into().unwrap())
+}
+fn block(s: &Started, sequence: u32) -> f32 {
+    assert_eq!(
+        s.publisher
+            .try_publish(s.region.region(), 0, sequence, Some(&*s.work), |slot| {
+                for f in 0..slot.frames() {
+                    slot.write(0, f, 1.0);
+                    slot.write(1, f, 1.0);
+                }
+            }),
+        Publish::Published
+    );
+    let end = Instant::now() + Duration::from_secs(2);
+    while s.publisher.completed(s.region.region(), 0) < sequence {
+        assert!(Instant::now() < end);
+        s.done.wait(Duration::from_millis(2));
+    }
+    let mut sample = 0.0;
+    assert!(
+        s.publisher
+            .try_read(s.region.region(), 0, sequence, |slot| sample =
+                slot.read(0, 100))
+    );
+    sample
+}
+#[test]
+#[ignore = "native fixtures required"]
+fn callbacks_time_latency_and_opaque_state() {
+    let mut s = start(7);
+    block(&s, 1);
+    let blob = state(&mut s);
+    assert_eq!(observation(&blob, 0), 255);
+    assert_eq!(observation(&blob, 1), 48000);
+    assert_eq!(observation(&blob, 2), 48000);
+    assert_eq!(observation(&blob, 3), 2);
+    println!("canDo=255 (first eight yes, remaining seven no), OPEN/resume=48000, DSP level=2");
+    s.control.set_state(&[1, 8]).unwrap();
+    assert_eq!(
+        wait(&mut s, |m| matches!(m, Message::LatencyChanged { .. })),
+        Message::LatencyChanged { frames: 128 }
+    );
+    block(&s, 2);
+    s.control.set_state(&[1, 10]).unwrap();
+    wait(&mut s, |m| matches!(m, Message::ParamsChanged));
+    s.control.set_state(b"SSV3test").unwrap();
+    wait(&mut s, |m| matches!(m, Message::Ack));
+    assert_eq!(state(&mut s), b"SSV3test");
+    if std::env::var_os("VST_AUDIO_TEST_CONFIGURE_LATENCY").is_some() {
+        let configured = start(16);
+        assert_eq!(configured.latency_frames, 96);
+        println!("configure latency=96 (native.rs before/after comparison)");
+    }
+    let mut resumed = start(11);
+    // Startup queues notifications; poll once if the activation notification arrived after Ack.
+    for _ in 0..10 {
+        resumed.control.poll(resumed.control.elapsed_ms());
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(resumed.control.latency(), 192);
+    println!(
+        "ioChanged latency=128, processing continued; resume latency=192; SSV3 round-trip exact"
+    );
+}
+#[test]
+#[ignore = "native fixtures required"]
+fn incompatible_counts_fault() {
+    let mut s = start(7);
+    block(&s, 1);
+    s.control.set_state(&[1, 9]).unwrap();
+    let Message::Fault { text, .. } = wait(&mut s, |m| matches!(m, Message::Fault { .. })) else {
+        unreachable!()
+    };
+    assert!(text.contains("restart required"));
+    println!("structural change fault: {text}");
+}
+#[test]
+#[ignore = "native fixtures required"]
+fn automatic_recovery_replaces_worker_after_structural_fault() {
+    let (worker, plugin) = paths();
+    let host = Host::new(worker);
+    let config = Configuration {
+        recovery: RecoveryPolicy::Automatic {
+            attempts: 2,
+            backoff_ms: 10,
+        },
+        ..Default::default()
+    };
+    let mut instance = host
+        .spawn(
+            &PluginDescriptor::new(plugin, PluginFormat::Vst2),
+            &config,
+            Some(&[1, 7]),
+        )
+        .unwrap();
+    let mut audio = instance.take_audio().unwrap();
+    let previous_generation = audio.generation();
+    instance
+        .controller()
+        .request(Command::RestoreState(vec![1, 9]))
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let input = [0.25f32; 128];
+    let mut samples = [[0.0f32; 128]; 6];
+    let mut outputs: Vec<_> = samples.iter_mut().map(|plane| &mut plane[..]).collect();
+    let mut recovery_required = false;
+    let recovered_generation = loop {
+        audio.process(&[&input, &input], &mut outputs);
+        if let Some(event) = instance.try_next_event() {
+            match event {
+                HostEvent::RecoveryRequired => recovery_required = true,
+                HostEvent::Recovered { generation } => break generation,
+                _ => {}
+            }
+        }
+        assert!(Instant::now() < deadline, "automatic recovery timeout");
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    assert!(recovery_required);
+    assert!(recovered_generation > previous_generation);
+
+    loop {
+        if audio.process(&[&input, &input], &mut outputs) == AudioStatus::Processed {
+            assert!(audio.generation() > previous_generation);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "audio did not resume after recovery"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    println!(
+        "structural fault recovery: generation {previous_generation} -> {recovered_generation}, audio processed"
+    );
+}
+
+#[test]
+#[ignore = "native fixtures required"]
+fn editor_resize_and_idle_do_not_stop_audio() {
+    let mut resized = start(13);
+    resized.control.open_editor().unwrap();
+    wait(&mut resized, |m| matches!(m, Message::Ack));
+    resized
+        .control
+        .editor_action(EditorAction::Inspect)
+        .unwrap();
+    let Message::EditorStatus(status) =
+        wait(&mut resized, |m| matches!(m, Message::EditorStatus(_)))
+    else {
+        unreachable!()
+    };
+    assert_eq!((status.width, status.height), (480, 260));
+    let mut resized = start(14);
+    resized.control.open_editor().unwrap();
+    assert_eq!(
+        wait(&mut resized, |m| matches!(m, Message::EditorResized { .. })),
+        Message::EditorResized {
+            width: 500,
+            height: 280
+        }
+    );
+    let mut s = start(15);
+    s.control.open_editor().unwrap();
+    wait(&mut s, |m| matches!(m, Message::Ack));
+    let begin = Instant::now();
+    let mut sequence = 1;
+    while begin.elapsed() < Duration::from_millis(350) {
+        block(&s, sequence);
+        sequence += 1;
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let blob = state(&mut s);
+    assert_eq!(observation(&blob, 4), 1);
+    assert_eq!(observation(&blob, 5), 2);
+    assert!(observation(&blob, 7) > 0);
+    println!(
+        "post-open=480x260, sizeWindow=500x280, idle thread=1, blocks during 300ms={}",
+        observation(&blob, 7)
+    );
+
+    let mut closing = start(18);
+    closing.control.open_editor().unwrap();
+    wait(&mut closing, |m| matches!(m, Message::Ack));
+    closing.control.close_editor().unwrap();
+    wait(&mut closing, |m| matches!(m, Message::Ack));
+    assert_eq!(observation(&state(&mut closing), 10), 0);
+}
+#[test]
+#[ignore = "native fixtures required"]
+fn shell_children() {
+    if std::env::var_os("VST_AUDIO_TEST_SHELL").is_none() {
+        return;
+    }
+    let (worker, plugin) = paths();
+    let classes = PluginProcess::scan(&worker, &plugin, PluginFormat::Vst2).unwrap();
+    assert_eq!(classes.len(), 2);
+    for (class, gain) in classes.iter().zip([0.5, 0.25]) {
+        assert_eq!(&class.id[..4], b"VST2");
+        let s = PluginProcess::start(
+            &worker,
+            &plugin,
+            PluginFormat::Vst2,
+            Some(class.id),
+            48000,
+            None,
+        )
+        .unwrap();
+        assert_eq!(block(&s, 1), gain);
+        println!("shell {} gain={gain}", class.name);
+    }
+}
+#[test]
+#[ignore = "native fixtures required"]
+fn shell_child_limit() {
+    let Some(expected) = std::env::var("VST_AUDIO_TEST_SHELL_CHILDREN")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+    else {
+        return;
+    };
+    let (worker, plugin) = paths();
+    let result = PluginProcess::scan(&worker, &plugin, PluginFormat::Vst2);
+    if expected == 1024 {
+        assert_eq!(result.unwrap().len(), 1024);
+    } else {
+        assert_eq!(expected, 1025);
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.contains("VST2 shell enumeration exceeded 1024 entries"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "native fixtures required"]
+fn zero_program_parameter_state() {
+    if std::env::var_os("VST_AUDIO_TEST_NO_CHUNKS").is_none() {
+        return;
+    }
+    let (worker, plugin) = paths();
+    let mut s =
+        PluginProcess::start(&worker, &plugin, PluginFormat::Vst2, None, 48000, None).unwrap();
+    let saved = state(&mut s);
+    let mut expected = 0i32.to_le_bytes().to_vec();
+    expected.extend_from_slice(&1.0f32.to_le_bytes());
+    assert_eq!(saved, expected);
+    s.control.set_state(&saved).unwrap();
+    wait(&mut s, |m| matches!(m, Message::Ack));
+    assert_eq!(state(&mut s), saved);
+
+    let mut legacy = 27i32.to_le_bytes().to_vec();
+    legacy.extend_from_slice(&0.25f32.to_le_bytes());
+    s.control.set_state(&legacy).unwrap();
+    wait(&mut s, |m| matches!(m, Message::Ack));
+    let restored = state(&mut s);
+    assert_eq!(&restored[..4], &0i32.to_le_bytes());
+    assert_eq!(&restored[4..], &0.25f32.to_le_bytes());
+
+    let mut invalid = 0i32.to_le_bytes().to_vec();
+    invalid.extend_from_slice(&2.0f32.to_le_bytes());
+    s.control.set_state(&invalid).unwrap();
+    wait(&mut s, |m| matches!(m, Message::Fault { .. }));
+    println!("zero-program state=8 bytes, legacy program ignored, out-of-range=Fault");
+}
+
+#[test]
+#[ignore = "native fixtures required"]
+fn resize_reaches_application_floating_and_embedded() {
+    use vst_audio::{Command, Configuration, Host, HostEvent, PluginDescriptor};
+    for format in [PluginFormat::Vst2, PluginFormat::Vst3] {
+        if format == PluginFormat::Vst3 && std::env::var_os("VST_AUDIO_TEST_VST3_RESIZE").is_none()
+        {
+            continue;
+        }
+        for embedded in [false, true] {
+            #[cfg(target_os = "macos")]
+            if embedded {
+                continue;
+            }
+            let (worker, mut plugin) = paths();
+            if format == PluginFormat::Vst3 {
+                plugin = std::env::var_os("VST_AUDIO_TEST_VST3").unwrap().into();
+            }
+            let host = Host::new(worker);
+            let state = if format == PluginFormat::Vst2 {
+                vec![1, 14]
+            } else {
+                vst_audio::state::encode(&[1, 0], &[1, 0]).unwrap()
+            };
+            let instance = host
+                .spawn(
+                    &PluginDescriptor::new(plugin, format),
+                    &Configuration::default(),
+                    Some(&state),
+                )
+                .unwrap();
+            #[cfg(any(windows, target_os = "linux"))]
+            let parent = vst_audio_test_window::Parent::create(640, 480);
+            #[cfg(any(windows, target_os = "linux"))]
+            let command = if embedded {
+                Command::OpenEditorIn(parent.handle())
+            } else {
+                Command::OpenEditor
+            };
+            #[cfg(target_os = "macos")]
+            let command = Command::OpenEditor;
+            let opened = instance.controller().request(command).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let expected = if format == PluginFormat::Vst2 {
+                (500, 280)
+            } else {
+                (520, 300)
+            };
+            loop {
+                #[cfg(any(windows, target_os = "linux"))]
+                parent.pump();
+                if let Some(event) = instance.try_next_event() {
+                    match event {
+                        HostEvent::Completed { request }
+                            if request == opened && format == PluginFormat::Vst3 =>
+                        {
+                            instance
+                                .controller()
+                                .request(Command::Editor(EditorAction::Resize {
+                                    width: 400,
+                                    height: 240,
+                                }))
+                                .unwrap();
+                        }
+                        HostEvent::EditorResized { width, height } => {
+                            assert_eq!((width, height), expected);
+                            break;
+                        }
+                        HostEvent::Failed { reason } | HostEvent::RequestFailed { reason, .. } => {
+                            panic!("{reason}")
+                        }
+                        _ => {}
+                    }
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "application resize event timeout"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            instance
+                .controller()
+                .request(Command::Editor(EditorAction::Inspect))
+                .unwrap();
+            loop {
+                if let Some(HostEvent::EditorStatus { status, .. }) = instance.try_next_event() {
+                    assert_eq!((status.width, status.height), expected);
+                    break;
+                }
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            println!(
+                "{format:?} embedded={embedded}: HostEvent::EditorResized and status={expected:?}"
+            );
+        }
+    }
+}

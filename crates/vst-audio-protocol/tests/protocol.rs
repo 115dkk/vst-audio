@@ -143,6 +143,10 @@ fn codec_round_trips_every_message() {
         },
         Message::Ack,
         Message::EditorClosed,
+        Message::EditorResized {
+            width: 500,
+            height: 280,
+        },
         Message::Scan {
             path: "C:\\".to_owned() + &"a".repeat(MAX_STRING_BYTES - 3),
         },
@@ -550,4 +554,48 @@ fn the_backoff_starts_again_once_the_window_is_clear() {
     watch.process_exited(700_000, 1);
     assert_eq!(watch.tick(700_499), Action::None);
     assert_eq!(watch.tick(700_500), Action::Spawn);
+}
+
+#[test]
+fn editor_resized_rejects_out_of_range_dimensions() {
+    for (width, height) in [(0, 1), (1, 0), (8193, 1), (1, 8193), (u32::MAX, 1)] {
+        let frame = Frame {
+            flags: 0,
+            request: 0,
+            message: Message::EditorResized { width, height },
+        };
+        assert!(matches!(
+            encode_frame(&frame),
+            Err(CodecError::InvalidValue)
+        ));
+
+        let mut bytes = vec![0; 20];
+        bytes[..4].copy_from_slice(&16u32.to_le_bytes());
+        bytes[4..6].copy_from_slice(&31u16.to_le_bytes());
+        bytes[12..16].copy_from_slice(&width.to_le_bytes());
+        bytes[16..20].copy_from_slice(&height.to_le_bytes());
+        assert!(matches!(
+            decode_frame(&bytes),
+            Err(CodecError::InvalidValue)
+        ));
+    }
+}
+
+#[test]
+fn editor_resized_rejects_short_body() {
+    let bytes = encode_frame(&Frame {
+        flags: 0,
+        request: 0,
+        message: Message::EditorResized {
+            width: 500,
+            height: 280,
+        },
+    })
+    .unwrap();
+    assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 31);
+    for length in 0..8 {
+        let mut short = bytes[..12 + length].to_vec();
+        short[..4].copy_from_slice(&((8 + length) as u32).to_le_bytes());
+        assert!(decode_frame(&short).is_err());
+    }
 }

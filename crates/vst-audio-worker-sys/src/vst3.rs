@@ -61,6 +61,7 @@ pub struct Events {
     pub params: bool,
     pub latency: Option<u32>,
     pub closed: bool,
+    pub resized: Option<(u32, u32)>,
     pub fault: Option<&'static str>,
 }
 struct ModuleLibrary {
@@ -330,6 +331,7 @@ pub struct Vst3Plugin {
     info: Info,
     module: Vst3Module,
     closed_editor: bool,
+    editor_size: Option<(u32, u32)>,
     processor_taken: bool,
     max_frames: usize,
     setup: Option<vst_audio_protocol::ProcessingSetup>,
@@ -392,6 +394,7 @@ impl Vst3Plugin {
             },
             module,
             closed_editor: false,
+            editor_size: None,
             processor_taken: false,
             max_frames: 0,
             setup: None,
@@ -1132,6 +1135,7 @@ impl Vst3Plugin {
             }
             .map_err(|e| PluginError(e.to_string()))?,
         });
+        self.editor_size = Some((width as u32, height as u32));
         let frame = ComWrapper::new(Frame {
             window: window.clone(),
             #[cfg(target_os = "linux")]
@@ -1297,12 +1301,13 @@ impl Vst3Plugin {
                     .checked_sub(rect.top)
                     .filter(|v| (1..=8192).contains(v))
                     .ok_or_else(|| PluginError("invalid constrained height".into()))?;
-                // SAFETY: live view with validated writable rectangle on main thread.
-                check(unsafe { editor.view.onSize(&mut rect) }, "onSize")?;
                 editor
                     .window
                     .resize(width, height)
                     .map_err(|e| PluginError(e.to_string()))?;
+                // SAFETY: live view with validated rectangle on main thread; a reentrant
+                // resizeView now takes precedence over the initial host request.
+                check(unsafe { editor.view.onSize(&mut rect) }, "onSize")?;
             }
             A::Scale(scale) => {
                 if !scale.is_finite() || !(0.5..=4.0).contains(&scale) {
@@ -1439,7 +1444,19 @@ impl Vst3Plugin {
         } else {
             None
         };
+        let size = self
+            .editor
+            .as_ref()
+            .and_then(|editor| editor.window.status().ok())
+            .map(|(_, w, h)| (w, h));
+        let resized = if self.editor_size.is_some() && size != self.editor_size {
+            size
+        } else {
+            None
+        };
+        self.editor_size = size;
         Events {
+            resized,
             params: flags & 1 != 0,
             latency,
             closed: std::mem::take(&mut self.closed_editor),

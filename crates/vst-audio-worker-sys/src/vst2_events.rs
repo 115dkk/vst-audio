@@ -87,6 +87,7 @@ pub struct CallbackEvents {
     pub dropped: AtomicU32,
     pub base: AtomicU32,
     time: [AtomicU64; 10],
+    sequence: AtomicU64,
 }
 impl Default for CallbackEvents {
     fn default() -> Self {
@@ -95,6 +96,7 @@ impl Default for CallbackEvents {
             dropped: AtomicU32::new(0),
             base: AtomicU32::new(0),
             time: std::array::from_fn(|_| AtomicU64::new(0)),
+            sequence: AtomicU64::new(0),
         }
     }
 }
@@ -117,13 +119,26 @@ impl CallbackEvents {
             u64::from(context.denominator),
             flags,
         ];
+        self.sequence.fetch_add(1, Ordering::SeqCst);
         for (to, from) in self.time.iter().zip(values) {
-            to.store(from, Ordering::Relaxed);
+            to.store(from, Ordering::SeqCst);
         }
+        self.sequence.fetch_add(1, Ordering::SeqCst);
     }
     pub fn time_pointer(&self) -> isize {
         TIME.with(|cell| {
-            let f = |i: usize| f64::from_bits(self.time[i].load(Ordering::Relaxed));
+            let values = loop {
+                let before = self.sequence.load(Ordering::SeqCst);
+                if before & 1 != 0 {
+                    continue;
+                }
+                let values: [u64; 10] =
+                    std::array::from_fn(|i| self.time[i].load(Ordering::SeqCst));
+                if before == self.sequence.load(Ordering::SeqCst) {
+                    break values;
+                }
+            };
+            let f = |i: usize| f64::from_bits(values[i]);
             let value = TimeInfo {
                 sample_position: f(0),
                 sample_rate: f(1),
@@ -132,9 +147,9 @@ impl CallbackEvents {
                 bar: f(4),
                 cycle_start: f(5),
                 cycle_end: f(6),
-                numerator: self.time[7].load(Ordering::Relaxed) as i32,
-                denominator: self.time[8].load(Ordering::Relaxed) as i32,
-                flags: self.time[9].load(Ordering::Relaxed) as i32,
+                numerator: values[7] as i32,
+                denominator: values[8] as i32,
+                flags: values[9] as i32,
                 ..TimeInfo::default()
             };
             // SAFETY: thread-local plain value, accessed only in this callback;

@@ -1,16 +1,20 @@
 #![allow(unsafe_code)]
-use std::ffi::c_void;
+use std::{
+    cell::UnsafeCell,
+    ffi::c_void,
+    sync::atomic::{AtomicBool, AtomicU32, Ordering},
+};
 use vst_audio_worker_sys::vst2::*;
 
 #[repr(C)]
 struct Instance {
     effect: AEffect,
     host: Callback,
-    chunk: [u8; 2],
-    width: f32,
-    gate: f64,
+    chunk: UnsafeCell<[u8; 2]>,
+    width: AtomicU32,
+    gate: UnsafeCell<f64>,
     events: vst_audio_worker_sys::vst2_events::CallbackEvents,
-    active: bool,
+    active: AtomicBool,
     input: Arrangement,
     output: Arrangement,
     rect: Rect,
@@ -38,11 +42,11 @@ pub extern "C" fn VSTPluginMain(host: Callback) -> *mut AEffect {
             ..AEffect::default()
         },
         host,
-        chunk: [1, 0],
-        width: 1.0,
-        gate: 0.0,
+        chunk: UnsafeCell::new([1, 0]),
+        width: AtomicU32::new(1.0f32.to_bits()),
+        gate: UnsafeCell::new(0.0),
         events: Default::default(),
-        active: false,
+        active: AtomicBool::new(false),
         input: Arrangement::new(0, &[]),
         output: Arrangement::new(ARR_STEREO, &[1, 2]),
         rect: Rect {
@@ -71,14 +75,13 @@ unsafe extern "C" fn dispatch(
         drop(unsafe { Box::from_raw(effect.cast::<Instance>()) });
         return 1;
     }
-    // SAFETY: host serializes dispatch/state with processing and effect points to our instance.
-    let instance = unsafe { &mut *effect.cast::<Instance>() };
+    // SAFETY: header is immutable after entry; mutable fields use atomics or thread-owned UnsafeCell.
+    let instance = unsafe { &*effect.cast::<Instance>() };
     match opcode {
         25 => {
             // SAFETY: processEvents carries a valid native list, copied into a bounded fixture queue.
             unsafe { instance.events.receive(pointer) };
             let callback = instance.host;
-            let effect = std::ptr::addr_of_mut!(instance.effect);
             // SAFETY: synchronous echo while caller-owned event data is still live.
             unsafe { callback(effect, 8, 0, 0, pointer, 0.0) };
             1
@@ -87,7 +90,7 @@ unsafe extern "C" fn dispatch(
         | EDIT_CLOSE | EDIT_IDLE | SET_PROGRAM => 1,
         GET_PROGRAM => 0,
         MAINS_CHANGED => {
-            instance.active = value != 0;
+            instance.active.store(value != 0, Ordering::Relaxed);
             1
         }
         GET_EFFECT_NAME | GET_VENDOR_STRING | PARAM_NAME => {
@@ -108,9 +111,13 @@ unsafe extern "C" fn dispatch(
                 return 0;
             }
             // SAFETY: opcode supplies an input arrangement pointer-out in value.
-            unsafe { *(value as *mut *mut Arrangement) = &mut instance.input };
+            unsafe {
+                *(value as *mut *mut Arrangement) = std::ptr::addr_of!(instance.input).cast_mut()
+            };
             // SAFETY: opcode supplies an output arrangement pointer-out in pointer.
-            unsafe { *pointer.cast::<*mut Arrangement>() = &mut instance.output };
+            unsafe {
+                *pointer.cast::<*mut Arrangement>() = std::ptr::addr_of!(instance.output).cast_mut()
+            };
             1
         }
         SET_SPEAKER_ARRANGEMENT => 1,
@@ -119,7 +126,7 @@ unsafe extern "C" fn dispatch(
                 return 0;
             }
             // SAFETY: GET_CHUNK supplies a pointer-out; chunk remains live until next state call.
-            unsafe { *pointer.cast::<*const u8>() = instance.chunk.as_ptr() };
+            unsafe { *pointer.cast::<*const u8>() = instance.chunk.get().cast::<u8>() };
             2
         }
         SET_CHUNK => {
@@ -134,7 +141,8 @@ unsafe extern "C" fn dispatch(
             if chunk[1] == 4 {
                 std::process::abort();
             }
-            instance.chunk.copy_from_slice(chunk);
+            // SAFETY: chunk writes are gated and only the control thread reads the chunk.
+            unsafe { *instance.chunk.get() = [chunk[0], chunk[1]] };
             1
         }
         EDIT_GET_RECT => {
@@ -142,7 +150,7 @@ unsafe extern "C" fn dispatch(
                 return 0;
             }
             // SAFETY: EDIT_GET_RECT supplies a rectangle pointer-out.
-            unsafe { *pointer.cast::<*mut Rect>() = &mut instance.rect };
+            unsafe { *pointer.cast::<*mut Rect>() = std::ptr::addr_of!(instance.rect).cast_mut() };
             1
         }
         _ => 0,
@@ -152,9 +160,11 @@ unsafe extern "C" fn set_parameter(effect: *mut AEffect, index: u32, value: f32)
     if effect.is_null() || index != 0 {
         return;
     }
-    // SAFETY: host serializes parameter changes with processing; effect is our live instance.
-    let instance = unsafe { &mut *effect.cast::<Instance>() };
-    instance.width = value.clamp(0.0, 1.0);
+    // SAFETY: parameter storage is atomic; immutable instance header stays live.
+    let instance = unsafe { &*effect.cast::<Instance>() };
+    instance
+        .width
+        .store(value.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
     let host = instance.host;
     // SAFETY: callback belongs to the host that created this instance; no pointer payload.
     unsafe { host(effect, MASTER_AUTOMATE, 0, 0, std::ptr::null_mut(), value) };
@@ -164,7 +174,7 @@ unsafe extern "C" fn get_parameter(effect: *mut AEffect, index: u32) -> f32 {
         return 0.0;
     }
     // SAFETY: host serializes parameter access; effect is our live instance.
-    unsafe { (*effect.cast::<Instance>()).width }
+    f32::from_bits(unsafe { &(*effect.cast::<Instance>()).width }.load(Ordering::Relaxed))
 }
 unsafe extern "C" fn process(
     effect: *mut AEffect,
@@ -201,10 +211,11 @@ unsafe fn render<T: Sample>(effect: *mut AEffect, outputs: *mut *mut T, frames: 
     if effect.is_null() || outputs.is_null() || frames <= 0 {
         return;
     }
-    // SAFETY: exclusive processor call owns the live fixture instance.
-    let instance = unsafe { &mut *effect.cast::<Instance>() };
+    // SAFETY: immutable header is shared; only this processor accesses the audio gate.
+    let instance = unsafe { &*effect.cast::<Instance>() };
+    // SAFETY: gate is exclusively owned by the unique audio processor.
+    let gate = unsafe { &mut *instance.gate.get() };
     let callback = instance.host;
-    let effect = std::ptr::addr_of_mut!(instance.effect);
     // SAFETY: time callback returns a readable host time record until its next time query.
     let time = unsafe { callback(effect, 7, 0, 0, std::ptr::null_mut(), 0.0) };
     let position = if time == 0 {
@@ -225,15 +236,17 @@ unsafe fn render<T: Sample>(effect: *mut AEffect, outputs: *mut *mut T, frames: 
         {
             if let vst_audio_ring::EventData::Midi([status, _, velocity]) = event.data {
                 match status & 0xf0 {
-                    0x90 => instance.gate = f64::from(velocity) / 127.0,
-                    0x80 => instance.gate = 0.0,
+                    0x90 => *gate = f64::from(velocity) / 127.0,
+                    0x80 => *gate = 0.0,
                     _ => {}
                 }
             }
         }
         let values = [
-            0.123456789012345 * instance.gate * f64::from(instance.width),
-            (position + frame as f64) * 0.000001 * instance.gate,
+            0.123456789012345
+                * *gate
+                * f64::from(f32::from_bits(instance.width.load(Ordering::Relaxed))),
+            (position + frame as f64) * 0.000001 * *gate,
         ];
         for channel in 0..2 {
             // SAFETY: frame lies in the host's declared output span.

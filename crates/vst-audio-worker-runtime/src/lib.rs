@@ -20,6 +20,7 @@ pub struct PluginEvents {
     pub params_changed: bool,
     pub latency_changed: Option<u32>,
     pub editor_closed: bool,
+    pub editor_resized: Option<(u32, u32)>,
     pub fault: Option<&'static str>,
 }
 

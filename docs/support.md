@@ -16,7 +16,7 @@ from this repository. Required CI executes the implementation on Windows x64, Li
 | Parameters | Paged IDs, values, steps, units and read-only/automatable/hidden attributes; invalid and read-only edits return errors |
 | Editors | Floating worker-owned windows; open, hide, show, focus, close, status and bounded native-view capture |
 | Editor embedding | Worker-owned child of an application HWND or X11 window; parent destruction closes only the editor. Linux x86_64/X11 VST2/VST3 parent pixels, lifecycle and default sandbox and Windows x64 VST2/VST3 parent pixels and lifecycle are native-tested. Windows refuses a sandboxed (AppContainer) worker's child under the application window: that request fails explicitly, so sandboxed Windows editors float. Mixed DPI is untested. macOS returns explicit unsupported; no floating fallback |
-| Editor negotiation | VST3 constrained resize and optional content-scale interface; VST2 returns explicit unsupported results for host-driven resize/scale |
+| Editor negotiation | VST3 constrained resize and optional content-scale interface; VST2 post-open sizing and plugin sizeWindow. Both formats emit coalesced EditorResized with actual dimensions, floating and embedded. VST2 host-driven resize/scale remains unsupported |
 | GUI consumers | Separate egui and iced example workspace; the same IPC API runs each editor lifecycle on all four native targets |
 | Linux Wayland editor | Native VST 3 floating view, shared host display, xdg-shell, shm background, optional decoration/activation, logical resize and integer output scale. Tested on Weston 13 headless/pixman at scales 1 and 2, with and without default sandbox. Hide tears down the view; Show recreates it. Capture and embedding unsupported; other compositors unverified |
 | Private Xwayland editor | Planned, not implemented; no public selection value. Auto stops after native Wayland/session X |
@@ -156,3 +156,25 @@ replace manual accessibility, keyboard/IME or broad third-party UI testing.
 Hosted runners do not certify device latency, dropout rates on physical audio
 hardware or universal plugin compatibility. macOS artifacts are ad-hoc signed;
 production signing/notarization is described in [distribution](distribution.md).
+
+## VST 2 hardening scope
+
+Shell scan/child selection, truthful canDo, coherent pre-processing time snapshots,
+post-OPEN metadata, lifecycle latency refresh, parameter refresh notifications,
+and restart-required structural IO changes are implemented. Explicit mono,
+stereo and 5.1 arrangements are negotiated; other non-default masks are rejected,
+not silently accepted. An unspecified layout retains the declaration. VST3's
+general speaker-mask support should not be inferred for VST2.
+
+Linux/X11 fixture tests cover shell child gains, latency changes, state round trips,
+OPEN-time channel changes, editor sizing, floating/embedded resize notifications,
+and continued DSP during a 300ms editor idle. Windows/macOS have compile checks;
+these new behaviors still require their native CI runs. Incompatible-count tests
+prove fault/rejected DSP; automatic replacement is provided by existing supervision,
+not a newly verified layout-recovery scenario in these tests.
+
+VST2 edit gestures on the application protocol, plugin-formatted display strings,
+program listing/selection, tail length and native bypass remain outside this
+scope. Non-chunk state contains only the current program's values, not a complete
+bank; chunks are bounded to slightly under 64 MiB. OPEN gets the host default
+48 kHz because configuration arrives later; resume gets the configured rate.

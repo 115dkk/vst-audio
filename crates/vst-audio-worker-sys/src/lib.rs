@@ -60,3 +60,5 @@ pub(crate) fn native_editor_platform() -> vst_audio_protocol::EditorPlatform {
 pub mod vst2_events;
 
 mod vst3_events;
+
+mod editor_probe;

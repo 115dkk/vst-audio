@@ -348,6 +348,9 @@ pub(crate) fn supervise(
                                     );
                                 }
                             }
+                            Message::EditorResized { width, height } => {
+                                emit(&events, &shared, HostEvent::EditorResized { width, height })
+                            }
                             Message::EditorClosed => {
                                 emit(&events, &shared, HostEvent::EditorClosed)
                             }

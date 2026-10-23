@@ -307,6 +307,10 @@ pub enum HostEvent {
         image: vst_audio_protocol::EditorImage,
     },
     EditorClosed,
+    EditorResized {
+        width: u32,
+        height: u32,
+    },
     ParametersChanged,
     LatencyChanged(u32),
     RequestFailed {

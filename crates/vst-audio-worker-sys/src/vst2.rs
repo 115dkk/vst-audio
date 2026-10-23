@@ -20,6 +20,7 @@ use std::ffi::c_void;
 pub const MAGIC: i32 = i32::from_be_bytes(*b"VstP");
 pub const HAS_EDITOR: i32 = 1;
 pub const REPLACING: i32 = 1 << 4;
+pub const DOUBLE_REPLACING: i32 = 1 << 12;
 pub const PROGRAM_CHUNKS: i32 = 1 << 5;
 pub const OPEN: i32 = 0;
 pub const CLOSE: i32 = 1;
@@ -60,7 +61,7 @@ pub type GetParameter = unsafe extern "C" fn(*mut AEffect, u32) -> f32;
 pub type Entry = unsafe extern "C" fn(Callback) -> *mut AEffect;
 
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct AEffect {
     pub magic: i32,
     pub dispatcher: Option<Callback>,

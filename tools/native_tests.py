@@ -28,6 +28,20 @@ run("cargo", "test", "--locked", "-p", "vst-audio", "--test", "stress", "--", "-
 run("cargo", "test", "--locked", "-p", "vst-audio", "--test", "embedding",
     "--", "--ignored", "--nocapture", "--test-threads=1", env=env)
 
+run("cargo", "test", "--locked", "-p", "vst-audio", "--test", "vst2_hardening",
+    "--", "--ignored", "--nocapture", "--test-threads=1", env=env)
+for variable, test in [("VST_AUDIO_TEST_CONFIGURE_LATENCY", "callbacks_time_latency_and_opaque_state"),
+                       ("VST_AUDIO_TEST_SHELL", "shell_children"),
+                       ("VST_AUDIO_TEST_VST3_RESIZE", "resize_reaches_application_floating_and_embedded"),
+                       ("VST_AUDIO_TEST_NO_CHUNKS", "zero_program_parameter_state"),
+                       ("VST_AUDIO_TEST_OPEN_COUNTS", "callbacks_time_latency_and_opaque_state")]:
+    run("cargo", "test", "--locked", "-p", "vst-audio", "--test", "vst2_hardening", test,
+        "--", "--ignored", "--nocapture", "--test-threads=1", env=dict(env, **{variable: "1"}))
+for count in (1024, 1025):
+    run("cargo", "test", "--locked", "-p", "vst-audio", "--test", "vst2_hardening", "shell_child_limit",
+        "--", "--ignored", "--nocapture", "--test-threads=1",
+        env=dict(env, VST_AUDIO_TEST_SHELL="1", VST_AUDIO_TEST_SHELL_CHILDREN=str(count)))
+
 # Reserve a loopback probe port and let the Rust test own the listener. A separate
 # environment keeps probe inputs out of unrelated worker tests.
 import socket

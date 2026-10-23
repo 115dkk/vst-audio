@@ -470,7 +470,7 @@ impl IEditControllerTrait for Matrix {
             counts[0] += 1;
             self.lifecycle.set(counts);
         }
-        ComWrapper::new(View {
+        let wrapper = ComWrapper::new(View {
             #[cfg(target_os = "linux")]
             lifecycle: self.lifecycle.clone(),
             canvas: std::cell::RefCell::new(None),
@@ -481,10 +481,12 @@ impl IEditControllerTrait for Matrix {
             context: self.context.borrow().clone(),
             #[cfg(target_os = "linux")]
             wayland: RefCell::new(None),
-        })
-        .to_com_ptr::<IPlugView>()
-        .expect("view interface")
-        .into_raw()
+            frame: std::cell::RefCell::new(None),
+            view_pointer: std::cell::Cell::new(std::ptr::null_mut()),
+        });
+        let view = wrapper.to_com_ptr::<IPlugView>().expect("view interface");
+        wrapper.view_pointer.set(view.as_ptr());
+        view.into_raw()
     }
 }
 struct View {
@@ -498,6 +500,8 @@ struct View {
     context: Option<ComPtr<IHostApplication>>,
     #[cfg(target_os = "linux")]
     wayland: RefCell<Option<crate::wayland::Canvas>>,
+    frame: std::cell::RefCell<Option<ComPtr<IPlugFrame>>>,
+    view_pointer: std::cell::Cell<*mut IPlugView>,
 }
 #[cfg(target_os = "linux")]
 impl Drop for View {
@@ -630,12 +634,28 @@ impl IPlugViewTrait for View {
         {
             return kResultFalse;
         }
+        // Host rectangles may carry this fixture's non-zero origin; compare the width.
+        if std::env::var_os("VST_AUDIO_TEST_VST3_RESIZE").is_some()
+            && rect.right - rect.left == 400
+            && let Some(frame) = self.frame.borrow().as_ref()
+        {
+            let mut requested = ViewRect {
+                left: 0,
+                top: 0,
+                right: 520,
+                bottom: 300,
+            };
+            // SAFETY: retained main-thread frame, live writable rectangle. view pointer is borrowed from this live COM wrapper.
+            let _ = unsafe { frame.resizeView(self.view_pointer.get(), &mut requested) };
+        }
         kResultOk
     }
     unsafe fn onFocus(&self, _: TBool) -> tresult {
         kResultOk
     }
     unsafe fn setFrame(&self, _frame: *mut IPlugFrame) -> tresult {
+        // SAFETY: borrowed SDK frame pointer; retain until detached.
+        *self.frame.borrow_mut() = unsafe { ComRef::from_raw(_frame) }.map(|f| f.to_com_ptr());
         #[cfg(target_os = "linux")]
         if !_frame.is_null() {
             // SAFETY: setFrame provides a live frame, or null during detach.

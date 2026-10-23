@@ -134,6 +134,7 @@ impl Plugin for Vst3 {
             params_changed: events.params,
             latency_changed: events.latency,
             editor_closed: events.closed,
+            editor_resized: events.resized,
             fault: events.fault,
         }
     }

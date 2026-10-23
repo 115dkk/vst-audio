@@ -203,3 +203,89 @@ supports it, and recovery keeps the selected worker path.
 Startup negotiates protocol/version, without requiring matching architectures.
 Cargo dependencies alone do not install executables. Development ad-hoc signing
 and production Developer ID signing/notarization are separate paths.
+
+## VST 2 ABI and concurrency
+
+Definitions originate in the pinned BSD-3-Clause Xaymar clean-room header named
+in NOTICE, not Steinberg's VST 2 SDK. Three intentional ABI differences follow
+the pinned ISC DPF wrapper: plugin-to-host events use opcode **8**, event pointers
+are inline immediately after the event-list header, and callback integers use
+pointer-width `isize`. DPF MIDI Through and native i686 interoperability are the
+regression evidence for retaining those choices.
+
+The main-thread wrapper and the unique audio processor share only immutable
+copied entry pointers/metadata and atomic callback state. They never hold a Rust
+reference to the foreign effect across a foreign call. Foreign plugins must
+synchronize their own UI/DSP state, as required by the VST 2 concurrent-call
+contract. Test fixtures likewise split UI-only and audio-only storage and use
+atomic parameters. Admission is non-waiting on audio; only control waits for the
+in-flight processing call.
+
+| Calls | Close audio admission? |
+|---|---|
+| OPEN, CLOSE, SET_SAMPLE_RATE, SET_BLOCK_SIZE, MAINS_CHANGED | Yes |
+| PROCESS_BEGIN/END, SET_SPEAKER_ARRANGEMENT, precision (77) | Yes |
+| SET_CHUNK, SET_PROGRAM, post-lifecycle/header revalidation | Yes |
+| Native editor pump, EDIT_OPEN/CLOSE/IDLE/GET_RECT | No |
+| Parameter name/value/label queries and setParameter | No |
+| GET_CHUNK, GET_PROGRAM, capability/category queries | No |
+
+`ioChanged` atomically suspends new processing admission until the next control
+pass re-reads input/output/parameter counts and latency. A latency-only change
+emits `LatencyChanged` and resumes processing; a count change permanently rejects
+processing and emits a restart-required Fault. The same check follows state,
+configuration and resume. OPEN's final counts/flags become the execution snapshot.
+The callback acknowledges that latency changes can be handled, **not** arbitrary
+IO changes. `acceptIOChanges` is not advertised. A callback during an in-flight
+foreign call cannot revoke that call; plugins must not start accessing an enlarged
+buffer in the middle of that call.
+
+Time records are initialized to stopped 48 kHz, 120 BPM, 4/4 before OPEN and reset
+to the configured rate before rate/block callbacks. OPEN precedes Configure on
+the wire, so it cannot know a future non-default sample rate. A sequence counter
+around atomic fields gives coherent cross-thread snapshots. Its only writer is
+the gated control thread before processing, then the audio thread; audio callback
+reads cannot overlap another writer. Constant-initialized TLS identifies audio
+(realtime 2/offline 4) versus other threads (1).
+
+Host canDo returns 1 only for `sendVstEvents`, `sendVstMidiEvent`,
+`receiveVstEvents`, `receiveVstMidiEvent`, `sendVstTimeInfo`, `sizeWindow`,
+`startStopProcess`, `shellCategory`. All others, including `acceptIOChanges`,
+`offline`, file selectors, `editFile`, `reportConnectionChanges` and
+`sendVstMidiEventFlagIsRealtime`, return 0. Input strings are bounded to 128 bytes.
+Events mean MIDI and bounded SysEx, not every historical VST event type.
+`updateDisplay` and endEdit coalesce into `ParamsChanged`; gesture boundaries do
+not cross the protocol yet.
+
+Shell enumeration is bounded to 1024 entries. A child class ID is `b"VST2"` +
+its signed unique ID's four big-endian bytes + eight zero bytes. Non-shell class
+IDs remain all zero. Entry-time currentEffectID uses TLS even without an effect
+pointer; the returned child's unique ID must match. The effect canDo helper
+preserves yes/unknown/no, independently of category-based shell detection.
+
+A layout identical to the loaded declaration is retained without renegotiation
+(the app echoes this by default, and DPF Latency does not implement opcode 42).
+Changed explicit mono (mask 4, speaker 0), stereo (mask 3, speakers 1/2), and 5.1
+(mask 63, speakers 1..6) requests use effect opcode 42; an absent direction uses
+an empty arrangement. Rejection fails setup. Other explicit masks fail with an
+unavailable-layout error. Both masks zero retain the declared default without
+requesting a new layout. Processing precision requires both its flag and pointer.
+
+VST 2 chunks are opaque, including `SSV3` prefixes. The caller already selects
+PluginFormat and class on Load, and recovery retains that descriptor; payload
+sniffing cannot reliably establish format. Callers must associate exported state
+with its original plugin/format. Non-chunk state is always `[program i32 LE,
+parameters f32 LE...]`; zero-program plugins store zero and ignore that field on
+restore. All normalized values are validated before modifying the plugin.
+
+`sizeWindow` atomically publishes one packed width/height pair, only while an
+editor is opening/open. UI-thread resize failures are diagnostic; status and
+`EditorResized` (kind 31, request 0) use actual native dimensions. VST3 dimensions
+are sampled on the control loop so `IPlugFrame::resizeView` also reaches the app,
+without changing the frame implementation. Notifications coalesce, not a history
+of intermediate sizes. A zero VST2 EDIT_OPEN reply is accepted only if a native
+child HWND/X11 window/NSView exists. Post-open GET_RECT corrects initial size.
+Host directory pointers last through CLOSE: UTF-8 on Unix and Windows ACP narrow
+strings (unrepresentable Windows paths fail rather than return a wrong path).
+The clean-room header specifies only `char*` on Windows, not an encoding;
+ACP is the explicit legacy Windows policy, not a claim of universal UTF-8 support.

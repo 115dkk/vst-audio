@@ -175,6 +175,10 @@ pub enum Message {
     Ack,
     /// The editor window was closed by the user.
     EditorClosed,
+    EditorResized {
+        width: u32,
+        height: u32,
+    },
 }
 
 impl Message {
@@ -219,6 +223,7 @@ impl Message {
             Self::Fault { .. } => 15,
             Self::Ack => 16,
             Self::EditorClosed => 17,
+            Self::EditorResized { .. } => 31,
         }
     }
 }
@@ -457,6 +462,13 @@ fn encode_message(message: &Message, out: &mut Vec<u8>) -> Result<(), CodecError
             }
         }
         Message::LatencyChanged { frames } => put_u32(out, *frames),
+        Message::EditorResized { width, height } => {
+            if !(1..=8192).contains(width) || !(1..=8192).contains(height) {
+                return Err(CodecError::InvalidValue);
+            }
+            put_u32(out, *width);
+            put_u32(out, *height);
+        }
         Message::Editor(action) => match action {
             EditorAction::Show => out.push(0),
             EditorAction::Hide => out.push(1),
@@ -664,6 +676,14 @@ fn decode_message(kind: u16, body: &[u8]) -> Result<Option<Message>, CodecError>
         },
         16 => Message::Ack,
         17 => Message::EditorClosed,
+        31 => {
+            let width = cursor.u32()?;
+            let height = cursor.u32()?;
+            if !(1..=8192).contains(&width) || !(1..=8192).contains(&height) {
+                return Err(CodecError::InvalidValue);
+            }
+            Message::EditorResized { width, height }
+        }
         18 => Message::CloseEditor,
         26 => Message::Editor(match cursor.u8()? {
             0 => EditorAction::Show,
