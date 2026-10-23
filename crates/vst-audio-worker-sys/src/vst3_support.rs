@@ -1,9 +1,15 @@
-#![allow(unsafe_code, non_snake_case)]
+#![allow(
+    unsafe_code,
+    non_snake_case,
+    clippy::multiple_unsafe_ops_per_block,
+    clippy::undocumented_unsafe_blocks
+)]
 //! Host-owned COM objects. Controller callbacks are UI-thread-only (SDK threading model).
 use crate::{editor::EditorWindow, state_buffer::StateBuffer};
 use std::{
     cell::Cell,
-    ffi::c_void,
+    collections::HashMap,
+    ffi::{c_char, c_void},
     io::{Read, Seek, SeekFrom, Write},
     rc::Rc,
     sync::{
@@ -131,6 +137,313 @@ impl Edits {
         Some(edit)
     }
 }
+const ATTRIBUTE_ENTRY_LIMIT: usize = 1024;
+const ATTRIBUTE_VALUE_LIMIT: usize = 16 * 1024 * 1024;
+const ATTRIBUTE_TOTAL_LIMIT: usize = 64 * 1024 * 1024;
+
+enum AttributeValue {
+    Int(i64),
+    Float(f64),
+    String(Vec<TChar>),
+    Binary(Vec<u8>),
+}
+impl AttributeValue {
+    fn size(&self) -> usize {
+        match self {
+            Self::Int(_) | Self::Float(_) => 8,
+            Self::String(value) => value.len() * std::mem::size_of::<TChar>(),
+            Self::Binary(value) => value.len(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct AttributeStorage {
+    values: HashMap<Vec<u8>, AttributeValue>,
+    bytes: usize,
+}
+
+#[derive(Default)]
+pub(crate) struct HostAttributeList(Mutex<AttributeStorage>);
+impl Class for HostAttributeList {
+    type Interfaces = (IAttributeList,);
+}
+impl HostAttributeList {
+    unsafe fn key(id: IAttributeList_::AttrID) -> Result<Vec<u8>, tresult> {
+        if id.is_null() {
+            return Err(kInvalidArgument);
+        }
+        // SAFETY: the SDK contract requires AttrID to point to a terminated byte string.
+        let bytes = unsafe { std::ffi::CStr::from_ptr(id) }.to_bytes();
+        if bytes.len() > ATTRIBUTE_VALUE_LIMIT {
+            return Err(kOutOfMemory);
+        }
+        let mut key = Vec::new();
+        key.try_reserve_exact(bytes.len())
+            .map_err(|_| kOutOfMemory)?;
+        key.extend_from_slice(bytes);
+        Ok(key)
+    }
+
+    fn set(&self, key: Vec<u8>, value: AttributeValue) -> tresult {
+        if value.size() > ATTRIBUTE_VALUE_LIMIT {
+            return kOutOfMemory;
+        }
+        let Ok(mut storage) = self.0.lock() else {
+            return kResultFalse;
+        };
+        let existing = storage.values.get(&key);
+        let previous = existing.map_or(0, |value| key.len() + value.size());
+        if existing.is_none() {
+            if storage.values.len() >= ATTRIBUTE_ENTRY_LIMIT {
+                return kOutOfMemory;
+            }
+            if storage.values.try_reserve(1).is_err() {
+                return kOutOfMemory;
+            }
+        }
+        let Some(bytes) = storage
+            .bytes
+            .checked_sub(previous)
+            .and_then(|bytes| bytes.checked_add(key.len()))
+            .and_then(|bytes| bytes.checked_add(value.size()))
+        else {
+            return kOutOfMemory;
+        };
+        if bytes > ATTRIBUTE_TOTAL_LIMIT {
+            return kOutOfMemory;
+        }
+        storage.values.insert(key, value);
+        storage.bytes = bytes;
+        kResultOk
+    }
+}
+impl IAttributeListTrait for HostAttributeList {
+    unsafe fn setInt(&self, id: IAttributeList_::AttrID, value: i64) -> tresult {
+        // SAFETY: forwarded SDK AttrID follows the interface contract.
+        let key = match unsafe { Self::key(id) } {
+            Ok(key) => key,
+            Err(result) => return result,
+        };
+        self.set(key, AttributeValue::Int(value))
+    }
+
+    unsafe fn getInt(&self, id: IAttributeList_::AttrID, value: *mut i64) -> tresult {
+        if value.is_null() {
+            return kInvalidArgument;
+        }
+        // SAFETY: forwarded SDK AttrID follows the interface contract.
+        let key = match unsafe { Self::key(id) } {
+            Ok(key) => key,
+            Err(result) => return result,
+        };
+        let Ok(storage) = self.0.lock() else {
+            return kResultFalse;
+        };
+        let Some(AttributeValue::Int(stored)) = storage.values.get(&key) else {
+            return kResultFalse;
+        };
+        // SAFETY: caller supplied the required writable scalar output.
+        unsafe { *value = *stored };
+        kResultOk
+    }
+
+    unsafe fn setFloat(&self, id: IAttributeList_::AttrID, value: f64) -> tresult {
+        // SAFETY: forwarded SDK AttrID follows the interface contract.
+        let key = match unsafe { Self::key(id) } {
+            Ok(key) => key,
+            Err(result) => return result,
+        };
+        self.set(key, AttributeValue::Float(value))
+    }
+
+    unsafe fn getFloat(&self, id: IAttributeList_::AttrID, value: *mut f64) -> tresult {
+        if value.is_null() {
+            return kInvalidArgument;
+        }
+        // SAFETY: forwarded SDK AttrID follows the interface contract.
+        let key = match unsafe { Self::key(id) } {
+            Ok(key) => key,
+            Err(result) => return result,
+        };
+        let Ok(storage) = self.0.lock() else {
+            return kResultFalse;
+        };
+        let Some(AttributeValue::Float(stored)) = storage.values.get(&key) else {
+            return kResultFalse;
+        };
+        // SAFETY: caller supplied the required writable scalar output.
+        unsafe { *value = *stored };
+        kResultOk
+    }
+
+    unsafe fn setString(&self, id: IAttributeList_::AttrID, string: *const TChar) -> tresult {
+        if string.is_null() {
+            return kInvalidArgument;
+        }
+        // SAFETY: forwarded SDK AttrID follows the interface contract.
+        let key = match unsafe { Self::key(id) } {
+            Ok(key) => key,
+            Err(result) => return result,
+        };
+        let mut length = 0usize;
+        loop {
+            if length >= ATTRIBUTE_VALUE_LIMIT / std::mem::size_of::<TChar>() {
+                return kOutOfMemory;
+            }
+            // SAFETY: the SDK contract requires a terminated TChar string.
+            let current = unsafe { string.add(length) };
+            // SAFETY: current points to the next code unit required by that contract.
+            if unsafe { *current } == 0 {
+                break;
+            }
+            length += 1;
+        }
+        let mut stored = Vec::new();
+        if stored.try_reserve_exact(length + 1).is_err() {
+            return kOutOfMemory;
+        }
+        // SAFETY: the scan above established length readable code units plus the terminator.
+        stored.extend_from_slice(unsafe { std::slice::from_raw_parts(string, length + 1) });
+        self.set(key, AttributeValue::String(stored))
+    }
+
+    unsafe fn getString(
+        &self,
+        id: IAttributeList_::AttrID,
+        string: *mut TChar,
+        sizeInBytes: u32,
+    ) -> tresult {
+        if string.is_null() || sizeInBytes < std::mem::size_of::<TChar>() as u32 {
+            return kInvalidArgument;
+        }
+        // SAFETY: forwarded SDK AttrID follows the interface contract.
+        let key = match unsafe { Self::key(id) } {
+            Ok(key) => key,
+            Err(result) => return result,
+        };
+        let Ok(storage) = self.0.lock() else {
+            return kResultFalse;
+        };
+        let Some(AttributeValue::String(stored)) = storage.values.get(&key) else {
+            return kResultFalse;
+        };
+        let capacity = sizeInBytes as usize / std::mem::size_of::<TChar>();
+        let copied = stored.len().saturating_sub(1).min(capacity - 1);
+        // SAFETY: caller supplied sizeInBytes writable bytes; copied is within that capacity.
+        unsafe { std::ptr::copy_nonoverlapping(stored.as_ptr(), string, copied) };
+        // SAFETY: capacity is at least one and copied is strictly below capacity.
+        let terminator = unsafe { string.add(copied) };
+        // SAFETY: terminator points within the caller-provided writable buffer.
+        unsafe { *terminator = 0 };
+        kResultOk
+    }
+
+    unsafe fn setBinary(
+        &self,
+        id: IAttributeList_::AttrID,
+        data: *const c_void,
+        sizeInBytes: u32,
+    ) -> tresult {
+        if data.is_null() {
+            return kInvalidArgument;
+        }
+        let size = sizeInBytes as usize;
+        if size > ATTRIBUTE_VALUE_LIMIT {
+            return kOutOfMemory;
+        }
+        // SAFETY: forwarded SDK AttrID follows the interface contract.
+        let key = match unsafe { Self::key(id) } {
+            Ok(key) => key,
+            Err(result) => return result,
+        };
+        let mut stored = Vec::new();
+        if stored.try_reserve_exact(size).is_err() {
+            return kOutOfMemory;
+        }
+        // SAFETY: caller supplies sizeInBytes readable bytes for this synchronous copy.
+        stored.extend_from_slice(unsafe { std::slice::from_raw_parts(data.cast(), size) });
+        self.set(key, AttributeValue::Binary(stored))
+    }
+
+    unsafe fn getBinary(
+        &self,
+        id: IAttributeList_::AttrID,
+        data: *mut *const c_void,
+        sizeInBytes: *mut u32,
+    ) -> tresult {
+        if data.is_null() || sizeInBytes.is_null() {
+            return kInvalidArgument;
+        }
+        // SAFETY: forwarded SDK AttrID follows the interface contract.
+        let key = match unsafe { Self::key(id) } {
+            Ok(key) => key,
+            Err(result) => return result,
+        };
+        let Ok(storage) = self.0.lock() else {
+            return kResultFalse;
+        };
+        let Some(AttributeValue::Binary(stored)) = storage.values.get(&key) else {
+            return kResultFalse;
+        };
+        // SAFETY: caller supplied both required writable outputs. Vec storage remains
+        // allocated until this key is replaced or the attribute list is released.
+        unsafe { *data = stored.as_ptr().cast() };
+        // SAFETY: caller supplied a writable size output.
+        unsafe { *sizeInBytes = stored.len() as u32 };
+        kResultOk
+    }
+}
+
+pub(crate) struct HostMessage {
+    id: Mutex<Option<Vec<c_char>>>,
+    attributes: vst3::ComPtr<IAttributeList>,
+}
+impl HostMessage {
+    fn new() -> Self {
+        let attributes = ComWrapper::new(HostAttributeList::default())
+            .to_com_ptr::<IAttributeList>()
+            .expect("attribute list interface");
+        Self {
+            id: Mutex::new(None),
+            attributes,
+        }
+    }
+}
+impl Class for HostMessage {
+    type Interfaces = (IMessage,);
+}
+impl IMessageTrait for HostMessage {
+    unsafe fn getMessageID(&self) -> FIDString {
+        let Ok(id) = self.id.lock() else {
+            return std::ptr::null();
+        };
+        id.as_ref().map_or(std::ptr::null(), |id| id.as_ptr())
+    }
+
+    unsafe fn setMessageID(&self, id: FIDString) {
+        let Ok(mut stored) = self.id.lock() else {
+            return;
+        };
+        if id.is_null() {
+            *stored = None;
+            return;
+        }
+        // SAFETY: IMessage requires a terminated FIDString for this synchronous call.
+        let bytes = unsafe { std::ffi::CStr::from_ptr(id) }.to_bytes_with_nul();
+        let mut copied = Vec::new();
+        if copied.try_reserve_exact(bytes.len()).is_err() {
+            return;
+        }
+        copied.extend(bytes.iter().map(|byte| *byte as c_char));
+        *stored = Some(copied);
+    }
+
+    unsafe fn getAttributes(&self) -> *mut IAttributeList {
+        self.attributes.as_ptr()
+    }
+}
+
 pub(crate) struct Host<const WAYLAND: bool = false> {
     #[cfg(target_os = "linux")]
     pub run_loop: Rc<crate::linux_runloop::RunLoop>,
@@ -180,27 +493,45 @@ impl<const WAYLAND: bool> IHostApplicationTrait for Host<WAYLAND> {
     }
     unsafe fn createInstance(
         &self,
-        _cid: *mut TUID,
-        _iid: *mut TUID,
+        cid: *mut TUID,
+        iid: *mut TUID,
         object: *mut *mut c_void,
     ) -> tresult {
-        if !object.is_null() {
-            // SAFETY: optional SDK output pointer; no object is created.
-            unsafe { *object = std::ptr::null_mut() };
+        if object.is_null() || cid.is_null() || iid.is_null() {
+            return kInvalidArgument;
+        }
+        // SAFETY: caller supplied the required writable interface output.
+        unsafe { *object = std::ptr::null_mut() };
+        // SAFETY: createInstance supplies a readable class identifier.
+        let class = unsafe { *cid };
+        // SAFETY: createInstance supplies a readable interface identifier.
+        let interface = unsafe { *iid };
+        if class == IMessage_iid && interface == IMessage_iid {
+            let message = ComWrapper::new(HostMessage::new())
+                .to_com_ptr::<IMessage>()
+                .expect("message interface");
+            // SAFETY: transfer the newly-created object's one owned interface reference.
+            unsafe { *object = message.into_raw().cast() };
+            return kResultOk;
+        }
+        if class == IAttributeList_iid && interface == IAttributeList_iid {
+            let attributes = ComWrapper::new(HostAttributeList::default())
+                .to_com_ptr::<IAttributeList>()
+                .expect("attribute list interface");
+            // SAFETY: transfer the newly-created object's one owned interface reference.
+            unsafe { *object = attributes.into_raw().cast() };
+            return kResultOk;
         }
         #[cfg(target_os = "linux")]
-        if !object.is_null() && !_iid.is_null() && WAYLAND {
-            // SAFETY: createInstance supplies a readable SDK interface identifier.
-            if unsafe { *_iid } == IWaylandHost_iid {
-                // SAFETY: wrap() installs this non-owning self pointer before publishing
-                // the COM object. This synchronous call retains the object itself.
-                let host = unsafe { ComRef::from_raw(self.wayland_interface.get()) }
-                    .expect("Wayland interface")
-                    .to_com_ptr();
-                // SAFETY: caller provided a writable interface output; transfer one owned COM reference.
-                unsafe { *object = host.into_raw().cast() };
-                return kResultOk;
-            }
+        if WAYLAND && interface == IWaylandHost_iid {
+            // SAFETY: wrap() installs this non-owning self pointer before publishing
+            // the COM object. This synchronous call retains the object itself.
+            let host = unsafe { ComRef::from_raw(self.wayland_interface.get()) }
+                .expect("Wayland interface")
+                .to_com_ptr();
+            // SAFETY: caller provided a writable interface output; transfer one owned COM reference.
+            unsafe { *object = host.into_raw().cast() };
+            return kResultOk;
         }
         kNotImplemented
     }
@@ -251,7 +582,10 @@ impl IComponentHandlerTrait for Handler {
             return kInvalidArgument;
         }
         self.0.notify(id, 1, value);
-        self.0.push_edit(id, value);
+        // Test only: never enable __test-drop-editor-edits in distribution builds.
+        if !cfg!(feature = "__test-drop-editor-edits") {
+            self.0.push_edit(id, value);
+        }
         kResultOk
     }
     unsafe fn endEdit(&self, id: u32) -> tresult {
@@ -309,11 +643,7 @@ impl IBStreamTrait for Stream {
             // SAFETY: optional writable byte-count output supplied by the caller.
             unsafe { *actual = n as i32 };
         }
-        if n == count as usize {
-            kResultOk
-        } else {
-            kResultFalse
-        }
+        kResultOk
     }
     unsafe fn write(&self, buffer: *mut c_void, count: i32, actual: *mut i32) -> tresult {
         if count < 0 || (count > 0 && buffer.is_null()) {
@@ -481,6 +811,184 @@ mod tests {
         drop((host, context, queried));
         assert!(created.cast::<IHostApplication>().is_some());
         crate::linux_editor::configure("auto", true);
+    }
+
+    #[test]
+    fn host_message_and_attributes_round_trip() {
+        let host = Host::new().wrap();
+        let context = host.cast::<IHostApplication>().unwrap();
+        let mut cid = IMessage_iid;
+        let mut iid = IMessage_iid;
+        let mut pointer = std::ptr::null_mut();
+        assert_eq!(
+            // SAFETY: retained host and writable class, interface and object pointers.
+            unsafe { context.createInstance(&mut cid, &mut iid, &mut pointer) },
+            kResultOk
+        );
+        // SAFETY: successful createInstance transferred one owned message reference.
+        let message = unsafe { vst3::ComPtr::<IMessage>::from_raw(pointer.cast()) }.unwrap();
+        // SAFETY: terminated string remains readable through this synchronous call.
+        unsafe { message.setMessageID(c"editor".as_ptr()) };
+        // SAFETY: retained message returns its copied terminated identifier.
+        assert_eq!(
+            unsafe { std::ffi::CStr::from_ptr(message.getMessageID()) },
+            c"editor"
+        );
+        // SAFETY: retained message owns one stable attribute-list object.
+        let attributes = unsafe { message.getAttributes() };
+        // SAFETY: same retained message remains alive between calls.
+        assert_eq!(attributes, unsafe { message.getAttributes() });
+        // SAFETY: borrowed pointer remains valid while message is retained.
+        let attributes = unsafe { ComRef::from_raw(attributes) }.unwrap();
+        // SAFETY: terminated IDs and writable scalar outputs satisfy the interface contract.
+        unsafe {
+            assert_eq!(attributes.setInt(c"int".as_ptr(), -17), kResultOk);
+            assert_eq!(attributes.setFloat(c"float".as_ptr(), 3.25), kResultOk);
+        }
+        let mut integer = 0;
+        let mut float = 0.0;
+        // SAFETY: terminated IDs and writable scalar outputs satisfy the interface contract.
+        unsafe {
+            assert_eq!(attributes.getInt(c"int".as_ptr(), &mut integer), kResultOk);
+            assert_eq!(
+                attributes.getFloat(c"float".as_ptr(), &mut float),
+                kResultOk
+            );
+        }
+        assert_eq!(integer, -17);
+        assert_eq!(float, 3.25);
+
+        let text = [b'a' as TChar, b'b' as TChar, b'c' as TChar, 0];
+        // SAFETY: text is terminated and ID is static and terminated.
+        assert_eq!(
+            unsafe { attributes.setString(c"text".as_ptr(), text.as_ptr()) },
+            kResultOk
+        );
+        let mut truncated = [99 as TChar; 2];
+        // SAFETY: output has exactly the advertised byte capacity.
+        assert_eq!(
+            unsafe {
+                attributes.getString(
+                    c"text".as_ptr(),
+                    truncated.as_mut_ptr(),
+                    std::mem::size_of_val(&truncated) as u32,
+                )
+            },
+            kResultOk
+        );
+        assert_eq!(truncated, [b'a' as TChar, 0]);
+
+        let binary = [1_u8, 2, 3, 4];
+        // SAFETY: input points to four readable bytes.
+        assert_eq!(
+            unsafe {
+                attributes.setBinary(
+                    c"data".as_ptr(),
+                    binary.as_ptr().cast(),
+                    binary.len() as u32,
+                )
+            },
+            kResultOk
+        );
+        let mut data = std::ptr::null();
+        let mut size = 0;
+        // SAFETY: both outputs are writable and the ID is terminated.
+        assert_eq!(
+            unsafe { attributes.getBinary(c"data".as_ptr(), &mut data, &mut size) },
+            kResultOk
+        );
+        assert_eq!(size, 4);
+        // SAFETY: returned pointer remains valid until this value is replaced or the list dies.
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(data.cast::<u8>(), 4) },
+            binary
+        );
+        // SAFETY: setting an unrelated scalar does not replace the binary value.
+        assert_eq!(
+            unsafe { attributes.setInt(c"other".as_ptr(), 1) },
+            kResultOk
+        );
+        let mut same_data = std::ptr::null();
+        let mut same_size = 0;
+        // SAFETY: both outputs are writable and the ID is terminated.
+        assert_eq!(
+            unsafe { attributes.getBinary(c"data".as_ptr(), &mut same_data, &mut same_size) },
+            kResultOk
+        );
+        assert_eq!((same_data, same_size), (data, size));
+    }
+
+    #[test]
+    fn host_attributes_reject_missing_null_and_limits() {
+        let attributes = HostAttributeList::default();
+        let mut integer = 0;
+        // SAFETY: terminated missing key and writable output.
+        assert_eq!(
+            unsafe { attributes.getInt(c"missing".as_ptr(), &mut integer) },
+            kResultFalse
+        );
+        // SAFETY: deliberately null arguments exercise validation without dereferencing them.
+        unsafe {
+            assert_eq!(attributes.setInt(std::ptr::null(), 1), kInvalidArgument);
+            assert_eq!(
+                attributes.getInt(c"value".as_ptr(), std::ptr::null_mut()),
+                kInvalidArgument
+            );
+            assert_eq!(
+                attributes.setString(c"value".as_ptr(), std::ptr::null()),
+                kInvalidArgument
+            );
+            assert_eq!(
+                attributes.setBinary(c"value".as_ptr(), std::ptr::null(), 0),
+                kInvalidArgument
+            );
+        }
+        let byte = 0_u8;
+        // SAFETY: oversized input is rejected before the one-byte pointer can be read.
+        assert_eq!(
+            unsafe {
+                attributes.setBinary(
+                    c"large".as_ptr(),
+                    (&byte as *const u8).cast(),
+                    (ATTRIBUTE_VALUE_LIMIT + 1) as u32,
+                )
+            },
+            kOutOfMemory
+        );
+        for index in 0..ATTRIBUTE_ENTRY_LIMIT {
+            let key = std::ffi::CString::new(format!("key-{index}")).unwrap();
+            // SAFETY: each CString is terminated and remains live for the call.
+            assert_eq!(unsafe { attributes.setInt(key.as_ptr(), 1) }, kResultOk);
+        }
+        // SAFETY: static terminated key exceeds the item limit by one.
+        assert_eq!(
+            unsafe { attributes.setInt(c"one-too-many".as_ptr(), 1) },
+            kOutOfMemory
+        );
+    }
+
+    #[test]
+    fn host_created_objects_start_with_one_reference() {
+        let host = Host::new().wrap();
+        let context = host.cast::<IHostApplication>().unwrap();
+        for mut identifier in [IMessage_iid, IAttributeList_iid] {
+            let mut iid = identifier;
+            let mut pointer = std::ptr::null_mut();
+            assert_eq!(
+                // SAFETY: retained host and writable identifiers and object output.
+                unsafe { context.createInstance(&mut identifier, &mut iid, &mut pointer) },
+                kResultOk
+            );
+            let unknown = pointer.cast::<FUnknown>();
+            // SAFETY: successful creation returned a live FUnknown-derived interface.
+            let after_add = unsafe { ((*(*unknown).vtbl).addRef)(unknown) };
+            assert_eq!(after_add, 2);
+            // SAFETY: balance the explicit addRef while retaining the creation reference.
+            let after_release = unsafe { ((*(*unknown).vtbl).release)(unknown) };
+            assert_eq!(after_release, 1);
+            // SAFETY: release the original creation reference exactly once.
+            assert_eq!(unsafe { ((*(*unknown).vtbl).release)(unknown) }, 0);
+        }
     }
 
     #[test]

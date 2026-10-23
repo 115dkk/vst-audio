@@ -23,4 +23,14 @@ forbidden = {n for n in names if n.startswith("vst-audio-worker") or n in {
     "tauri", "egui", "iced", "slint", "gtk4", "cpal", "libloading"}}
 if forbidden:
     raise SystemExit(f"application boundary violated: {sorted(forbidden)}")
-print("Application dependency boundary passed: no worker, loader, GUI or audio device backend.")
+mutation = "__test-drop-editor-edits"
+for key in metadata["workspace_members"]:
+    package = packages[key]
+    for dependency in package["dependencies"]:
+        assert not any(mutation in feature for feature in dependency["features"]), (
+            f"{package['name']} enables test mutation through a dependency")
+    for feature, enables in package["features"].items():
+        assert not any(mutation in enabled for enabled in enables), (
+            f"{package['name']} feature {feature} enables test mutation")
+    assert mutation not in nodes[key]["features"], f"test mutation active in {package['name']}"
+print("Application dependency boundary passed; editor mutation is not enabled by workspace defaults or dependencies.")

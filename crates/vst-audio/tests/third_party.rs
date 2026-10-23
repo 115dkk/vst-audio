@@ -468,3 +468,444 @@ fn mda_dx10_midi_starts_at_requested_sample_and_is_repeatable() {
     assert!(error < 1e-6, "fresh instances disagree: {error}");
     metric("mda DX10 fresh-instance max error", 0.0, f64::from(error));
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "native editor input is unsupported"]
+fn editor_input_macos_limitation() {
+    metric("known limitation: macOS synthetic editor input", 0.0, 0.0);
+}
+
+#[cfg(any(target_os = "linux", windows))]
+mod editor_input {
+    use super::*;
+    use vst_audio_test_window::Parent;
+
+    struct Editor {
+        instance: Instance,
+        parent: Parent,
+        edits: Vec<(u32, EditPhase, f64)>,
+        size: (u32, u32),
+        closed: bool,
+    }
+    impl Editor {
+        fn open(name: &str, format: PluginFormat, sandbox: bool) -> Self {
+            let parent = Parent::create(900, 600);
+            let config = Configuration {
+                quantum: 512,
+                sandbox: sandbox.then(SandboxPolicy::default),
+                ..Default::default()
+            };
+            let instance = host()
+                .spawn(&descriptor(name, format), &config, None)
+                .unwrap();
+            parent.expect_input_process(instance.controller().worker_pid());
+            let mut editor = Self {
+                instance,
+                parent,
+                edits: Vec::new(),
+                size: (0, 0),
+                closed: false,
+            };
+            editor.request(Command::OpenEditorIn(editor.parent.handle()));
+            let event = editor.request(Command::Editor(EditorAction::Inspect));
+            let HostEvent::EditorStatus { status, .. } = event else {
+                panic!("missing editor status: {event:?}")
+            };
+            assert!(status.embedded);
+            editor.size = (status.width, status.height);
+            editor.collect(Duration::from_millis(300));
+            assert!(
+                editor.edits.is_empty(),
+                "editor edited without input: {:?}",
+                editor.edits
+            );
+            editor
+        }
+        fn observe(&mut self, event: &HostEvent) {
+            match event {
+                HostEvent::ParameterEdited { id, phase, value } => {
+                    self.edits.push((*id, *phase, *value))
+                }
+                HostEvent::Failed { .. } | HostEvent::RequestFailed { .. } => panic!("{event:?}"),
+                _ => {}
+            }
+        }
+        fn request(&mut self, command: Command) -> HostEvent {
+            let id = self.instance.controller().request(command).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(12);
+            loop {
+                self.parent.pump();
+                if let Some(event) = self.instance.try_next_event() {
+                    self.observe(&event);
+                    let request = match &event {
+                        HostEvent::Completed { request }
+                        | HostEvent::Parameters { request, .. }
+                        | HostEvent::EditorStatus { request, .. } => Some(*request),
+                        HostEvent::State { request, .. } => *request,
+                        _ => None,
+                    };
+                    if request == Some(id) {
+                        return event;
+                    }
+                }
+                assert!(Instant::now() < deadline, "editor request timed out");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        fn collect(&mut self, duration: Duration) {
+            let deadline = Instant::now() + duration;
+            while Instant::now() < deadline {
+                self.parent.pump();
+                while let Some(event) = self.instance.try_next_event() {
+                    self.observe(&event);
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        fn close(&mut self) {
+            if !self.closed {
+                self.request(Command::CloseEditor);
+                self.closed = true;
+            }
+        }
+        fn parameters(&mut self) -> Vec<Parameter> {
+            let mut result = Vec::new();
+            loop {
+                let HostEvent::Parameters { total, entries, .. } =
+                    self.request(Command::ListParameters {
+                        start: result.len() as u32,
+                        count: 32,
+                    })
+                else {
+                    panic!("missing parameters")
+                };
+                result.extend(entries);
+                if result.len() == total as usize {
+                    return result;
+                }
+            }
+        }
+        fn gesture(&mut self, id: u32, value: f64, multiple: bool, case: &str) {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !self.edits.iter().any(|e| e.1 == EditPhase::End) {
+                self.collect(Duration::from_millis(5));
+                assert!(
+                    Instant::now() < deadline,
+                    "gesture timed out: {:?}",
+                    self.edits
+                );
+            }
+            self.collect(Duration::from_millis(80));
+            let observed: Vec<_> = self
+                .edits
+                .iter()
+                .map(|(id, phase, value)| {
+                    format!("{{\"id\":{id},\"phase\":\"{phase:?}\",\"value\":{value}}}")
+                })
+                .collect();
+            println!(
+                "METRIC {{\"case\":\"{case} gesture\",\"edits\":[{}]}}",
+                observed.join(",")
+            );
+            assert!(self.edits.iter().all(|edit| edit.0 == id));
+            assert_eq!(self.edits.first().unwrap().1, EditPhase::Begin);
+            assert_eq!(self.edits.last().unwrap().1, EditPhase::End);
+            let performs = &self.edits[1..self.edits.len() - 1];
+            assert!(!performs.is_empty());
+            assert!(performs.iter().all(|edit| edit.1 == EditPhase::Perform));
+            if !multiple {
+                assert_eq!(performs.len(), 1);
+            }
+            assert!((performs.last().unwrap().2 - value).abs() < 1e-5);
+            self.edits.clear();
+        }
+        fn pixel(&self, point: (i32, i32)) -> [u8; 3] {
+            let image = self.parent.capture();
+            let i = (point.1 as usize * image.width as usize + point.0 as usize) * 4;
+            image.rgba[i..i + 3].try_into().unwrap()
+        }
+        fn color(&mut self, point: (i32, i32), expected: [u8; 3]) -> [u8; 3] {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let actual = self.pixel(point);
+                if actual
+                    .iter()
+                    .zip(expected)
+                    .all(|(a, b)| a.abs_diff(b) <= 12)
+                {
+                    return actual;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "pixel {point:?}: {actual:?}, expected {expected:?}"
+                );
+                self.collect(Duration::from_millis(20));
+            }
+        }
+    }
+    impl Drop for Editor {
+        fn drop(&mut self) {
+            self.close();
+        }
+    }
+    fn grid_values(editor: &mut Editor, on: Option<&str>) -> Vec<(u32, f64)> {
+        let parameters = editor.parameters();
+        let grid: Vec<_> = parameters
+            .iter()
+            .filter(|p| p.name.contains('-') && !p.read_only)
+            .collect();
+        assert_eq!(grid.len(), 9);
+        for p in &grid {
+            assert_eq!(
+                p.value,
+                if Some(p.name.as_str()) == on {
+                    1.0
+                } else {
+                    0.0
+                },
+                "{}",
+                p.name
+            );
+        }
+        grid.iter().map(|p| (p.id, p.value)).collect()
+    }
+    pub(super) fn parameters(format: PluginFormat, sandbox: bool) {
+        let mut editor = Editor::open("PARAMETERS", format, sandbox);
+        let mut audio = editor.instance.take_audio().unwrap();
+        let case = format!("Parameters {format:?} sandbox={sandbox}");
+        let parameters = editor.parameters();
+        let id = parameters
+            .iter()
+            .find(|p| p.name == "middle-right")
+            .expect("middle-right parameter")
+            .id;
+        let first = parameters.iter().find(|p| p.name == "top-left").unwrap().id;
+        grid_values(&mut editor, None);
+        let m = editor.size.0.min(editor.size.1) as i32;
+        let point = (m * 5 / 6, m / 2);
+        let off = editor.color(point, [77, 128, 204]);
+        editor.parent.click(point.0, point.1);
+        editor.gesture(id, 1.0, false, &case);
+        let values: Vec<_> = grid_values(&mut editor, Some("middle-right"))
+            .into_iter()
+            .map(|(id, value)| [f64::from(id), value])
+            .collect();
+        let on = editor.color(point, [204, 128, 77]);
+        println!(
+            "METRIC {{\"case\":\"{case} pixels\",\"off\":{off:?},\"on\":{on:?},\"values\":{values:?}}}"
+        );
+        editor.parent.click(point.0, point.1);
+        editor.gesture(id, 0.0, false, &case);
+        grid_values(&mut editor, None);
+        editor.color(point, [77, 128, 204]);
+        let before = editor.pixel(point);
+        editor.parent.click(m / 3, m / 2);
+        editor.collect(Duration::from_millis(500));
+        assert!(editor.edits.is_empty());
+        grid_values(&mut editor, None);
+        assert_eq!(editor.pixel(point), before);
+        metric(&format!("{case} gap edits"), 0.0, editor.edits.len() as f64);
+        editor.request(Command::SetParameter {
+            id: first,
+            value: 1.0,
+        });
+        let host_pixel = editor.color((m / 6, m / 6), [204, 128, 77]);
+        editor.collect(Duration::from_millis(500));
+        assert!(editor.edits.is_empty());
+        let inputs = vec![vec![0.0; 512]; audio.geometry().input_channels as usize];
+        let mut outputs = vec![vec![0.0; 512]; audio.geometry().output_channels as usize];
+        let input: Vec<_> = inputs.iter().map(Vec::as_slice).collect();
+        let mut output: Vec<_> = outputs.iter_mut().map(Vec::as_mut_slice).collect();
+        for _ in 0..4 {
+            let _ = audio.process(&input, &mut output);
+            pause();
+        }
+        let expected = grid_values(&mut editor, Some("top-left"));
+        let HostEvent::State { bytes, .. } = editor.request(Command::SaveState) else {
+            panic!("state missing")
+        };
+        editor.close();
+        let mut restored = Editor::open("PARAMETERS", format, sandbox);
+        restored.request(Command::RestoreState(bytes));
+        restored.collect(Duration::from_millis(100));
+        assert_eq!(grid_values(&mut restored, Some("top-left")), expected);
+        assert!(restored.edits.is_empty());
+        println!(
+            "METRIC {{\"case\":\"{case} host-to-UI and state\",\"pixel\":{host_pixel:?},\"edits\":0,\"restored\":true}}"
+        );
+    }
+    fn rms(samples: &[f32]) -> f64 {
+        (samples.iter().map(|s| f64::from(*s).powi(2)).sum::<f64>() / samples.len() as f64).sqrt()
+    }
+    fn blocks(
+        editor: &Editor,
+        audio: &mut AudioEndpoint,
+        frequency: f64,
+        count: usize,
+    ) -> Vec<f32> {
+        let inputs = audio.geometry().input_channels as usize;
+        let outputs = audio.geometry().output_channels as usize;
+        let mut recorded = Vec::new();
+        for block in 0..count {
+            let source: Vec<f32> = (0..512)
+                .map(|i| {
+                    (10f64.powf(-12.0 / 20.0)
+                        * (std::f64::consts::TAU * frequency * (block * 512 + i) as f64 / 48_000.0)
+                            .sin()) as f32
+                })
+                .collect();
+            let refs = vec![source.as_slice(); inputs];
+            let mut result = vec![vec![0.0; 512]; outputs];
+            let mut outs: Vec<_> = result.iter_mut().map(Vec::as_mut_slice).collect();
+            let status = audio.process(&refs, &mut outs);
+            if block >= 2 {
+                assert_eq!(status, AudioStatus::Processed);
+                assert!(result[0].iter().all(|s| s.is_finite()));
+                recorded.extend_from_slice(&result[0]);
+            }
+            editor.parent.settle();
+        }
+        recorded
+    }
+    pub(super) fn send_note(format: PluginFormat) {
+        let mut editor = Editor::open("SENDNOTE", format, false);
+        let mut audio = editor.instance.take_audio().unwrap();
+        assert_eq!(
+            (
+                audio.geometry().input_channels,
+                audio.geometry().output_channels
+            ),
+            (0, 1)
+        );
+        let silence = blocks(&editor, &mut audio, 0.0, 8);
+        let peak = |s: &[f32]| s.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        assert!(peak(&silence) < 1e-6);
+        // getKeyBounds(9) = (584,8,56,56), MIDI 60+9 = A4.
+        editor.parent.press(612, 36);
+        let sound = blocks(&editor, &mut audio, 0.0, 20);
+        editor.parent.release(612, 36);
+        let released = blocks(&editor, &mut audio, 0.0, 8);
+        let db = 20.0 * rms(&sound).log10();
+        let crossings: Vec<f64> = sound
+            .windows(2)
+            .enumerate()
+            .filter(|(_, s)| s[0] <= 0.0 && s[1] > 0.0)
+            .map(|(i, s)| i as f64 - f64::from(s[0]) / f64::from(s[1] - s[0]))
+            .collect();
+        assert!(crossings.len() > 2, "UI note did not reach processor");
+        let hz =
+            (crossings.len() - 1) as f64 * 48_000.0 / (crossings.last().unwrap() - crossings[0]);
+        println!(
+            "METRIC {{\"case\":\"SendNote {format:?}\",\"rms_dbfs\":{db},\"hz\":{hz},\"before_peak\":{},\"release_peak\":{}}}",
+            peak(&silence),
+            peak(&released[released.len() - 512..])
+        );
+        assert!(db > -40.0);
+        assert!((hz / 440.0 - 1.0).abs() < 0.01);
+        assert!(peak(&released[released.len() - 512..]) < 1e-6);
+    }
+    fn levels(editor: &Editor, audio: &mut AudioEndpoint) -> [f64; 2] {
+        [100.0, 8000.0].map(|frequency| {
+            let samples = blocks(editor, audio, frequency, 28);
+            20.0 * rms(&samples[8 * 512..]).log10()
+        })
+    }
+    pub(super) fn eq(format: PluginFormat) {
+        let mut editor = Editor::open("EQ", format, false);
+        let mut audio = editor.instance.take_audio().unwrap();
+        let parameters = editor.parameters();
+        let low = parameters
+            .iter()
+            .find(|p| p.name == "Low")
+            .expect("Low parameter");
+        let id = low.id;
+        let initial = low.value;
+        let before = levels(&editor, &mut audio);
+        // Slider start (57,43), end (57,203), image 50x30; default 0 dB is halfway.
+        editor.parent.drag((82, 138), (82, 98), 12);
+        let after_parameters = editor.parameters();
+        let value = after_parameters.iter().find(|p| p.id == id).unwrap().value;
+        assert!(value > initial);
+        editor.gesture(id, value, true, &format!("3 Band EQ {format:?}"));
+        let after = levels(&editor, &mut audio);
+        let delta = [after[0] - before[0], after[1] - before[1]];
+        println!(
+            "METRIC {{\"case\":\"3 Band EQ {format:?} sound\",\"before_db\":{before:?},\"after_db\":{after:?},\"delta_db\":{delta:?},\"low_before\":{initial},\"low_after\":{value}}}"
+        );
+        assert!(
+            delta[0] >= 3.0 && delta[1].abs() <= 0.5,
+            "editor-to-processor sound assertion failed: low/high delta {delta:?}"
+        );
+        editor.parent.drag((360, 100), (360, 60), 12);
+        editor.collect(Duration::from_millis(500));
+        assert!(editor.edits.is_empty());
+        let negative_parameters = editor.parameters();
+        assert_eq!(
+            negative_parameters
+                .iter()
+                .map(|p| (p.id, p.value))
+                .collect::<Vec<_>>(),
+            after_parameters
+                .iter()
+                .map(|p| (p.id, p.value))
+                .collect::<Vec<_>>()
+        );
+        let negative = levels(&editor, &mut audio);
+        for i in 0..2 {
+            assert!((negative[i] - after[i]).abs() < 0.05);
+        }
+        println!(
+            "METRIC {{\"case\":\"3 Band EQ {format:?} background drag\",\"edits\":0,\"levels_db\":{negative:?}}}"
+        );
+    }
+}
+
+#[cfg(any(target_os = "linux", windows))]
+#[test]
+#[ignore = "built independent plugins and native desktop required"]
+fn editor_input_parameters_vst2() {
+    editor_input::parameters(PluginFormat::Vst2, false);
+}
+#[cfg(any(target_os = "linux", windows))]
+#[test]
+#[ignore = "built independent plugins and native desktop required"]
+fn editor_input_parameters_vst3() {
+    editor_input::parameters(PluginFormat::Vst3, false);
+}
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "built independent plugins and native desktop required"]
+fn editor_input_parameters_sandbox_vst2() {
+    editor_input::parameters(PluginFormat::Vst2, true);
+}
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "built independent plugins and native desktop required"]
+fn editor_input_parameters_sandbox_vst3() {
+    editor_input::parameters(PluginFormat::Vst3, true);
+}
+#[cfg(any(target_os = "linux", windows))]
+#[test]
+#[ignore = "built independent plugins and native desktop required"]
+fn editor_input_send_note_vst2() {
+    editor_input::send_note(PluginFormat::Vst2);
+}
+#[cfg(any(target_os = "linux", windows))]
+#[test]
+#[ignore = "built independent plugins and native desktop required"]
+fn editor_input_send_note_vst3() {
+    editor_input::send_note(PluginFormat::Vst3);
+}
+#[cfg(any(target_os = "linux", windows))]
+#[test]
+#[ignore = "built independent plugins and native desktop required"]
+fn editor_input_eq_vst2() {
+    editor_input::eq(PluginFormat::Vst2);
+}
+#[cfg(any(target_os = "linux", windows))]
+#[test]
+#[ignore = "built independent plugins and native desktop required"]
+fn editor_input_eq_vst3() {
+    editor_input::eq(PluginFormat::Vst3);
+}

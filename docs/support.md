@@ -157,6 +157,41 @@ Hosted runners do not certify device latency, dropout rates on physical audio
 hardware or universal plugin compatibility. macOS artifacts are ad-hoc signed;
 production signing/notarization is described in [distribution](distribution.md).
 
+## Synthetic editor input verification (in progress)
+
+`tools/third_party.py` builds pinned DPF Parameters, SendNote and DPF-Plugins
+3 Band EQ outside the checkout. The ignored tests inject XTest input on Linux
+and SendInput on Windows into embedded editors; they do not call plugin UI
+functions. Windows requires an interactive desktop: foreground denial, UIPI or
+a target belonging to another process fails explicitly. The SendInput path has
+passed x64/i686 MSVC-target clippy checks on Linux, not native Windows execution.
+macOS reports `known limitation: macOS synthetic editor input` because embedding
+is unsupported and synthetic input needs accessibility authorization. Wayland
+input is outside this test.
+
+Linux/Xvfb (1280x800x24) execution verifies VST 2 and VST 3 Parameters
+gestures, pixels, gap-click negative control, host-to-UI updates and
+fresh-instance state, both with and without the default sandbox. SendNote in
+both formats verifies A4 frequency/RMS and release silence. EQ in both formats
+verifies low-band gain and a background-drag negative control. The VST 3 cases
+use host-created, bounded `IMessage` and `IAttributeList` objects. Tests close
+each editor before destroying its X11 application parent; the plugin teardown
+therefore runs while the embedded window hierarchy is still valid.
+
+The test-only `__test-drop-editor-edits` feature suppresses VST 3 processor queue
+updates while retaining edit notifications. Never enable it in distribution
+builds. The runner builds a separate mutant worker and requires EQ to fail with
+`editor-to-processor sound assertion failed`; the UI/controller value still
+rises while the measured sound delta remains zero. A failed ordinary suite does
+not prevent the mutation diagnostic from running.
+
+DPF is pinned to `b801214e9ce41b56907e1c6c84859b6b4536917d`. The runner uses
+DPF's CMake wrapper and `dpf_add_plugin` for MIDI Through, Latency, Parameters,
+SendNote and the DPF-Plugins 3 Band EQ sources. No native Windows/macOS editor
+input result is claimed until those native runs complete. Plugin binaries and
+external build trees must not be cached or uploaded; only bounded logs and JSON
+reports are suitable CI artifacts.
+
 ## VST 2 hardening scope
 
 Shell scan/child selection, truthful canDo, coherent pre-processing time snapshots,

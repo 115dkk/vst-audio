@@ -27,6 +27,7 @@ unsafe extern "system" fn child(window: HWND, data: LPARAM) -> windows::core::BO
 pub struct Parent {
     window: HWND,
     destroyed: Cell<bool>,
+    input_pid: Cell<u32>,
 }
 impl Parent {
     pub fn create(width: u32, height: u32) -> Self {
@@ -63,6 +64,7 @@ impl Parent {
         Self {
             window,
             destroyed: Cell::new(false),
+            input_pid: Cell::new(0),
         }
     }
     pub fn handle(&self) -> ParentWindow {
@@ -78,6 +80,105 @@ impl Parent {
             let _ = unsafe { TranslateMessage(&message) };
             // SAFETY: valid message and static window callbacks.
             unsafe { DispatchMessageW(&message) };
+        }
+    }
+    pub fn expect_input_process(&self, pid: u32) {
+        assert_ne!(pid, 0);
+        self.input_pid.set(pid);
+    }
+    pub(crate) fn pointer(&self, x: i32, y: i32, button: Option<bool>) {
+        use windows::Win32::{Graphics::Gdi::ClientToScreen, UI::Input::KeyboardAndMouse::*};
+        let send = |dx, dy, flags| {
+            let input = INPUT {
+                r#type: INPUT_MOUSE,
+                Anonymous: INPUT_0 {
+                    mi: MOUSEINPUT {
+                        dx,
+                        dy,
+                        dwFlags: flags,
+                        ..Default::default()
+                    },
+                },
+            };
+            // SAFETY: one fully initialized mouse INPUT, with its exact ABI size.
+            let sent = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
+            assert_eq!(
+                sent,
+                1,
+                "SendInput blocked (desktop/UIPI): {}",
+                windows::core::Error::from_thread()
+            );
+        };
+        // Harmless relative zero motion permits a foreground request without bypassing OS policy.
+        send(0, 0, MOUSEEVENTF_MOVE);
+        // SAFETY: live parent top-level window on this thread.
+        let _ = unsafe { SetForegroundWindow(self.window) };
+        self.settle();
+        // SAFETY: queries current desktop foreground window, retaining no borrowed handle.
+        let foreground = unsafe { GetForegroundWindow() };
+        assert_eq!(
+            foreground, self.window,
+            "foreground blocked: another desktop/window owns input"
+        );
+        let mut point = POINT { x, y };
+        // SAFETY: live parent and writable client point.
+        assert!(unsafe { ClientToScreen(self.window, &mut point) }.as_bool());
+        // SAFETY: screen point is a value; query does not dereference caller data.
+        let hit = unsafe { WindowFromPoint(point) };
+        let mut pid = 0;
+        // SAFETY: returned HWND and writable process-id output.
+        unsafe { GetWindowThreadProcessId(hit, Some(&mut pid)) };
+        assert_ne!(
+            self.input_pid.get(),
+            0,
+            "expected worker pid must be configured"
+        );
+        assert_eq!(
+            pid,
+            self.input_pid.get(),
+            "input blocked at {point:?}: hit {hit:?}, process {pid}"
+        );
+        // SAFETY: these constants query dimensions/origin of the active virtual desktop.
+        let left = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
+        // SAFETY: virtual desktop origin query has no pointer arguments.
+        let top = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
+        // SAFETY: virtual desktop size query has no pointer arguments.
+        let width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
+        // SAFETY: virtual desktop size query has no pointer arguments.
+        let height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
+        assert!(width > 1 && height > 1);
+        let dx = (i64::from(point.x - left) * 65535 / i64::from(width - 1)) as i32;
+        let dy = (i64::from(point.y - top) * 65535 / i64::from(height - 1)) as i32;
+        send(
+            dx,
+            dy,
+            MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE | MOUSEEVENTF_VIRTUALDESK,
+        );
+        if let Some(press) = button {
+            send(
+                0,
+                0,
+                if press {
+                    MOUSEEVENTF_LEFTDOWN
+                } else {
+                    MOUSEEVENTF_LEFTUP
+                },
+            );
+        }
+        // SendInput queues into the system input stream; observe the delivered cursor position.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            self.settle();
+            let mut actual = POINT::default();
+            // SAFETY: writable point receives current desktop cursor coordinates.
+            unsafe { GetCursorPos(&mut actual) }.unwrap();
+            if (actual.x - point.x).abs() <= 1 && (actual.y - point.y).abs() <= 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "OS did not deliver mouse movement: {actual:?}"
+            );
         }
     }
     pub fn children(&self) -> Vec<(u64, Option<u32>)> {

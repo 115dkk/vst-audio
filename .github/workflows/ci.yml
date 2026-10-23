@@ -189,7 +189,7 @@ jobs:
       matrix:
         os: [windows-2025, ubuntu-24.04, macos-15, macos-15-intel]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 25
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -200,9 +200,15 @@ jobs:
         with:
           shared-key: independent
       - if: runner.os == 'Linux'
-        run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update -qq && sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y cmake build-essential pkg-config libx11-dev
-      - name: Build pinned upstreams and assert MIDI, DSP and negotiation
+        # DPF editors need X11 and OpenGL to build; Xvfb with Mesa runs them
+        # and its XTEST extension delivers the synthetic mouse input.
+        run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update -qq && sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y cmake build-essential pkg-config libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxinerama-dev libgl1-mesa-dev libglu1-mesa-dev libgl1-mesa-dri xvfb xauth
+      - name: Build pinned upstreams; assert MIDI, DSP, negotiation and real editor input (Windows, macOS)
+        if: runner.os != 'Linux'
         run: python tools/third_party.py
+      - name: Build pinned upstreams; assert MIDI, DSP, negotiation and real editor input (Linux X11)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a -s "-screen 0 1280x800x24" python3 tools/third_party.py
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
@@ -211,6 +217,7 @@ jobs:
           path: |
             test-results/third-party/summary.json
             test-results/third-party/checks.log
+            test-results/third-party/mutation.log
           if-no-files-found: error
 
   extended:

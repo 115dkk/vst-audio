@@ -1354,16 +1354,13 @@ impl Vst3Plugin {
             scale_supported: scale_interface.is_some(),
         }))
     }
-    pub fn request_editor_close(&self) -> Result<(), PluginError> {
+    pub fn request_editor_close(&mut self) -> Result<(), PluginError> {
         #[cfg(target_os = "linux")]
-        if let Some(hidden) = &self.hidden_wayland {
-            hidden.closed.set(true);
+        if self.hidden_wayland.take().is_some() {
+            self.closed_editor = true;
         }
-        if let Some(editor) = &self.editor {
-            editor
-                .window
-                .request_close()
-                .map_err(|e| PluginError(e.to_string()))?;
+        if self.editor.take().is_some() {
+            self.closed_editor = true;
         }
         Ok(())
     }

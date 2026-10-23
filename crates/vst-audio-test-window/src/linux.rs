@@ -84,6 +84,55 @@ impl Parent {
     pub fn pump(&self) {
         while self.connection.poll_for_event().unwrap().is_some() {}
     }
+    pub fn expect_input_process(&self, _pid: u32) {}
+    pub(crate) fn pointer(&self, x: i32, y: i32, button: Option<bool>) {
+        use x11rb::protocol::xtest::ConnectionExt as _;
+        let root = self
+            .connection
+            .get_geometry(self.window)
+            .unwrap()
+            .reply()
+            .unwrap()
+            .root;
+        let point = self
+            .connection
+            .translate_coordinates(
+                self.window,
+                root,
+                x.try_into().unwrap(),
+                y.try_into().unwrap(),
+            )
+            .unwrap()
+            .reply()
+            .unwrap();
+        self.connection
+            .xtest_fake_input(MOTION_NOTIFY_EVENT, 0, 0, root, point.dst_x, point.dst_y, 0)
+            .unwrap()
+            .check()
+            .unwrap();
+        if let Some(press) = button {
+            self.connection
+                .xtest_fake_input(
+                    if press {
+                        BUTTON_PRESS_EVENT
+                    } else {
+                        BUTTON_RELEASE_EVENT
+                    },
+                    1,
+                    0,
+                    root,
+                    0,
+                    0,
+                    0,
+                )
+                .unwrap()
+                .check()
+                .unwrap();
+        }
+        // A reply is a server round trip; pumping also gives the foreign client time to run.
+        self.connection.get_input_focus().unwrap().reply().unwrap();
+        self.settle();
+    }
     pub fn children(&self) -> Vec<(u64, Option<u32>)> {
         self.connection
             .query_tree(self.window)

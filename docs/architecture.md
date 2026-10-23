@@ -141,6 +141,38 @@ release, with at most two live buffers per visible Wayland editor.
 Initial surface synchronization precedes view attachment and content-scale setup;
 rejected content scales leave the last accepted scale unchanged.
 
+### Independent editor input tests
+
+The unpublished `vst-audio-test-window` helper injects OS mouse input in parent
+client coordinates (XTest on X11, SendInput with foreground and worker-PID
+hit-test checks on Windows). Tests embed independently built plugins and observe
+public host events, parameter/state requests, captured pixels and processed
+samples. No foreign UI function is invoked by the test. This is test machinery,
+not a new application input API or realtime path.
+
+An explicitly selected, default-off `__test-drop-editor-edits` worker-sys feature
+is reserved for mutation testing; it drops only the VST 3 performEdit processor
+queue write, retaining notifications. It must never be enabled for distribution.
+The boundary gate rejects workspace feature/dependency activation, and the
+mutant is built in a separate external target directory. An early failure is
+not evidence that the audio assertion detects the mutation. The host supplies
+bounded `IMessage` and `IAttributeList` objects, so the independent VST 3
+Parameters, SendNote and EQ paths exercise UI-to-controller-to-processor delivery.
+The mutant is accepted as detected only when that delivery reaches the EQ sound
+assertion and fails there.
+
+On X11, tests close the plugin editor before destroying their application parent.
+VST 2 sends `EDIT_CLOSE`; VST 3 calls `removed()`, then `setFrame(null)`, while the
+host child window remains alive. DPF unregisters its `IRunLoop` timer during
+`removed()`, and the host rechecks timer registration before each callback. This
+ordering matters because destroying an X parent also destroys its children; a
+plugin that subsequently calls `XGetGeometry`, `XUnmapWindow`, or `XDestroyWindow`
+would otherwise use stale resource IDs. After a plugin has loaded, Linux workers
+also install a dynamically resolved `XSetErrorHandler` from an already-loaded
+`libX11.so.6` (`RTLD_NOLOAD`) so a protocol error is reported once per event and
+returns without terminating the worker. This handler covers X protocol errors,
+not Xlib I/O errors such as a lost server connection.
+
 ## Data planes
 
 Control frames have explicit byte order, version, length, bounded payloads and

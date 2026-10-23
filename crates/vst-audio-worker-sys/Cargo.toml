@@ -20,6 +20,10 @@ multiple_unsafe_ops_per_block = "deny"
 missing_safety_doc = "deny"
 dbg_macro = "deny"
 
+[features]
+# Test only: never enable in distribution builds.
+__test-drop-editor-edits = []
+
 [dependencies]
 crossbeam-queue = "0.3"
 vst-audio-protocol.workspace = true

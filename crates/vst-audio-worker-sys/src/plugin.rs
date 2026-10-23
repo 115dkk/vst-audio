@@ -706,11 +706,17 @@ impl Vst2Plugin {
             scale_supported: false,
         }))
     }
-    pub fn request_editor_close(&self) -> Result<(), PluginError> {
-        if let Some(editor) = &self.editor {
-            editor
-                .request_close()
-                .map_err(|e| PluginError(e.to_string()))?;
+    pub fn request_editor_close(&mut self) -> Result<(), PluginError> {
+        if self.editor.is_some() {
+            self.shared
+                .callback
+                .editor_open
+                .store(false, Ordering::Release);
+            self.shared.callback.size.store(0, Ordering::Release);
+            let control = self.shared.calls();
+            control.call(EDIT_CLOSE, 0, 0, std::ptr::null_mut(), 0.0);
+            self.editor = None;
+            self.closed = true;
         }
         Ok(())
     }
