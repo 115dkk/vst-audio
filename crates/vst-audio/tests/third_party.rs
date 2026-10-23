@@ -641,11 +641,11 @@ mod editor_input {
                     // wrong window and a shifted layout read differently.
                     let image = self.parent.capture();
                     let mut counts = std::collections::HashMap::<[u8; 3], usize>::new();
-                    for pixel in image.rgba.chunks_exact(4) {
+                    for pixel in image.rgba.as_chunks::<4>().0 {
                         *counts.entry([pixel[0], pixel[1], pixel[2]]).or_default() += 1;
                     }
                     let mut counts: Vec<_> = counts.into_iter().collect();
-                    counts.sort_by(|a, b| b.1.cmp(&a.1));
+                    counts.sort_by_key(|entry| std::cmp::Reverse(entry.1));
                     counts.truncate(5);
                     panic!(
                         "pixel {point:?}: {actual:?}, expected {expected:?}; capture {}x{} top colors {counts:?}",
