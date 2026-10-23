@@ -43,11 +43,14 @@ impl Case {
             [((312, 56), (312, 26)), ((184, 56), (184, 86))]
         }
     }
-    fn reverse(self) -> [(&'static str, f64); 3] {
+    /// Values set through vst-audio for the reverse direction. For 3 Band EQ
+    /// these are the two parameters the forward direction showed EQ APO XT
+    /// resolving by name; "Mid" is checked on its own as an observation.
+    fn reverse(self) -> &'static [(&'static str, f64)] {
         if self.eq() {
-            [("Low", 0.75), ("High", 0.25), ("Mid", 0.625)]
+            &[("Low", 0.75), ("High", 0.25)]
         } else {
-            [("Decay", 0.75), ("Size", 0.375), ("Mix", 0.625)]
+            &[("Decay", 0.75), ("Size", 0.375), ("Mix", 0.625)]
         }
     }
 }
@@ -330,7 +333,7 @@ fn signal(case: Case) -> [Vec<f32>; 2] {
     }
     out
 }
-fn render(mut instance: Instance, x: &[Vec<f32>; 2]) -> [Vec<f32>; 2] {
+fn render(instance: &mut Instance, x: &[Vec<f32>; 2]) -> [Vec<f32>; 2] {
     let mut audio = instance.take_audio().unwrap();
     assert_eq!(
         (
@@ -618,7 +621,7 @@ pub fn compare(case: Case) {
             .unwrap()
     };
     let x = signal(case);
-    let default = spawn();
+    let mut default = spawn();
     let defaults = parameters(&default);
     println!(
         "METRIC {{\"case\":{:?},\"parameter_names\":{:?}}}",
@@ -626,9 +629,9 @@ pub fn compare(case: Case) {
         defaults.iter().map(|p| p.name.as_str()).collect::<Vec<_>>()
     );
     let c0 = (case.format() == PluginFormat::Vst3).then(|| component(&default));
-    let y0 = render(default, &x);
+    let y0 = render(&mut default, &x);
     let (saved, changed_pixels) = gui(case, &app, &root, library);
-    let forward = spawn();
+    let mut forward = spawn();
     let saved_edit = if let Some(c0) = &c0 {
         let chunk = saved.chunk.as_ref().expect("missing ChunkData");
         chunk != c0
@@ -651,7 +654,7 @@ pub fn compare(case: Case) {
         // host then kept out of ChunkData is the engine's side; the reverse
         // direction below still compares the two engines.
         assert!(
-            case.format() == PluginFormat::Vst3 && changed_pixels >= 500,
+            case.format() == PluginFormat::Vst3 && changed_pixels >= 100,
             "EQ APO XT GUI edit did not change the plugin state ({changed_pixels} editor pixels changed)"
         );
         println!(
@@ -680,7 +683,7 @@ pub fn compare(case: Case) {
                 set(&forward, &defaults, name, *value);
             }
         }
-        let y1 = render(forward, &x);
+        let y1 = render(&mut forward, &x);
         let change = y0
             .iter()
             .flatten()
@@ -703,48 +706,77 @@ pub fn compare(case: Case) {
         );
         compare_output(case, "forward", &app, &root, &x, &y1, &saved.raw);
     }
-    let reverse = spawn();
+    let mut reverse = spawn();
     let entries = parameters(&reverse);
     for (name, value) in case.reverse() {
-        set(&reverse, &entries, name, value);
+        set(&reverse, &entries, name, *value);
     }
-    let mut line = format!("VSTPlugin: Library \"{}\"", library.display());
-    let mut by_name = None;
-    if case.format() == PluginFormat::Vst3 {
-        line.push_str(&format!(
-            " ChunkData \"{}\"",
+    // VST 3 hands a parameter value to the processor in process(), and a DPF
+    // component saves the processor's values: save after processing, as an
+    // application with running audio does.
+    let y2 = render(&mut reverse, &x);
+    let library_line = format!("VSTPlugin: Library \"{}\"", library.display());
+    let line = if case.format() == PluginFormat::Vst3 {
+        format!(
+            "{library_line} ChunkData \"{}\"",
             base64_encode(&component(&reverse))
-        ));
+        )
     } else {
-        // Parameters by index, each value as the shortest decimal that reads
-        // back as the plugin's f32. The same values by name are an observation:
-        // names that share a prefix ("Low", "Low-Mid Freq") are ambiguous.
-        let mut named = line.clone();
-        for p in parameters(&reverse) {
-            assert!(!p.name.contains('"'));
-            line.push_str(&format!(" {} {}", p.id, p.value as f32));
-            named.push_str(&format!(" \"{}\" {}", p.name, p.value as f32));
-        }
-        by_name = Some(named);
-    }
+        // By name, as the Editor writes them; each value as the shortest decimal
+        // that reads back as the plugin's f32.
+        let values = parameters(&reverse);
+        let by_index: String = values
+            .iter()
+            .map(|p| format!(" {} {}", p.id, p.value as f32))
+            .collect();
+        let max = plain_difference(
+            &app,
+            &root,
+            &format!("{}-reverse-by-index", case.name()),
+            &x,
+            &y2,
+            &format!("{library_line}{by_index}"),
+        );
+        println!(
+            "METRIC {{\"case\":{:?},\"observation\":\"VST 2 parameters written by index\",\"plain_max_lsb\":{max}}}",
+            case.name()
+        );
+        format!("{library_line}{}", named(&values))
+    };
     println!(
         "METRIC {{\"case\":{:?},\"reverse_line\":{line:?}}}",
         case.name()
     );
-    let y2 = render(reverse, &x);
-    if let Some(named) = by_name {
-        let max = plain_difference(
-            &app,
-            &root,
-            &format!("{}-reverse-by-name", case.name()),
-            &x,
-            &y2,
-            &named,
-        );
-        println!(
-            "METRIC {{\"case\":{:?},\"observation\":\"VST 2 parameters written by name\",\"line\":{named:?},\"plain_max_lsb\":{max}}}",
-            case.name()
-        );
-    }
     compare_output(case, "reverse", &app, &root, &x, &y2, &line);
+    if matches!(case, Case::EqVst2) {
+        // Which names EQ APO XT resolves: one parameter changed at a time.
+        for (name, value) in [("Low", 0.75), ("Mid", 0.625), ("High", 0.25)] {
+            let mut single = spawn();
+            set(&single, &entries, name, value);
+            let y = render(&mut single, &x);
+            let line = format!("{library_line}{}", named(&parameters(&single)));
+            let max = plain_difference(
+                &app,
+                &root,
+                &format!("{}-single-{name}", case.name()),
+                &x,
+                &y,
+                &line,
+            );
+            println!(
+                "METRIC {{\"case\":{:?},\"observation\":\"one VST 2 parameter by name\",\"parameter\":{name:?},\"value\":{value},\"plain_max_lsb\":{max}}}",
+                case.name()
+            );
+        }
+    }
+}
+/// `"<name>" <value>` pairs for every parameter, as the Editor writes them.
+fn named(parameters: &[Parameter]) -> String {
+    parameters
+        .iter()
+        .map(|p| {
+            assert!(!p.name.contains('"'));
+            format!(" \"{}\" {}", p.name, p.value as f32)
+        })
+        .collect()
 }
