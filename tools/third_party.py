@@ -22,16 +22,17 @@ PINS = {
     "sdk": ("https://github.com/steinbergmedia/vst3sdk.git", "3cdf9ca5d1f5b1b21e0a86832aa4abe55607bd96"),
 }
 
+# EqualizerAPO-XT release used by the engine comparison. GPL binaries stay
+# outside the repository, Cargo caches and CI artifacts.
+EAPO = ("https://github.com/115dkk/equalizerapo-xt/releases/download/v2.60.3/EqualizerAPO-XT-x64-sse2-2.60.3-x64-sse2-full.nupkg",
+        "82554fe4c1d92c4f78304972cdd80053078a87d581ef1b56d06b9555011621ae")
+
 # A GPU-less Windows runner has only the GDI OpenGL 1.1, on which DPF editors draw
 # nothing (their pixels read near black). As with Mesa under Xvfb on Linux, a pinned
 # Mesa llvmpipe renders them in software. The worker loads plugins with
 # LOAD_WITH_ALTERED_SEARCH_PATH, which resolves their imports from the plugin's own
 # folder before System32 and never from the worker's, so the DLLs go beside each
 # plugin binary in the external build tree.
-# Temporary: the EqualizerAPO-XT release whose engine the comparison will run.
-EAPO = ("https://github.com/115dkk/equalizerapo-xt/releases/download/v2.60.3/EqualizerAPO-XT-x64-sse2-2.60.3-x64-sse2-full.nupkg",
-        "82554fe4c1d92c4f78304972cdd80053078a87d581ef1b56d06b9555011621ae")
-
 MESA = ("https://github.com/pal1000/mesa-dist-win/releases/download/26.2.4/mesa3d-26.2.4-release-msvc.7z",
         "351fc8c8b695878ffb3eaa044b3ead08672a48b1a045e3c3e3975811df0f6695")
 
@@ -72,6 +73,8 @@ dpf_add_plugin(d_sendNote TARGETS vst2 vst3 FILES_DSP "{dpf.as_posix()}/examples
 target_include_directories(d_sendNote PUBLIC "{dpf.as_posix()}/examples/SendNote")
 dpf_add_plugin(d_3BandEQ TARGETS vst2 vst3 FILES_DSP "{plugins.as_posix()}/plugins/3BandEQ/DistrhoPlugin3BandEQ.cpp" FILES_UI "{plugins.as_posix()}/plugins/3BandEQ/DistrhoArtwork3BandEQ.cpp" "{plugins.as_posix()}/plugins/3BandEQ/DistrhoUI3BandEQ.cpp")
 target_include_directories(d_3BandEQ PUBLIC "{plugins.as_posix()}/plugins/3BandEQ")
+dpf_add_plugin(d_MVerb TARGETS vst2 vst3 FILES_DSP "{plugins.as_posix()}/plugins/MVerb/DistrhoPluginMVerb.cpp" FILES_UI "{plugins.as_posix()}/plugins/MVerb/DistrhoArtworkMVerb.cpp" "{plugins.as_posix()}/plugins/MVerb/DistrhoUIMVerb.cpp")
+target_include_directories(d_MVerb PUBLIC "{plugins.as_posix()}/plugins/MVerb")
 ''', encoding="utf-8")
     dpf_build, sdk_build = root / "dpf-build", root / "sdk-build"
     run("cmake", "-S", wrapper, "-B", dpf_build, "-DCMAKE_BUILD_TYPE=Release")
@@ -87,6 +90,8 @@ target_include_directories(d_3BandEQ PUBLIC "{plugins.as_posix()}/plugins/3BandE
         paths[f"{case}_VST2"] = dpf_build / "bin" / (f"{name}.vst" if sys.platform == "darwin" else f"{name}-vst2" + (".dll" if sys.platform == "win32" else ".so"))
     paths["EQ_VST3"] = dpf_build / "bin/d_3BandEQ.vst3"
     paths["EQ_VST2"] = dpf_build / "bin" / ("d_3BandEQ.vst" if sys.platform == "darwin" else "d_3BandEQ-vst2" + (".dll" if sys.platform == "win32" else ".so"))
+    paths["MVERB_VST3"] = dpf_build / "bin/d_MVerb.vst3"
+    paths["MVERB_VST2"] = dpf_build / "bin" / ("d_MVerb.vst" if sys.platform == "darwin" else "d_MVerb-vst2" + (".dll" if sys.platform == "win32" else ".so"))
     for case, name in [("DELAY", "adelay"), ("MDA", "mda-vst3")]:
         candidates = [p for p in sdk_build.rglob(f"{name}.vst3") if p.is_dir()]
         assert len(candidates) == 1, candidates
@@ -117,6 +122,29 @@ def install_software_opengl(root, plugins):
             shutil.copy2(extracted / "x64" / dll, directory / dll)
     return sorted(str(directory) for directory in directories)
 
+def install_eapo(root) -> Path:
+    """Verify and unpack the black-box GPL engine only in the external work tree."""
+    import zipfile
+    url, digest = EAPO
+    download = root / "eapo-package"
+    download.mkdir(exist_ok=True)
+    package = download / "release.nupkg"
+    if not package.exists() or hashlib.sha256(package.read_bytes()).hexdigest() != digest:
+        urllib.request.urlretrieve(url, package)
+    actual = hashlib.sha256(package.read_bytes()).hexdigest()
+    assert actual == digest, f"EqualizerAPO-XT archive digest {actual}"
+    app = root / "eapo"
+    # Re-extract verified bytes: a reused directory must not silently use stale binaries.
+    with zipfile.ZipFile(package) as archive:
+        for member in archive.infolist():
+            if member.filename.startswith("lib/app/") and not member.is_dir():
+                target = app / member.filename[len("lib/app/"):]
+                assert app.resolve() in target.resolve().parents
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(archive.read(member))
+    assert (app / "Editor.exe").is_file() and (app / "Benchmark.exe").is_file()
+    return app
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, help="Reuse a developer-owned directory outside the checkout")
@@ -144,11 +172,17 @@ def main():
         env = dict(os.environ, VST_AUDIO_WORKER=str(worker), **{f"VST_AUDIO_REAL_{key}": str(value) for key, value in paths.items()})
         if sys.platform == "win32":
             env["GALLIUM_DRIVER"] = "llvmpipe"
+            env["VST_AUDIO_EAPO"] = str(install_eapo(root))
+            work = root / "eapo-work"
+            work.mkdir(exist_ok=True)
+            assert not any(work.iterdir()), "EqualizerAPO comparison needs an empty eapo-work directory"
+            env["VST_AUDIO_EAPO_WORK"] = str(work)
+            report["equalizer_apo_xt"] = {"url": EAPO[0], "sha256": EAPO[1]}
         # Core dumps can contain native code pages. They are neither needed nor retained.
         if sys.platform != "win32":
             import resource
             resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-        result = subprocess.run(["cargo", "test", "--locked", "-p", "vst-audio", "--test", "third_party", "--", "--ignored", "--nocapture", "--test-threads=1"], cwd=ROOT, env=env, capture_output=True, text=True, timeout=600)
+        result = subprocess.run(["cargo", "test", "--locked", "-p", "vst-audio", "--test", "third_party", "--", "--ignored", "--nocapture", "--test-threads=1"], cwd=ROOT, env=env, capture_output=True, text=True, timeout=1500)
         output = result.stdout + result.stderr
         print(output[-131072:], flush=True)
         (report_dir / "checks.log").write_text(output[-131072:], encoding="utf-8")
@@ -176,34 +210,6 @@ def main():
             assert mutation_passed, "mutation did not fail at the sound assertion"
         else:
             report["mutation"] = {"not_run": "macOS synthetic editor input is unsupported"}
-        if sys.platform == "win32":
-            # Temporary discovery step for the EqualizerAPO-XT comparison; never fails.
-            try:
-                import zipfile
-                url, digest = EAPO
-                package = root / "eapo.nupkg"
-                urllib.request.urlretrieve(url, package)
-                actual = hashlib.sha256(package.read_bytes()).hexdigest()
-                print(f"PROBE package digest {actual}", flush=True)
-                assert actual == digest
-                app = root / "eapo"
-                with zipfile.ZipFile(package) as archive:
-                    for member in archive.infolist():
-                        if member.filename.startswith("lib/app/") and not member.is_dir():
-                            target = app / member.filename[len("lib/app/"):]
-                            assert app in target.resolve().parents
-                            target.parent.mkdir(parents=True, exist_ok=True)
-                            target.write_bytes(archive.read(member))
-                # Windows PowerShell must not inherit pwsh's module path.
-                probe_env = {k: v for k, v in os.environ.items() if k.upper() != "PSMODULEPATH"}
-                probe = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
-                    ROOT / "tools/eapo_probe.ps1", "-Root", root / "eapo-probe", "-App", app,
-                    "-Vst3", paths["EQ_VST3"], "-Vst2", paths["EQ_VST2"]],
-                    capture_output=True, timeout=420, env=probe_env)
-                text = (probe.stdout or b"").decode("utf-8", "replace") + (probe.stderr or b"").decode("utf-8", "replace")
-                print(text[-200000:].encode("ascii", "backslashreplace").decode("ascii"), flush=True)
-            except Exception as error:
-                print(f"PROBE failed to run: {error}", flush=True)
         if report["returncode"]:
             raise SystemExit(report["returncode"])
         report["passed"] = True
