@@ -135,7 +135,11 @@ impl LaunchSecurity {
                     if !openable(&token, path)? {
                         return Err(windows::core::Error::new(
                             E_ACCESSDENIED,
-                            format!("the sandboxed worker cannot read {}", path.display()),
+                            format!(
+                                "the sandboxed worker cannot read {} ({})",
+                                path.display(),
+                                describe(path, user)
+                            ),
                         ));
                     }
                 }
@@ -144,6 +148,60 @@ impl LaunchSecurity {
         }
         Ok(security)
     }
+}
+
+/// Temporary: the security descriptor and user behind a denied open.
+fn describe(path: &Path, user: PSID) -> String {
+    let text = |pointer: PWSTR| {
+        // SAFETY: a successful conversion returned a terminated LocalAlloc string.
+        let value = unsafe { pointer.to_string() }.unwrap_or_default();
+        let _ = Local(HLOCAL(pointer.0.cast()));
+        value
+    };
+    let mut sid = PWSTR::null();
+    // SAFETY: live SID and writable output.
+    let user = unsafe { ConvertSidToStringSidW(user, &mut sid) }
+        .map(|()| text(sid))
+        .unwrap_or_else(|error| error.to_string());
+    let Ok(name) = wide(path) else {
+        return user;
+    };
+    let information = OWNER_SECURITY_INFORMATION
+        | GROUP_SECURITY_INFORMATION
+        | DACL_SECURITY_INFORMATION
+        | LABEL_SECURITY_INFORMATION;
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: terminated path and writable descriptor output.
+    let read = unsafe {
+        GetNamedSecurityInfoW(
+            PCWSTR(name.as_ptr()),
+            SE_FILE_OBJECT,
+            information,
+            None,
+            None,
+            None,
+            None,
+            &mut descriptor,
+        )
+    };
+    if read.is_err() {
+        return format!("user {user}, descriptor {read:?}");
+    }
+    let _descriptor = Local(HLOCAL(descriptor.0));
+    let mut sddl = PWSTR::null();
+    // SAFETY: live descriptor and writable output.
+    let sddl = unsafe {
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            descriptor,
+            SDDL_REVISION_1,
+            information,
+            &mut sddl,
+            None,
+        )
+    }
+    .map(|()| text(sddl))
+    .unwrap_or_else(|error| error.to_string());
+    format!("user {user}, {sddl}")
 }
 
 fn executables<'a>(exe: &'a Path, plugin: &'a Path) -> impl Iterator<Item = &'a Path> {
