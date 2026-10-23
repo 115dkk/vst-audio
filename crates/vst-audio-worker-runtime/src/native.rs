@@ -502,6 +502,7 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
                             let geometry = Geometry {
                                 sample_format: setup.sample_format,
                                 lanes: 1,
+                                slots: args.slots,
                                 input_channels: in_channels.into(),
                                 output_channels: out_channels.into(),
                                 max_frames,

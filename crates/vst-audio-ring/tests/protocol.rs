@@ -13,6 +13,7 @@ fn geometry(lanes: u32) -> Geometry {
     Geometry {
         sample_format: vst_audio_ring::SampleFormat::F32,
         lanes,
+        slots: 2,
         input_channels: 2,
         output_channels: 6,
         max_frames: 64,
@@ -24,9 +25,34 @@ fn geometry(lanes: u32) -> Geometry {
 #[test]
 fn header_layout_is_pinned() {
     assert_eq!(vst_audio_ring::MAGIC.to_le_bytes(), *b"SSRR");
+    assert_eq!(vst_audio_ring::LAYOUT_VERSION, 3);
     assert_eq!(vst_audio_ring::HEADER_BYTES, 512);
     assert_eq!(geometry(1).total_bytes().unwrap(), 299_008);
     assert_eq!(geometry(2).total_bytes().unwrap(), 597_376);
+}
+
+#[test]
+fn slot_bounds_are_validated() {
+    for slots in [2, 16] {
+        assert!(
+            Geometry {
+                slots,
+                ..geometry(1)
+            }
+            .validate()
+            .is_ok()
+        );
+    }
+    for slots in [1, 17] {
+        assert_eq!(
+            Geometry {
+                slots,
+                ..geometry(1)
+            }
+            .validate(),
+            Err(vst_audio_ring::GeometryError::Slots)
+        );
+    }
 }
 
 #[test]
@@ -209,7 +235,7 @@ fn fault_code_and_peer_gone_are_observable() {
 fn hostile_headers_are_rejected() {
     let cases: &[(usize, u32, HeaderError)] = &[
         (0, 0, HeaderError::Magic),
-        (1, 99, HeaderError::Version),
+        (1, 2, HeaderError::Version),
         (2, 0, HeaderError::TotalBytes),
         (
             3,
@@ -231,9 +257,16 @@ fn hostile_headers_are_rejected() {
             999,
             HeaderError::Geometry(vst_audio_ring::GeometryError::SampleRate),
         ),
+        (
+            14,
+            1,
+            HeaderError::Geometry(vst_audio_ring::GeometryError::Slots),
+        ),
+        // Three slots is valid geometry, but disagrees with this two-slot region.
+        (14, 3, HeaderError::TotalBytes),
         (16, 0, HeaderError::LaneGeometry),
         (17, 512, HeaderError::LaneGeometry),
-        (18, 0, HeaderError::LaneGeometry),
+        (18, 3, HeaderError::LaneGeometry),
     ];
     for &(index, value, expected) in cases {
         let prefix: Vec<_> = (0..geometry(1).total_bytes().unwrap() / 4 - 32)
@@ -319,8 +352,33 @@ fn corrupt_and_truncated_regions_are_rejected_at_boundary() {
 }
 
 #[test]
-fn pipeline_rule_covers_first_misses_generation_and_late_results() {
+fn deeper_ring_reuses_only_completed_slots_and_rejects_overwritten_reads() {
+    let g = Geometry {
+        slots: 5,
+        ..geometry(1)
+    };
+    let storage = RegionBuf::new(g).unwrap();
+    let event = InProcessEvent::new();
+    let mut producer = Producer::new(storage.region(), [None, None], &event);
+    producer.announce(g, 1).unwrap();
+    let mut consumer = Consumer::new(storage.region(), &event, [None, None]);
+    consumer.validate_and_ready(2).unwrap();
+    for sequence in 1..=5 {
+        assert_eq!(
+            producer.try_publish(0, sequence, |_| {}),
+            Publish::Published
+        );
+    }
+    assert_eq!(producer.try_publish(0, 6, |_| {}), Publish::Dropped);
+    consumer.complete(0, 1);
+    assert_eq!(producer.try_publish(0, 6, |_| {}), Publish::Published);
+    assert!(!producer.try_read(0, 1, |_| {}));
+}
+
+#[test]
+fn pipeline_rule_covers_depth_generation_and_late_results() {
     let mut pipeline = Pipeline::new();
+    assert_eq!(pipeline.depth(), 1);
     assert_eq!(pipeline.output_sequence(0, 1, 0), None);
     pipeline.published(1, 0, 1);
     assert_eq!(pipeline.output_sequence(1, 1, 1), Some(1));
@@ -330,4 +388,19 @@ fn pipeline_rule_covers_first_misses_generation_and_late_results() {
     assert_eq!(pipeline.output_sequence(4, 1, 2), None);
     pipeline.published(3, 4, 1);
     assert_eq!(pipeline.output_sequence(5, 2, 3), None);
+
+    pipeline.set_depth(4);
+    assert_eq!(pipeline.depth(), 4);
+    for block in 0..4 {
+        assert_eq!(pipeline.output_sequence(block, 7, u32::MAX), None);
+    }
+    pipeline.published(10, 0, 7);
+    assert_eq!(pipeline.output_sequence(4, 7, 10), Some(10));
+    pipeline.published(11, 1, 7);
+    assert_eq!(pipeline.output_sequence(5, 7, 10), None);
+    assert_eq!(pipeline.output_sequence(6, 7, 11), None);
+
+    let mut maximum = Pipeline::with_depth(vst_audio_ring::MAX_SLOTS);
+    maximum.published(20, 0, 9);
+    assert_eq!(maximum.output_sequence(16, 9, 20), Some(20));
 }

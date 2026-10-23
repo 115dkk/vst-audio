@@ -40,11 +40,15 @@ if let Some(instance) = task.try_complete()? {
 ```
 
 `Instance::take_audio` transfers the unique preallocated audio endpoint.
-It accepts variable-length planar f32/f64 callbacks, reblocks them into a
-prepared quantum, and carries bounded sample-offset MIDI/SysEx, automation and
-transport data. It returns processed or explicit fallback output, reports two
-quanta plus plugin latency, and swaps recovered workers at audio boundaries. The supervisor runs
-even when the GUI does not poll. Drop audio resources on a control thread.
+It accepts variable-length planar f32/f64 callbacks up to the configured
+`max_callback_frames`, reblocks them into a prepared quantum, and carries bounded
+sample-offset MIDI/SysEx, automation and transport data. The implemented ring
+uses a configurable number of slots per lane and a matching fixed pipeline depth.
+The endpoint returns processed or explicit fallback output and reports
+`(ceil(max_callback_frames / quantum) + 1) * quantum` plus plugin latency; the
+default remains two quanta plus plugin latency. Recovered workers swap at audio
+boundaries. The supervisor runs even when the GUI does not poll. Drop audio
+resources on a control thread.
 
 Build and test:
 

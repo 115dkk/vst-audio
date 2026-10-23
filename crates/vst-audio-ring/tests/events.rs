@@ -5,6 +5,7 @@ fn double_precision_and_bounded_packets_round_trip() {
     let geometry = Geometry {
         sample_format: SampleFormat::F64,
         lanes: 1,
+        slots: 2,
         input_channels: 0,
         output_channels: 2,
         max_frames: 64,

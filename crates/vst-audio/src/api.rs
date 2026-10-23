@@ -15,8 +15,13 @@ use std::{
 #[derive(Clone, Debug)]
 pub struct Configuration {
     pub sample_rate: u32,
-    /// Worker processing quantum; caller callbacks may have variable lengths.
+    /// Worker processing quantum. A callback may be any length up to
+    /// `max_callback_frames`, which defaults to this value.
     pub quantum: u32,
+    /// Largest accepted callback. Longer callbacks are refused because later
+    /// quanta could not be processed in time. Latency is
+    /// `(ceil(max_callback_frames / quantum) + 1) * quantum + plugin latency`.
+    pub max_callback_frames: Option<u32>,
     pub fallback: Fallback,
     pub recovery: RecoveryPolicy,
     pub sample_format: vst_audio_protocol::SampleFormat,
@@ -32,6 +37,7 @@ impl Default for Configuration {
         Self {
             sample_rate: 48_000,
             quantum: 128,
+            max_callback_frames: None,
             fallback: Fallback::Silence,
             recovery: RecoveryPolicy::Manual,
             sample_format: vst_audio_protocol::SampleFormat::F32,
@@ -76,11 +82,35 @@ impl Launch {
     }
 }
 impl Configuration {
+    fn callback_geometry(&self) -> Result<(u32, u32, u32), StartError> {
+        let maximum = self.max_callback_frames.unwrap_or(self.quantum);
+        if maximum == 0 || self.quantum == 0 {
+            return Err(StartError(format!(
+                "max_callback_frames {maximum} and quantum {} must both be nonzero",
+                self.quantum
+            )));
+        }
+        let depth = maximum / self.quantum + u32::from(!maximum.is_multiple_of(self.quantum));
+        let slots = depth.saturating_add(1);
+        if slots > crate::MAX_SLOTS {
+            return Err(StartError(format!(
+                "max_callback_frames {maximum} with quantum {} requires {slots} slots, but MAX_SLOTS is {}",
+                self.quantum,
+                crate::MAX_SLOTS
+            )));
+        }
+        Ok((maximum, depth, slots))
+    }
+
     fn options(&self, cancel: Option<Arc<AtomicBool>>) -> crate::ProcessingOptions {
+        let (_, _, slots) = self
+            .callback_geometry()
+            .expect("configuration is validated before starting or recovering");
         crate::ProcessingOptions {
             cancel,
             sample_rate: self.sample_rate,
             quantum: self.quantum,
+            slots,
             sample_format: self.sample_format,
             offline: self.offline,
             sandbox: self.sandbox.clone(),
@@ -206,13 +236,21 @@ impl Host {
         {
             return Err(StartError("invalid recovery policy".into()));
         }
+        let (max_callback_frames, depth, _) = config.callback_geometry()?;
         let launch = Launch {
             worker: self.worker_for(plugin)?,
             plugin: plugin.clone(),
             configuration: config.clone(),
         };
         let started = launch.start(state, cancel.clone())?;
-        Instance::new(started, config.fallback, launch, cancel)
+        Instance::new(
+            started,
+            config.fallback,
+            max_callback_frames,
+            depth,
+            launch,
+            cancel,
+        )
     }
     /// Starts loading on a dedicated control thread; polling never blocks the GUI.
     pub fn spawn_async(
@@ -419,6 +457,8 @@ impl Instance {
     fn new(
         started: Started,
         fallback: Fallback,
+        max_callback_frames: u32,
+        depth: u32,
         launch: Launch,
         cancel: Arc<AtomicBool>,
     ) -> Result<Self, StartError> {
@@ -461,7 +501,15 @@ impl Instance {
         };
         let (updates, next) = rtrb::RingBuffer::new(2);
         let (retired, retirements) = rtrb::RingBuffer::new(2);
-        let audio = AudioEndpoint::new(prepared, fallback, shared.clone(), next, retired)?;
+        let audio = AudioEndpoint::new(
+            prepared,
+            fallback,
+            max_callback_frames,
+            depth,
+            shared.clone(),
+            next,
+            retired,
+        )?;
         let (requests, rx) = mpsc::sync_channel(8);
         let (tx, events) = mpsc::sync_channel(16);
         let control_shared = shared.clone();

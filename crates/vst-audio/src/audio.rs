@@ -42,6 +42,8 @@ pub struct AudioEndpoint {
     next: rtrb::Consumer<PreparedAudio>,
     retired: rtrb::Producer<PreparedAudio>,
     fallback: Fallback,
+    max_callback_frames: u32,
+    depth: u32,
     sequence: u32,
     block: u64,
     stream_position: u64,
@@ -67,13 +69,19 @@ impl AudioEndpoint {
     pub(crate) fn new(
         active: PreparedAudio,
         fallback: Fallback,
+        max_callback_frames: u32,
+        depth: u32,
         shared: Arc<Shared>,
         next: rtrb::Consumer<PreparedAudio>,
         retired: rtrb::Producer<PreparedAudio>,
     ) -> Result<Self, StartError> {
         let g = active.geometry;
         let q = g.max_frames as usize;
-        let history_len = g.latency_bound_frames as usize + 2 * q + 1;
+        let history_len =
+            g.latency_bound_frames
+                .checked_add((depth + 1).saturating_mul(g.max_frames))
+                .and_then(|frames| frames.checked_add(1))
+                .ok_or_else(|| StartError("fallback delay overflow".into()))? as usize;
         let history_samples = if fallback == Fallback::DelayedInput {
             history_len
                 .checked_mul(g.output_channels as usize)
@@ -91,10 +99,12 @@ impl AudioEndpoint {
             next,
             retired,
             fallback,
+            max_callback_frames,
+            depth,
             sequence: 1,
             block: 0,
             stream_position: 0,
-            pipeline: Pipeline::default(),
+            pipeline: Pipeline::with_depth(depth),
             fill: 0,
             output_at: 0,
             ready: false,
@@ -153,10 +163,16 @@ impl AudioEndpoint {
     pub fn generation(&self) -> u64 {
         self.active.generation
     }
-    /// Reblocking/IPC adds two quanta, independently of plugin-reported latency.
+    /// Reblocking/IPC latency is `(depth + 1) * quantum`, independently of
+    /// plugin-reported latency.
     pub fn latency_frames(&self) -> usize {
-        2 * self.active.geometry.max_frames as usize + self.active.latency as usize
+        (self.depth as usize + 1) * self.active.geometry.max_frames as usize
+            + self.active.latency as usize
     }
+    /// Processes any callback length up to the configured `max_callback_frames`.
+    /// Longer callbacks are refused because later quanta could not be processed
+    /// in time; latency is `(ceil(max_callback / quantum) + 1) * quantum` plus
+    /// plugin latency.
     pub fn process(&mut self, inputs: &[&[f32]], outputs: &mut [&mut [f32]]) -> AudioStatus {
         let frames = outputs
             .first()
@@ -166,6 +182,7 @@ impl AudioEndpoint {
         self.process_events(frames, inputs, outputs, self.next_context, &[], &mut [])
             .status
     }
+    /// Processes any callback length up to the configured `max_callback_frames`.
     pub fn process_f64(&mut self, inputs: &[&[f64]], outputs: &mut [&mut [f64]]) -> AudioStatus {
         let frames = outputs
             .first()
@@ -175,6 +192,7 @@ impl AudioEndpoint {
         self.process_events_f64(frames, inputs, outputs, self.next_context, &[], &mut [])
             .status
     }
+    /// Processes events with any callback length up to `max_callback_frames`.
     pub fn process_events(
         &mut self,
         frames: usize,
@@ -186,6 +204,7 @@ impl AudioEndpoint {
     ) -> ProcessReport {
         self.process_inner(frames, inputs, outputs, transport, events, output_events)
     }
+    /// Processes events with any callback length up to `max_callback_frames`.
     pub fn process_events_f64(
         &mut self,
         frames: usize,
@@ -215,7 +234,7 @@ impl AudioEndpoint {
             generation: self.active.generation,
         };
         let invalid = if T::FORMAT != g.sample_format
-            || frames > 65536
+            || frames > self.max_callback_frames as usize
             || inputs.len() != g.input_channels as usize
             || outputs.len() != g.output_channels as usize
             || inputs.iter().any(|p| p.len() != frames)

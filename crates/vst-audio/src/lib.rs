@@ -26,7 +26,7 @@ pub use vst_audio_protocol::{EditPhase, Parameter};
 
 pub use vst_audio_protocol::{BusConfiguration, Capabilities, ProcessingSetup, SampleFormat};
 pub use vst_audio_ring::{
-    Event as AudioEvent, EventBuffer, EventData, MAX_EVENTS, MAX_SYSEX_BYTES, Transport,
+    Event as AudioEvent, EventBuffer, EventData, MAX_EVENTS, MAX_SLOTS, MAX_SYSEX_BYTES, Transport,
 };
 
 mod audio;

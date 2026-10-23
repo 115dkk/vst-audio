@@ -4,9 +4,13 @@ The native matrix runs a repeated recovery test for each format. It varies
 callback lengths through 1, 7, 37, 83, 129 and 256 samples, injects four worker
 crashes, and requires four complete generation changes while a second plugin
 continues producing numerically correct samples. At least 400 healthy callbacks
-per format must pass. The callback allocator guard covers both instances,
-including endpoint handover and retirement. A 45-second deadline bounds each
-format's run; host scheduling latency is not a hardware audio benchmark.
+per format must pass, and at least 90% of measured healthy-peer callbacks must be
+processed rather than use fallback. A separate native test runs real-time-paced
+480-frame callbacks over a 128-frame quantum after warm-up, requires at least 95%
+processed callbacks with numeric output, and verifies that 481 frames are refused
+without disturbing following calls. The callback allocator guard covers both
+instances, including endpoint handover and retirement. The wall-clock deadline
+bounds hangs; hosted scheduling latency is not a hardware audio benchmark.
 
 `python3 tools/fuzz_tests.py` runs two coverage-guided libFuzzer targets for
 120 seconds each, using cargo-fuzz 0.13.2 and nightly-2026-10-20:
