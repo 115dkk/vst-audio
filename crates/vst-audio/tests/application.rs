@@ -789,6 +789,12 @@ fn editor_visibility_focus_scaling_errors_and_pixels_roundtrip() {
                 assert_eq!((status.width, status.height, status.scale), (w, h, scale));
                 assert!(status.resize_supported && status.scale_supported);
             }
+        } else if cfg!(target_os = "macos") {
+            // macOS leaves Retina scaling to the system: no VST 2 scale request.
+            assert!(matches!(
+                wait(control.request(Command::Editor(A::Scale(1.5))).unwrap()),
+                HostEvent::RequestFailed { .. }
+            ));
         } else {
             // The VST 2 fixture accepts the 'PreS'/'AeCs' content scale and
             // reports its 320x200 rectangle scaled.
