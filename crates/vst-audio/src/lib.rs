@@ -39,5 +39,5 @@ pub use audio::{AudioEndpoint, AudioStatus, ProcessReport};
 mod supervision;
 
 pub use vst_audio_protocol::{
-    EditorAction, EditorImage, EditorPlatform, EditorStatus, ParentWindow,
+    EditorAction, EditorImage, EditorPlatform, EditorScaling, EditorStatus, ParentWindow,
 };

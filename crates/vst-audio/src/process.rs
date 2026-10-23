@@ -363,13 +363,25 @@ impl PluginControl {
         self.request(Message::Editor(action), RequestKind::Editor)
     }
     pub fn open_editor(&mut self) -> Result<u32, StartError> {
-        self.request(Message::OpenEditor, RequestKind::Editor)
+        self.open_editor_with(None, vst_audio_protocol::EditorScaling::Auto)
     }
     pub fn open_editor_in(
         &mut self,
         parent: vst_audio_protocol::ParentWindow,
     ) -> Result<u32, StartError> {
-        self.request(Message::OpenEditorIn { parent }, RequestKind::Editor)
+        self.open_editor_with(Some(parent), vst_audio_protocol::EditorScaling::Auto)
+    }
+    /// Open a floating or embedded editor with an explicit scaling policy.
+    pub fn open_editor_with(
+        &mut self,
+        parent: Option<vst_audio_protocol::ParentWindow>,
+        scaling: vst_audio_protocol::EditorScaling,
+    ) -> Result<u32, StartError> {
+        let message = match parent {
+            Some(parent) => Message::OpenEditorIn { parent, scaling },
+            None => Message::OpenEditor { scaling },
+        };
+        self.request(message, RequestKind::Editor)
     }
     pub fn latency(&self) -> u32 {
         self.watch.latency()

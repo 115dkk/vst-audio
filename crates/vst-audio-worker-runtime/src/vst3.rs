@@ -107,14 +107,18 @@ impl Plugin for Vst3 {
         let (component, controller) = state::decode(blob)?;
         self.inner.set_state(component, controller).map_err(error)
     }
-    fn open_editor(&mut self) -> Result<(), PluginError> {
-        self.inner.open_editor().map_err(error)
+    fn open_editor(
+        &mut self,
+        scaling: vst_audio_protocol::EditorScaling,
+    ) -> Result<(), PluginError> {
+        self.inner.open_editor(scaling).map_err(error)
     }
     fn open_editor_in(
         &mut self,
         parent: vst_audio_protocol::ParentWindow,
+        scaling: vst_audio_protocol::EditorScaling,
     ) -> Result<(), PluginError> {
-        self.inner.open_editor_in(parent).map_err(error)
+        self.inner.open_editor_in(parent, scaling).map_err(error)
     }
     fn editor_action(
         &mut self,

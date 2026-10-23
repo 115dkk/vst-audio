@@ -62,3 +62,4 @@ pub mod vst2_events;
 mod vst3_events;
 
 mod editor_probe;
+mod editor_scaling;

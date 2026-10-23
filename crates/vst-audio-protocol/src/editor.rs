@@ -19,6 +19,23 @@ pub enum EditorAction {
     Inspect,
     Capture,
 }
+/// How an editor is fitted to the display's scale when it opens.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(u8)]
+#[non_exhaustive]
+pub enum EditorScaling {
+    /// The plugin scales itself when it can; otherwise the system stretches
+    /// it where the platform can (Windows), else it stays 1:1.
+    #[default]
+    Auto = 0,
+    /// Only the plugin scales; a plugin that cannot stays 1:1.
+    Plugin = 1,
+    /// The system stretches a 1:1 drawing (sharpness is lost). Windows
+    /// floating editors only; elsewhere the open fails with a request error.
+    Stretch = 2,
+    /// No scaling: the plugin is told nothing and draws 1:1 physical pixels.
+    Off = 3,
+}
 /// The backend actually hosting the editor, independent of the requested policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -32,6 +49,7 @@ pub enum EditorPlatform {
 #[derive(Clone, Debug, PartialEq)]
 pub struct EditorStatus {
     pub platform: EditorPlatform,
+    pub scaling: EditorScaling,
     pub visible: bool,
     pub embedded: bool,
     pub width: u32,

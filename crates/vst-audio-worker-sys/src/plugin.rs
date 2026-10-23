@@ -2,7 +2,7 @@
 //! VST 2 lifecycle calls close a non-waiting audio admission gate. UI and
 //! parameter calls may overlap DSP, using copied ABI function pointers rather
 //! than Rust references to foreign mutable storage. Callbacks use atomics/TLS.
-use crate::{editor::EditorWindow, library::Library, vst2::*};
+use crate::{editor::EditorWindow, editor_scaling, library::Library, vst2::*};
 use std::{
     cell::Cell,
     ffi::{CStr, CString, c_void},
@@ -13,6 +13,7 @@ use std::{
     },
     time::Duration,
 };
+use vst_audio_protocol::EditorScaling;
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
@@ -149,6 +150,10 @@ pub struct Vst2Plugin {
     shared: Arc<Shared>,
     info: Info,
     editor: Option<EditorWindow>,
+    editor_mode: EditorScaling,
+    editor_scaling: EditorScaling,
+    editor_scale: f32,
+    editor_scale_supported: bool,
     closed: bool,
     resized: Option<(u32, u32)>,
     configured: bool,
@@ -293,6 +298,10 @@ impl Vst2Plugin {
             shared,
             info,
             editor: None,
+            editor_mode: EditorScaling::Auto,
+            editor_scaling: EditorScaling::Off,
+            editor_scale: 1.0,
+            editor_scale_supported: false,
             closed: false,
             resized: None,
             configured: false,
@@ -564,23 +573,26 @@ impl Vst2Plugin {
         }
         Ok(())
     }
-    pub fn open_editor(&mut self) -> Result<(), PluginError> {
-        self.open_editor_at(None)
+    pub fn open_editor(&mut self, scaling: EditorScaling) -> Result<(), PluginError> {
+        self.open_editor_at(None, scaling)
     }
     pub fn open_editor_in(
         &mut self,
         parent: vst_audio_protocol::ParentWindow,
+        scaling: EditorScaling,
     ) -> Result<(), PluginError> {
-        self.open_editor_at(Some(parent))
+        self.open_editor_at(Some(parent), scaling)
     }
     fn open_editor_at(
         &mut self,
         parent: Option<vst_audio_protocol::ParentWindow>,
+        scaling: EditorScaling,
     ) -> Result<(), PluginError> {
+        editor_scaling::validate(scaling, parent)?;
         if self
             .editor
             .as_ref()
-            .is_some_and(|editor| editor.parent() == parent)
+            .is_some_and(|editor| editor.parent() == parent && self.editor_mode == scaling)
         {
             return Ok(());
         }
@@ -591,12 +603,43 @@ impl Vst2Plugin {
         self.shared.callback.size.store(0, Ordering::Release);
         if self.editor.is_some() {
             let control = self.shared.calls();
+            let _dpi = self.editor.as_ref().map(editor_scaling::scope);
+            // Reset the old Plugin session before closing: some VST2 adapters
+            // retain the scale across EDIT_CLOSE. Off/Stretch opens send nothing.
+            if self.editor_scaling == EditorScaling::Plugin && self.editor_scale != 1.0 {
+                set_vst2_scale(&control, 1.0);
+            }
             control.call(EDIT_CLOSE, 0, 0, std::ptr::null_mut(), 0.0);
             self.editor = None;
         }
         let control = self.shared.calls();
         if control.effect().flags & HAS_EDITOR == 0 {
             return Err(PluginError("plugin has no editor".into()));
+        }
+        self.editor_mode = scaling;
+        self.editor_scale = 1.0;
+        self.editor_scale_supported = control.call(
+            51,
+            0,
+            0,
+            c"supportsViewDpiScaling".as_ptr().cast_mut().cast(),
+            0.0,
+        ) == 1;
+        let request = !cfg!(target_os = "macos")
+            && self.editor_scale_supported
+            && editor_scaling::requests_scale(scaling);
+        self.editor_scaling = if request {
+            EditorScaling::Plugin
+        } else {
+            editor_scaling::fallback(scaling, parent)
+        };
+        // Create the actual native parent first so its own display/monitor is
+        // authoritative. Scaling must precede even the first effEditGetRect.
+        let editor = editor_scaling::open(&self.info.name, parent, 640, 480, self.editor_scaling)?;
+        let _dpi = editor_scaling::scope(&editor);
+        if request {
+            self.editor_scale = editor_scaling::platform_scale(&editor);
+            set_vst2_scale(&control, self.editor_scale);
         }
         // effEditGetRect writes a pointer to the plugin's own rectangle, or
         // leaves the out-pointer alone (some plugins return null instead).
@@ -621,12 +664,9 @@ impl Vst2Plugin {
             i32::from(rect.right) - i32::from(rect.left),
             i32::from(rect.bottom) - i32::from(rect.top),
         );
-        let editor = match parent {
-            Some(parent) => EditorWindow::open_embedded(parent, width, height)
-                .map_err(|e| PluginError(e.to_string()))?,
-            None => EditorWindow::open(&self.info.name, width, height)
-                .map_err(|e| PluginError(e.to_string()))?,
-        };
+        editor
+            .resize(width, height)
+            .map_err(|e| PluginError(e.to_string()))?;
         self.shared
             .callback
             .editor_open
@@ -670,6 +710,24 @@ impl Vst2Plugin {
         action: vst_audio_protocol::EditorAction,
     ) -> Result<vst_audio_protocol::EditorReply, PluginError> {
         use vst_audio_protocol::{EditorAction as A, EditorReply, EditorStatus};
+        #[cfg(windows)]
+        if let A::Scale(scale) = action
+            && self.editor_scaling == EditorScaling::Stretch
+            && self.editor.is_some()
+            && self.editor_scale_supported
+            && scale.is_finite()
+            && (0.5..=4.0).contains(&scale)
+        {
+            let visible = self
+                .editor
+                .as_ref()
+                .and_then(|w| w.status().ok())
+                .is_some_and(|s| s.0);
+            self.open_editor_at(None, EditorScaling::Plugin)?;
+            if !visible && let Some(window) = &self.editor {
+                window.show(false).map_err(|e| PluginError(e.to_string()))?;
+            }
+        }
         let window = self
             .editor
             .as_ref()
@@ -679,7 +737,25 @@ impl Vst2Plugin {
             A::Hide => window.show(false).map_err(|e| PluginError(e.to_string()))?,
             A::Focus => window.focus().map_err(|e| PluginError(e.to_string()))?,
             A::Inspect => {}
-            A::Resize { .. } | A::Scale(_) => {
+            A::Scale(scale) => {
+                if !scale.is_finite() || !(0.5..=4.0).contains(&scale) {
+                    return Err(PluginError("invalid content scale".into()));
+                }
+                if !self.editor_scale_supported || cfg!(target_os = "macos") {
+                    return Err(PluginError("editor scaling unsupported".into()));
+                }
+                let _dpi = editor_scaling::scope(window);
+                let control = self.shared.calls();
+                set_vst2_scale(&control, scale);
+                resize_vst2(&control, window)?;
+                self.editor_scale = scale;
+                self.editor_mode = EditorScaling::Plugin;
+                self.editor_scaling = EditorScaling::Plugin;
+                if let Ok((_, width, height)) = window.status() {
+                    self.resized = Some((width, height));
+                }
+            }
+            A::Resize { .. } => {
                 return Err(PluginError(
                     "VST2 has no standard host-driven resize or scale contract".into(),
                 ));
@@ -701,9 +777,10 @@ impl Vst2Plugin {
             embedded: window.parent().is_some(),
             width,
             height,
-            scale: 1.0,
+            scale: self.editor_scale,
+            scaling: self.editor_scaling,
             resize_supported: false,
-            scale_supported: false,
+            scale_supported: self.editor_scale_supported,
         }))
     }
     pub fn request_editor_close(&mut self) -> Result<(), PluginError> {
@@ -714,6 +791,12 @@ impl Vst2Plugin {
                 .store(false, Ordering::Release);
             self.shared.callback.size.store(0, Ordering::Release);
             let control = self.shared.calls();
+            let _dpi = self.editor.as_ref().map(editor_scaling::scope);
+            // Reset the old Plugin session before closing: some VST2 adapters
+            // retain the scale across EDIT_CLOSE. Off/Stretch opens send nothing.
+            if self.editor_scaling == EditorScaling::Plugin && self.editor_scale != 1.0 {
+                set_vst2_scale(&control, 1.0);
+            }
             control.call(EDIT_CLOSE, 0, 0, std::ptr::null_mut(), 0.0);
             self.editor = None;
             self.closed = true;
@@ -722,6 +805,7 @@ impl Vst2Plugin {
     }
     pub fn idle(&mut self) {
         if let Some(editor) = &self.editor {
+            let _dpi = editor_scaling::scope(editor);
             let control = self.shared.calls();
             control.call(EDIT_IDLE, 0, 0, std::ptr::null_mut(), 0.0);
             let size = self.shared.callback.size.swap(0, Ordering::AcqRel);
@@ -734,12 +818,32 @@ impl Vst2Plugin {
                     self.resized = Some((width, height));
                 }
             }
-            if editor.pump() {
+            let closed = editor.pump();
+            #[cfg(windows)]
+            if !closed && let Some(change) = editor.take_dpi_change() {
+                let _dpi = editor.dpi_scope();
+                if self.editor_scaling == EditorScaling::Plugin {
+                    set_vst2_scale(&control, change.scale);
+                    self.editor_scale = change.scale;
+                    if let Err(error) = resize_vst2(&control, editor) {
+                        eprintln!("VST2 DPI resize failed: {error}");
+                    }
+                } else if let Err(error) = editor.apply_dpi_rectangle(change) {
+                    eprintln!("VST2 DPI rectangle failed: {error}");
+                }
+                if let Ok((_, width, height)) = editor.status() {
+                    self.resized = Some((width, height));
+                }
+            }
+            if closed {
                 self.shared
                     .callback
                     .editor_open
                     .store(false, Ordering::Release);
                 self.shared.callback.size.store(0, Ordering::Release);
+                if self.editor_scaling == EditorScaling::Plugin && self.editor_scale != 1.0 {
+                    set_vst2_scale(&control, 1.0);
+                }
                 control.call(EDIT_CLOSE, 0, 0, std::ptr::null_mut(), 0.0);
                 self.editor = None;
                 self.closed = true;
@@ -770,6 +874,35 @@ impl Vst2Plugin {
             fault: self.shared.callback.invalid.load(Ordering::Acquire),
         }
     }
+}
+// DPF b801214e distrho/src/DistrhoPluginVST2.cpp:948 and
+// DistrhoUtils.hpp:83: d_cconst packs a<<24 | b<<16 | c<<8 | d.
+// The vendor dispatch has no acceptance result (DPF returns zero).
+fn set_vst2_scale(control: &Control<'_>, scale: f32) {
+    control.call(50, 0x5072_6553, 0x4165_4373, std::ptr::null_mut(), scale);
+}
+fn resize_vst2(control: &Control<'_>, window: &EditorWindow) -> Result<(), PluginError> {
+    let mut rect = std::ptr::null::<Rect>();
+    control.call(
+        EDIT_GET_RECT,
+        0,
+        0,
+        (&mut rect as *mut *const Rect).cast(),
+        0.0,
+    );
+    if rect.is_null() {
+        return Err(PluginError("plugin returned no editor rectangle".into()));
+    }
+    // SAFETY: plugin-owned rectangle is valid until the next foreign dispatcher call.
+    let rect = unsafe { rect.read() };
+    let width = i32::from(rect.right) - i32::from(rect.left);
+    let height = i32::from(rect.bottom) - i32::from(rect.top);
+    if !(1..=8192).contains(&width) || !(1..=8192).contains(&height) {
+        return Err(PluginError("invalid editor rectangle".into()));
+    }
+    window
+        .resize(width, height)
+        .map_err(|e| PluginError(e.to_string()))
 }
 impl Drop for Vst2Plugin {
     fn drop(&mut self) {

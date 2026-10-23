@@ -93,7 +93,7 @@ pub extern "C" fn VSTPluginMain(host: Callback) -> *mut AEffect {
             rect: Rect {
                 top: 0,
                 left: 0,
-                bottom: 240,
+                bottom: 200,
                 right: 320,
             },
             canvas: None,
@@ -135,10 +135,10 @@ unsafe fn observe_time(effect: *mut AEffect, slot: usize) {
 unsafe extern "C" fn dispatch(
     effect: *mut AEffect,
     opcode: i32,
-    _index: i32,
+    index: i32,
     value: isize,
     pointer: *mut c_void,
-    _option: f32,
+    option: f32,
 ) -> isize {
     if effect.is_null() {
         return 0;
@@ -246,7 +246,13 @@ unsafe extern "C" fn dispatch(
             }
             control.idle_once = false;
             // SAFETY: platform parent supplied by host, used on main thread only.
-            control.canvas = unsafe { crate::visual::Canvas::attach(pointer) };
+            control.canvas = unsafe {
+                crate::visual::Canvas::attach(
+                    pointer,
+                    i32::from(control.rect.right - control.rect.left),
+                    i32::from(control.rect.bottom - control.rect.top),
+                )
+            };
             isize::from(control.canvas.is_some())
         }
         EDIT_CLOSE => {
@@ -281,7 +287,33 @@ unsafe extern "C" fn dispatch(
             let shell = shell && child == 0;
             if shell { 10 } else { 1 }
         }
-        51 => 0,
+        50 if index == 0x50726553 && value == 0x41654373 && pointer.is_null() => {
+            if !option.is_finite() || option <= 0.0 {
+                return 0;
+            }
+            let scale = f64::from(option);
+            let width = (320.0 * scale).round().clamp(1.0, f64::from(i16::MAX)) as i16;
+            let height = (200.0 * scale).round().clamp(1.0, f64::from(i16::MAX)) as i16;
+            control.rect.right = control.rect.left.saturating_add(width);
+            control.rect.bottom = control.rect.top.saturating_add(height);
+            observations[11].store(option.to_bits(), Ordering::Relaxed);
+            eprintln!("fixture VST2 scale={option}, size={width}x{height}");
+            if let Some(canvas) = control.canvas.as_ref() {
+                canvas.resize(i32::from(width), i32::from(height));
+            }
+            1
+        }
+        51 => {
+            if mode.load(Ordering::Relaxed) == 19 || pointer.is_null() {
+                0
+            } else {
+                // SAFETY: canDo supplies a terminated capability name.
+                isize::from(
+                    unsafe { std::ffi::CStr::from_ptr(pointer.cast()) }
+                        == c"supportsViewDpiScaling",
+                )
+            }
+        }
         70 => {
             // SAFETY: configured child count is immutable after entry.
             let shell_children = unsafe { (*raw).shell_children };
@@ -359,7 +391,7 @@ unsafe extern "C" fn dispatch(
                 mode.store(12, Ordering::Relaxed);
                 return 1;
             }
-            if chunk[0] != 1 || chunk[1] > 18 {
+            if chunk[0] != 1 || chunk[1] > 19 {
                 return 0;
             }
             if chunk[1] == 5 {

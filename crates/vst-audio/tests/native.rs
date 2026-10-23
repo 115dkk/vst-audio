@@ -4,7 +4,7 @@ use std::{
     path::PathBuf,
     time::{Duration, Instant},
 };
-use vst_audio::{ControlEvent, PluginFormat, PluginProcess, Started};
+use vst_audio::{ControlEvent, EditorScaling, PluginFormat, PluginProcess, Started};
 use vst_audio_protocol::{Action, HostWatch, Message, Received, StateHistory};
 use vst_audio_ring::{Publish, SlotReader, SlotWriter, Wait};
 
@@ -148,7 +148,158 @@ macro_rules! format_tests {
                 );
             }
             #[test]
-            #[ignore = "needs vst-audio-worker and the test plugin; run by the plughost CI job"]
+            #[ignore = "native fixtures and display required"]
+            #[cfg(any(windows, target_os = "linux"))]
+            fn editor_scaling_policies() {
+                #[cfg(target_os = "linux")]
+                let _dpi = vst_audio_test_window::ResourceManager::set(Some("Xft.dpi: 192\n"));
+                let mut started = start(0);
+                let plugin_scale = if cfg!(target_os = "linux") { 2.0 } else { 1.0 };
+                let plugin_size = if cfg!(target_os = "linux") {
+                    (640, 400)
+                } else {
+                    (320, 200)
+                };
+                for (scaling, resolved, scale, size) in [
+                    (
+                        EditorScaling::Auto,
+                        EditorScaling::Plugin,
+                        plugin_scale,
+                        plugin_size,
+                    ),
+                    (EditorScaling::Off, EditorScaling::Off, 1.0, (320, 200)),
+                    (
+                        EditorScaling::Plugin,
+                        EditorScaling::Plugin,
+                        plugin_scale,
+                        plugin_size,
+                    ),
+                ] {
+                    let request = started
+                        .control
+                        .open_editor_with(None, scaling)
+                        .expect("open editor request");
+                    assert_eq!(response(&mut started, request), Message::Ack);
+                    let inspect = started
+                        .control
+                        .editor_action(vst_audio::EditorAction::Inspect)
+                        .unwrap();
+                    let Message::EditorStatus(status) = response(&mut started, inspect) else {
+                        panic!("missing editor status")
+                    };
+                    assert_eq!(status.scaling, resolved);
+                    assert_eq!(status.scale, scale);
+                    assert_eq!((status.width, status.height), size);
+                    #[cfg(target_os = "linux")]
+                    {
+                        let capture = started
+                            .control
+                            .editor_action(vst_audio::EditorAction::Capture)
+                            .unwrap();
+                        let Message::EditorImage(image) = response(&mut started, capture) else {
+                            panic!("missing editor capture")
+                        };
+                        assert_eq!((image.width, image.height), size);
+                        assert!(image
+                            .rgba
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .all(|pixel| *pixel == [32, 64, 128, 255]));
+                    }
+                    #[cfg(windows)]
+                    assert!(vst_audio_test_window::desktop::dpi_context(
+                        started.control.pid(),
+                        if resolved == EditorScaling::Stretch { -5 } else { -4 },
+                    ));
+                }
+                let request = started
+                    .control
+                    .open_editor_with(None, EditorScaling::Stretch)
+                    .unwrap();
+                #[cfg(target_os = "linux")]
+                assert!(matches!(
+                    response(&mut started, request),
+                    Message::RequestError { text, .. }
+                        if text == "stretched editors need a Windows floating window"
+                ));
+                #[cfg(windows)]
+                {
+                    assert_eq!(response(&mut started, request), Message::Ack);
+                    let inspect = started
+                        .control
+                        .editor_action(vst_audio::EditorAction::Inspect)
+                        .unwrap();
+                    let Message::EditorStatus(status) = response(&mut started, inspect) else {
+                        panic!("missing stretch status")
+                    };
+                    assert_eq!(status.scaling, EditorScaling::Stretch);
+                    assert!(vst_audio_test_window::desktop::dpi_context(
+                        started.control.pid(),
+                        -5,
+                    ));
+                    let request = started
+                        .control
+                        .open_editor_with(None, EditorScaling::Auto)
+                        .unwrap();
+                    assert_eq!(response(&mut started, request), Message::Ack);
+                    assert!(vst_audio_test_window::desktop::dpi_context(
+                        started.control.pid(),
+                        -4,
+                    ));
+                    vst_audio_test_window::desktop::change_dpi(
+                        started.control.pid(),
+                        192,
+                        vst_audio_test_window::desktop::Rect {
+                            left: 0,
+                            top: 0,
+                            right: 640,
+                            bottom: 400,
+                        },
+                    );
+                    std::thread::sleep(Duration::from_millis(50));
+                    let inspect = started
+                        .control
+                        .editor_action(vst_audio::EditorAction::Inspect)
+                        .unwrap();
+                    let Message::EditorStatus(status) = response(&mut started, inspect) else {
+                        panic!("missing changed DPI status")
+                    };
+                    assert_eq!(status.scaling, EditorScaling::Plugin);
+                    assert_eq!((status.scale, status.width, status.height), (2.0, 640, 400));
+                    let capture = started
+                        .control
+                        .editor_action(vst_audio::EditorAction::Capture)
+                        .unwrap();
+                    let Message::EditorImage(image) = response(&mut started, capture) else {
+                        panic!("missing editor capture")
+                    };
+                    assert_eq!((image.width, image.height), (640, 400));
+                }
+            }
+
+            #[test]
+            #[ignore = "native fixtures and display required"]
+            fn missing_display_dpi_uses_one() {
+                #[cfg(target_os = "linux")]
+                let _dpi = vst_audio_test_window::ResourceManager::set(None);
+                let mut started = start(0);
+                let request = started
+                    .control
+                    .open_editor_with(None, EditorScaling::Auto)
+                    .unwrap();
+                assert_eq!(response(&mut started, request), Message::Ack);
+                let inspect = started
+                    .control
+                    .editor_action(vst_audio::EditorAction::Inspect)
+                    .unwrap();
+                let Message::EditorStatus(status) = response(&mut started, inspect) else {
+                    panic!("missing editor status")
+                };
+                assert_eq!((status.scale, status.width, status.height), (1.0, 320, 200));
+            }
+            #[test]
+            #[ignore = "native fixtures and display required"]
             fn editor_round_trip() {
                 let mut started = start(0);
                 let request = started.control.open_editor().unwrap();
@@ -325,6 +476,85 @@ macro_rules! format_tests {
 }
 format_tests!(vst2, PluginFormat::Vst2, "VST_AUDIO_TEST_VST2");
 format_tests!(vst3, PluginFormat::Vst3, "VST_AUDIO_TEST_VST3");
+
+#[test]
+#[ignore = "native fixtures and display required"]
+#[cfg(any(windows, target_os = "linux"))]
+fn nonscaling_vst2_auto_resolves_off() {
+    #[cfg(target_os = "linux")]
+    let _dpi = vst_audio_test_window::ResourceManager::set(Some("Xft.dpi: 192\n"));
+    let exe: PathBuf = std::env::var_os("VST_AUDIO_WORKER").expect("worker").into();
+    let plugin: PathBuf = std::env::var_os("VST_AUDIO_TEST_VST2")
+        .expect("fixture")
+        .into();
+    let mut started = PluginProcess::start(
+        &exe,
+        &plugin,
+        PluginFormat::Vst2,
+        None,
+        48000,
+        Some(&[1, 19]),
+    )
+    .unwrap();
+    let wait = |started: &mut Started, request| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            for event in started.control.poll(started.control.elapsed_ms()) {
+                if let ControlEvent::Message(frame) = event
+                    && frame.request == request
+                {
+                    return frame.message;
+                }
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+    for scaling in [EditorScaling::Auto, EditorScaling::Off] {
+        let request = started.control.open_editor_with(None, scaling).unwrap();
+        assert_eq!(wait(&mut started, request), Message::Ack);
+        let inspect = started
+            .control
+            .editor_action(vst_audio::EditorAction::Inspect)
+            .unwrap();
+        let Message::EditorStatus(status) = wait(&mut started, inspect) else {
+            panic!("missing status")
+        };
+        assert_eq!(
+            status.scaling,
+            if cfg!(windows) && scaling == EditorScaling::Auto {
+                EditorScaling::Stretch
+            } else {
+                EditorScaling::Off
+            }
+        );
+        assert_eq!((status.scale, status.width, status.height), (1.0, 320, 200));
+        assert!(!status.scale_supported);
+    }
+    let request = started
+        .control
+        .open_editor_with(None, EditorScaling::Stretch)
+        .unwrap();
+    #[cfg(windows)]
+    {
+        assert_eq!(wait(&mut started, request), Message::Ack);
+        let inspect = started
+            .control
+            .editor_action(vst_audio::EditorAction::Inspect)
+            .unwrap();
+        let Message::EditorStatus(status) = wait(&mut started, inspect) else {
+            panic!("missing stretch status")
+        };
+        assert_eq!(status.scaling, EditorScaling::Stretch);
+        assert_eq!((status.scale, status.width, status.height), (1.0, 320, 200));
+    }
+    #[cfg(not(windows))]
+    assert!(matches!(
+        wait(&mut started, request),
+        Message::RequestError { text, .. }
+            if text == "stretched editors need a Windows floating window"
+    ));
+}
 
 fn vst3_paths() -> (PathBuf, PathBuf) {
     (

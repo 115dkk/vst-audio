@@ -3,6 +3,8 @@ use std::{
     path::PathBuf,
     time::{Duration, Instant},
 };
+#[cfg(target_os = "linux")]
+use vst_audio::EditorScaling;
 use vst_audio::{
     Command, Configuration, Host, HostEvent, Instance, ParentWindow, PluginDescriptor, PluginFormat,
 };
@@ -271,20 +273,88 @@ fn invalid_handle() -> ParentWindow {
         ParentWindow::X11 { window: 0 }
     }
 }
+#[cfg(target_os = "linux")]
+fn assert_fixture_pixels(image: &vst_audio::EditorImage, expected: usize) {
+    let pixels = image
+        .rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|pixel| **pixel == [32, 64, 128, 255])
+        .count();
+    assert_eq!(
+        pixels, expected,
+        "fixture canvas did not fill its scaled area"
+    );
+}
+
 #[test]
-#[ignore = "native fixtures required"]
+#[ignore = "native fixtures and display required"]
+#[cfg(target_os = "linux")]
+fn embedded_x11_auto_uses_resource_manager_dpi() {
+    let _dpi = vst_audio_test_window::ResourceManager::set(Some("Xft.dpi: 192\n"));
+    for format in [PluginFormat::Vst2, PluginFormat::Vst3] {
+        let parent = Parent::create(800, 500);
+        let instance = spawn(format, false);
+        let request = instance
+            .controller()
+            .request(Command::OpenEditorWith {
+                parent: Some(parent.handle()),
+                scaling: EditorScaling::Auto,
+            })
+            .unwrap();
+        let opened = {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                parent.pump();
+                if let Some(event) = instance.try_next_event() {
+                    let id = match &event {
+                        HostEvent::Completed { request }
+                        | HostEvent::RequestFailed { request, .. }
+                        | HostEvent::EditorStatus { request, .. } => Some(*request),
+                        _ => None,
+                    };
+                    if id == Some(request) {
+                        break event;
+                    }
+                }
+                assert!(Instant::now() < deadline, "editor open timed out");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        assert!(matches!(opened, HostEvent::Completed { .. }), "{opened:?}");
+        let HostEvent::EditorStatus { status, .. } = response(
+            &instance,
+            Command::Editor(vst_audio::EditorAction::Inspect),
+            || parent.pump(),
+        ) else {
+            panic!("missing editor status")
+        };
+        assert_eq!(status.scaling, EditorScaling::Plugin);
+        assert_eq!((status.scale, status.width, status.height), (2.0, 640, 400));
+        let deadline = Instant::now() + Duration::from_millis(250);
+        while Instant::now() < deadline {
+            parent.pump();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_fixture_pixels(&parent.capture(), 640 * 400);
+    }
+}
+
+#[test]
+#[ignore = "native fixtures and display required"]
 #[cfg(any(windows, target_os = "linux"))]
 fn embedded_editors_render_close_and_preserve_audio() {
     exercise(false);
 }
 #[test]
-#[ignore = "native fixtures required"]
+#[ignore = "native fixtures and display required"]
 #[cfg(any(windows, target_os = "linux"))]
 fn sandboxed_embedded_editors() {
     exercise(true);
 }
 #[test]
-#[ignore = "native fixtures required"]
+#[ignore = "native fixtures and display required"]
 #[cfg(target_os = "macos")]
 fn embedding_is_explicitly_unsupported_on_macos() {
     for format in [PluginFormat::Vst2, PluginFormat::Vst3] {

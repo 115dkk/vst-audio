@@ -11,6 +11,10 @@ The contract is one worker per plugin instance, safe application-side
 Rust APIs, bounded audio IPC and worker-owned native editor windows. Any Rust GUI
 can request an editor over the same control protocol. Native editor embedding
 inside an application's window is a separate, platform-specific capability.
+Editors open with automatic DPI scaling. `Command::OpenEditorWith` selects
+plugin-only scaling, Windows floating-window stretching or unscaled drawing;
+`EditorStatus` reports the mode and scale actually in use. See the support guide
+for X11 `Xft.dpi`, Wayland output scale and Windows mixed-DPI limits.
 Process isolation contains crashes and hangs. An opt-in OS sandbox restricts
 worker network access, program execution and filesystem writes; it is off by
 default for plugin compatibility. Set `Configuration::sandbox` (or

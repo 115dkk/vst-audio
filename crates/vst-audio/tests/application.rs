@@ -790,10 +790,55 @@ fn editor_visibility_focus_scaling_errors_and_pixels_roundtrip() {
                 assert!(status.resize_supported && status.scale_supported);
             }
         } else {
+            // The VST 2 fixture accepts the 'PreS'/'AeCs' content scale and
+            // reports its 320x200 rectangle scaled.
+            let HostEvent::EditorStatus { status, .. } =
+                wait(control.request(Command::Editor(A::Scale(1.5))).unwrap())
+            else {
+                panic!("missing VST 2 scale response")
+            };
+            assert_eq!((status.width, status.height, status.scale), (480, 300, 1.5));
+            assert!(status.scale_supported && !status.resize_supported);
+            // Mode 19 does not answer supportsViewDpiScaling: no scale contract.
+            let plain = host()
+                .spawn(
+                    &descriptor(format),
+                    &Configuration::default(),
+                    Some(&state(format, 19)),
+                )
+                .unwrap();
+            let plain_control = plain.controller();
+            let plain_wait = |request| {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    if let Some(event) = plain.try_next_event() {
+                        let id = match &event {
+                            HostEvent::Completed { request }
+                            | HostEvent::RequestFailed { request, .. }
+                            | HostEvent::EditorStatus { request, .. } => Some(*request),
+                            _ => None,
+                        };
+                        if id == Some(request) {
+                            break event;
+                        }
+                    }
+                    assert!(Instant::now() < deadline, "editor response timeout");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            };
             assert!(matches!(
-                wait(control.request(Command::Editor(A::Scale(1.5))).unwrap()),
+                plain_wait(plain_control.request(Command::OpenEditor).unwrap()),
+                HostEvent::Completed { .. }
+            ));
+            assert!(matches!(
+                plain_wait(
+                    plain_control
+                        .request(Command::Editor(A::Scale(1.5)))
+                        .unwrap()
+                ),
                 HostEvent::RequestFailed { .. }
             ));
+            drop(plain);
         }
         // Unsupported or invalid requests leave the editor and audio instance alive.
         assert!(matches!(

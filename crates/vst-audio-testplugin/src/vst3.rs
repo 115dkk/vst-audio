@@ -485,6 +485,8 @@ impl IEditControllerTrait for Matrix {
             #[cfg(target_os = "linux")]
             wayland: RefCell::new(None),
             frame: std::cell::RefCell::new(None),
+            #[cfg(target_os = "linux")]
+            wayland_frame: std::cell::Cell::new(false),
             view_pointer: std::cell::Cell::new(std::ptr::null_mut()),
         });
         let view = wrapper.to_com_ptr::<IPlugView>().expect("view interface");
@@ -505,6 +507,8 @@ struct View {
     #[cfg(target_os = "linux")]
     wayland: RefCell<Option<crate::wayland::Canvas>>,
     frame: std::cell::RefCell<Option<ComPtr<IPlugFrame>>>,
+    #[cfg(target_os = "linux")]
+    wayland_frame: std::cell::Cell<bool>,
     view_pointer: std::cell::Cell<*mut IPlugView>,
 }
 #[cfg(target_os = "linux")]
@@ -575,7 +579,8 @@ impl IPlugViewTrait for View {
             };
         }
         // SAFETY: attached supplies a live platform parent on the UI thread.
-        *self.canvas.borrow_mut() = unsafe { crate::visual::Canvas::attach(parent) };
+        *self.canvas.borrow_mut() =
+            unsafe { crate::visual::Canvas::attach(parent, self.size.get().0, self.size.get().1) };
         if self.canvas.borrow().is_none() {
             return kResultFalse;
         }
@@ -641,6 +646,9 @@ impl IPlugViewTrait for View {
         let rect = unsafe { *rect };
         self.size
             .set((rect.right - rect.left, rect.bottom - rect.top));
+        if let Some(canvas) = self.canvas.borrow().as_ref() {
+            canvas.resize(self.size.get().0, self.size.get().1);
+        }
         #[cfg(target_os = "linux")]
         if let Some(canvas) = self.wayland.borrow().as_ref()
             && canvas.resize(self.size.get().0, self.size.get().1).is_err()
@@ -676,6 +684,29 @@ impl IPlugViewTrait for View {
             if frame.cast::<Linux::IRunLoop>().is_none() {
                 return kNoInterface;
             }
+            let wayland = self.context.as_ref().is_some_and(|context| {
+                let Some(host) = context.cast::<IWaylandHost>() else {
+                    return false;
+                };
+                let Some(frame) = frame.cast::<IWaylandFrame>() else {
+                    return false;
+                };
+                // SAFETY: retained host owns this temporary connection until close below.
+                let display = unsafe { host.openWaylandConnection() };
+                if display.is_null() {
+                    return false;
+                }
+                // SAFETY: retained frame is queried with the live display from this host.
+                let surface = unsafe { frame.getWaylandSurface(display) };
+                // SAFETY: balances the successful open after the synchronous frame query.
+                unsafe { host.closeWaylandConnection(display) };
+                !surface.is_null()
+            });
+            self.wayland_frame.set(wayland);
+        }
+        #[cfg(target_os = "linux")]
+        if _frame.is_null() {
+            self.wayland_frame.set(false);
         }
         kResultOk
     }
@@ -707,6 +738,38 @@ impl IPlugViewContentScaleSupportTrait for View {
             return kResultFalse;
         }
         self.scale.set(scale);
+        #[cfg(target_os = "linux")]
+        let size = if self.wayland_frame.get() {
+            (320, 200)
+        } else {
+            (
+                (320.0 * scale).round() as i32,
+                (200.0 * scale).round() as i32,
+            )
+        };
+        #[cfg(not(target_os = "linux"))]
+        let size = (
+            (320.0 * scale).round() as i32,
+            (200.0 * scale).round() as i32,
+        );
+        self.size.set(size);
+        eprintln!("fixture VST3 scale={scale}, size={}x{}", size.0, size.1);
+        if let Some(canvas) = self.canvas.borrow().as_ref() {
+            canvas.resize(size.0, size.1);
+        }
+        // Wayland keeps logical 320x200 view units; the compositor maps the
+        // existing buffer to output pixels. Resizing its buffer here would apply
+        // the same scale twice.
+        if let Some(frame) = self.frame.borrow().as_ref() {
+            let mut rect = ViewRect {
+                left: 0,
+                top: 0,
+                right: size.0,
+                bottom: size.1,
+            };
+            // SAFETY: retained UI-thread frame and this live view's borrowed COM pointer.
+            let _ = unsafe { frame.resizeView(self.view_pointer.get(), &mut rect) };
+        }
         kResultOk
     }
 }

@@ -94,6 +94,46 @@ pub fn top_windows(pid: u32) -> Vec<Window> {
     });
     result
 }
+/// Sends a synthetic DPI change to the first visible top-level process window.
+pub fn change_dpi(pid: u32, dpi: u32, rect: Rect) {
+    let window = top_windows(pid)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("no editor window for process {pid}"));
+    let suggested = RECT {
+        left: rect.left,
+        top: rect.top,
+        right: rect.right,
+        bottom: rect.bottom,
+    };
+    // SAFETY: synchronous message borrows the suggested rectangle only until return.
+    unsafe {
+        SendMessageW(
+            hwnd(window.handle),
+            WM_DPICHANGED,
+            Some(WPARAM((dpi as usize) | ((dpi as usize) << 16))),
+            Some(LPARAM((&suggested as *const RECT) as isize)),
+        )
+    };
+}
+
+/// Returns whether the first visible top-level process window has this DPI context.
+pub fn dpi_context(pid: u32, context: isize) -> bool {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetWindowDpiAwarenessContext(window: HWND) -> isize;
+        fn AreDpiAwarenessContextsEqual(a: isize, b: isize) -> BOOL;
+    }
+    let window = top_windows(pid)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("no editor window for process {pid}"));
+    // SAFETY: enumerated live HWND; returned DPI context is compared as an opaque value.
+    let actual = unsafe { GetWindowDpiAwarenessContext(hwnd(window.handle)) };
+    // SAFETY: both arguments are documented opaque DPI context values.
+    unsafe { AreDpiAwarenessContextsEqual(actual, context) }.as_bool()
+}
+
 /// First descendant whose native class matches exactly.
 pub fn find_child_class(top: u64, class: &str) -> Option<Window> {
     let mut result = Vec::<Window>::new();

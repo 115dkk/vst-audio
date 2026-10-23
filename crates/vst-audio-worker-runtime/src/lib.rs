@@ -69,10 +69,14 @@ pub trait Plugin {
     }
     fn get_state(&mut self) -> Result<Vec<u8>, PluginError>;
     fn set_state(&mut self, blob: &[u8]) -> Result<(), PluginError>;
-    fn open_editor(&mut self) -> Result<(), PluginError>;
+    fn open_editor(
+        &mut self,
+        scaling: vst_audio_protocol::EditorScaling,
+    ) -> Result<(), PluginError>;
     fn open_editor_in(
         &mut self,
         _parent: vst_audio_protocol::ParentWindow,
+        _scaling: vst_audio_protocol::EditorScaling,
     ) -> Result<(), PluginError> {
         Err(PluginError("editor embedding unsupported".into()))
     }

@@ -38,6 +38,12 @@ impl EditorWindow {
             crate::wayland_editor::Window::open(host, title, width, height, resizable)?,
         ))))
     }
+    pub fn scale(&self) -> f32 {
+        match &self.0 {
+            Backend::X11(w) => w.scale(),
+            Backend::Wayland(w) => w.scale(),
+        }
+    }
     pub fn platform(&self) -> EditorPlatform {
         match &self.0 {
             Backend::X11(_) => EditorPlatform::X11,

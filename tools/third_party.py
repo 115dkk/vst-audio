@@ -145,6 +145,100 @@ def install_eapo(root) -> Path:
     assert (app / "Editor.exe").is_file() and (app / "Benchmark.exe").is_file()
     return app
 
+def linux_dpf_hidpi(root, worker, plugin, env):
+    """Open DPF's VST2 editor at two Xft DPI values through the public crate API."""
+    consumer = root / "hidpi-consumer"
+    (consumer / "src").mkdir(parents=True, exist_ok=True)
+    (consumer / "Cargo.toml").write_text(f'''[package]
+name = "dpf-hidpi-consumer"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+vst-audio = {{ path = {json.dumps((ROOT / "crates/vst-audio").as_posix())} }}
+x11rb = "0.13"
+''', encoding="utf-8")
+    (consumer / "src/main.rs").write_text(r'''
+#![forbid(unsafe_code)]
+use std::{path::PathBuf, time::{Duration, Instant}};
+use vst_audio::{Command, Configuration, EditorScaling, Host, HostEvent, PluginDescriptor, PluginFormat};
+use x11rb::{connection::Connection, protocol::xproto::*, rust_connection::RustConnection, wrapper::ConnectionExt as _};
+struct ResourceManager { connection: RustConnection, root: u32, atom: u32, previous: Option<(u32, u8, Vec<u8>)> }
+impl ResourceManager {
+    fn set(dpi: u32) -> Self {
+        let (connection, screen) = x11rb::connect(None).unwrap();
+        let root = connection.setup().roots[screen].root;
+        let atom = connection.intern_atom(false, b"RESOURCE_MANAGER").unwrap().reply().unwrap().atom;
+        let reply = connection.get_property(false, root, atom, AtomEnum::ANY, 0, u32::MAX).unwrap().reply().unwrap();
+        let previous = (reply.type_ != 0).then_some((reply.type_, reply.format, reply.value));
+        connection.change_property8(PropMode::REPLACE, root, atom, AtomEnum::STRING,
+            format!("Xft.dpi: {dpi}\n").as_bytes()).unwrap().check().unwrap();
+        connection.flush().unwrap();
+        Self { connection, root, atom, previous }
+    }
+}
+impl Drop for ResourceManager {
+    fn drop(&mut self) {
+        let result = if let Some((type_, format, value)) = &self.previous {
+            self.connection.change_property(PropMode::REPLACE, self.root, self.atom, *type_, *format,
+                u32::try_from(value.len() / (usize::from(*format) / 8)).unwrap(), value)
+        } else { self.connection.delete_property(self.root, self.atom) };
+        if let Ok(cookie) = result { let _ = cookie.check(); }
+        let _ = self.connection.flush();
+    }
+}
+fn open(worker: &PathBuf, plugin: &PathBuf, dpi: u32) -> (f32, u32, u32) {
+    let _resource = ResourceManager::set(dpi);
+    let host = Host::new(worker.clone());
+    let descriptor = PluginDescriptor::new(plugin.clone(), PluginFormat::Vst2);
+    let instance = host.spawn(&descriptor, &Configuration::default(), None).unwrap();
+    let request = instance.controller().request(Command::OpenEditorWith {
+        parent: None, scaling: EditorScaling::Auto,
+    }).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(event) = instance.try_next_event() {
+            match event {
+                HostEvent::Completed { request: id } if id == request => break,
+                HostEvent::RequestFailed { request: id, reason } if id == request => panic!("{reason}"),
+                HostEvent::Failed { reason } => panic!("{reason}"),
+                _ => {}
+            }
+        }
+        assert!(Instant::now() < deadline, "DPF editor open timed out");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let request = instance.controller().request(Command::Editor(vst_audio::EditorAction::Inspect)).unwrap();
+    loop {
+        if let Some(HostEvent::EditorStatus { request: id, status }) = instance.try_next_event()
+            && id == request {
+                assert_eq!(status.scaling, EditorScaling::Plugin);
+                return (status.scale, status.width, status.height);
+            }
+        assert!(Instant::now() < deadline, "DPF editor status timed out");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+fn main() {
+    let args: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
+    let _display = x11rb::connect(None).unwrap().0;
+    let base = open(&args[0], &args[1], 96);
+    let high = open(&args[0], &args[1], 192);
+    assert_eq!(base.0, 1.0);
+    assert_eq!(high.0, 2.0);
+    assert_eq!((high.1, high.2), (base.1 * 2, base.2 * 2));
+    println!("DPF d_parameters VST2: 96dpi={base:?}, 192dpi={high:?}");
+}
+''', encoding="utf-8")
+    result = subprocess.run(["cargo", "run", "--manifest-path", str(consumer / "Cargo.toml"),
+        "--target-dir", str(Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "target")) / "third-party-consumer"),
+        "--", str(worker), str(plugin)], cwd=ROOT, env=env, capture_output=True, text=True, timeout=180)
+    output = result.stdout + result.stderr
+    print(output[-32768:], flush=True)
+    assert result.returncode == 0, "DPF HiDPI public consumer failed"
+    return result.stdout.strip().splitlines()[-1]
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, help="Reuse a developer-owned directory outside the checkout")
@@ -170,6 +264,8 @@ def main():
             report["software_opengl"] = {"url": MESA[0], "sha256": MESA[1], "driver": "llvmpipe",
                                          "directories": len(installed)}
         env = dict(os.environ, VST_AUDIO_WORKER=str(worker), **{f"VST_AUDIO_REAL_{key}": str(value) for key, value in paths.items()})
+        if sys.platform.startswith("linux"):
+            report["dpf_hidpi"] = linux_dpf_hidpi(root, worker, paths["PARAMETERS_VST2"], env)
         if sys.platform == "win32":
             env["GALLIUM_DRIVER"] = "llvmpipe"
             app = install_eapo(root)

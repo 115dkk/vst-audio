@@ -120,12 +120,12 @@ impl<P: Plugin> Session<P> {
                 self.plugin.set_state(&blob)?;
                 Ok(Message::Ack)
             }
-            Message::OpenEditor if self.phase != Phase::Closed => {
-                self.plugin.open_editor()?;
+            Message::OpenEditor { scaling } if self.phase != Phase::Closed => {
+                self.plugin.open_editor(scaling)?;
                 Ok(Message::Ack)
             }
-            Message::OpenEditorIn { parent } if self.phase != Phase::Closed => {
-                self.plugin.open_editor_in(parent)?;
+            Message::OpenEditorIn { parent, scaling } if self.phase != Phase::Closed => {
+                self.plugin.open_editor_in(parent, scaling)?;
                 Ok(Message::Ack)
             }
             Message::Shutdown => {
@@ -348,7 +348,7 @@ mod tests {
             self.state = blob.to_vec();
             Ok(())
         }
-        fn open_editor(&mut self) -> Result<(), PluginError> {
+        fn open_editor(&mut self, _: vst_audio_protocol::EditorScaling) -> Result<(), PluginError> {
             Ok(())
         }
         fn idle(&mut self) {}

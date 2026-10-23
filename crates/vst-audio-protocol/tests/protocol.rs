@@ -10,7 +10,7 @@ use vst_audio_protocol::{
 
 #[test]
 fn editor_platforms_round_trip_and_reject_unknown_tags() {
-    use vst_audio_protocol::{EditorPlatform, EditorStatus};
+    use vst_audio_protocol::{EditorPlatform, EditorScaling, EditorStatus};
     for platform in [
         EditorPlatform::Win32,
         EditorPlatform::Cocoa,
@@ -19,6 +19,7 @@ fn editor_platforms_round_trip_and_reject_unknown_tags() {
     ] {
         let message = Message::EditorStatus(EditorStatus {
             platform,
+            scaling: EditorScaling::Plugin,
             visible: true,
             embedded: false,
             width: 320,
@@ -34,7 +35,8 @@ fn editor_platforms_round_trip_and_reject_unknown_tags() {
             message,
         })
         .unwrap();
-        let offset = bytes.len() - 17;
+        // The platform tag precedes 16 bytes of fields and the scaling byte.
+        let offset = bytes.len() - 18;
         bytes[offset] = 4;
         assert!(matches!(
             decode_frame(&bytes),
@@ -95,15 +97,20 @@ fn codec_round_trips_every_message() {
             blob: vec![1, 2, 3],
         },
         Message::GetState,
-        Message::OpenEditor,
+        Message::OpenEditor {
+            scaling: vst_audio_protocol::EditorScaling::Auto,
+        },
         Message::OpenEditorIn {
             parent: vst_audio_protocol::ParentWindow::Win32 { hwnd: u64::MAX },
+            scaling: vst_audio_protocol::EditorScaling::Stretch,
         },
         Message::OpenEditorIn {
             parent: vst_audio_protocol::ParentWindow::X11 { window: 0x12345678 },
+            scaling: vst_audio_protocol::EditorScaling::Off,
         },
         Message::EditorStatus(vst_audio_protocol::EditorStatus {
             platform: vst_audio_protocol::EditorPlatform::Wayland,
+            scaling: vst_audio_protocol::EditorScaling::Plugin,
             visible: true,
             embedded: true,
             width: 640,
@@ -209,6 +216,7 @@ fn embedding_rejects_unknown_platform_tags() {
         request: 1,
         message: Message::OpenEditorIn {
             parent: vst_audio_protocol::ParentWindow::Win32 { hwnd: 1 },
+            scaling: vst_audio_protocol::EditorScaling::Auto,
         },
     })
     .unwrap();

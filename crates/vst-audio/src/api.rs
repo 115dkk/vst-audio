@@ -327,12 +327,25 @@ pub enum Command {
     Editor(vst_audio_protocol::EditorAction),
     OpenEditor,
     OpenEditorIn(vst_audio_protocol::ParentWindow),
+    /// Open a floating or embedded editor with an explicit scaling policy.
+    OpenEditorWith {
+        parent: Option<vst_audio_protocol::ParentWindow>,
+        scaling: vst_audio_protocol::EditorScaling,
+    },
     CloseEditor,
-    ListParameters { start: u32, count: u16 },
-    SetParameter { id: u32, value: f64 },
+    ListParameters {
+        start: u32,
+        count: u16,
+    },
+    SetParameter {
+        id: u32,
+        value: f64,
+    },
     SaveState,
     RestoreState(Vec<u8>),
-    Recover { use_previous: bool },
+    Recover {
+        use_previous: bool,
+    },
     Shutdown,
 }
 #[derive(Clone, Debug)]

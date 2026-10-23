@@ -244,6 +244,9 @@ pub(crate) fn supervise(
                 Command::Editor(action) => control.editor_action(action),
                 Command::OpenEditor => control.open_editor(),
                 Command::OpenEditorIn(parent) => control.open_editor_in(parent),
+                Command::OpenEditorWith { parent, scaling } => {
+                    control.open_editor_with(parent, scaling)
+                }
                 Command::CloseEditor => control.request_close_editor(),
                 Command::ListParameters { start, count } => control.parameters(start, count),
                 Command::SetParameter { id, value } => control.set_parameter(id, value),

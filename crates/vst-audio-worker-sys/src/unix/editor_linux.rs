@@ -22,6 +22,55 @@ pub struct EditorWindow {
     configured: Cell<bool>,
     parent: Option<vst_audio_protocol::ParentWindow>,
 }
+fn xft_scale(database: &[u8]) -> f32 {
+    let Ok(database) = std::str::from_utf8(database) else {
+        return 1.0;
+    };
+    database
+        .lines()
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if name.trim() != "Xft.dpi" {
+                return None;
+            }
+            let dpi = value.trim().parse::<f64>().ok()?;
+            (dpi.is_finite() && dpi > 0.0).then(|| (dpi / 96.0).clamp(0.5, 4.0) as f32)
+        })
+        .next()
+        .unwrap_or(1.0)
+}
+#[cfg(test)]
+mod dpi_tests {
+    use super::xft_scale;
+    #[test]
+    fn fractional_and_whitespace() {
+        assert_eq!(
+            xft_scale(b"! comment\n Xft.dpi : 132\nXft.antialias: 1"),
+            1.375
+        );
+    }
+    #[test]
+    fn clamp() {
+        assert_eq!(xft_scale(b"Xft.dpi: 12"), 0.5);
+        assert_eq!(xft_scale(b"Xft.dpi: 960"), 4.0);
+    }
+    #[test]
+    fn invalid_and_missing() {
+        for value in [
+            "",
+            "Xft.dpi: NaN",
+            "Xft.dpi: inf",
+            "Xft.dpi: 0",
+            "Xft.dpi: -96",
+            "Xft.dpi: wrong",
+            "Other.dpi: 192",
+            "Xft.dpi=192",
+        ] {
+            assert_eq!(xft_scale(value.as_bytes()), 1.0, "{value}");
+        }
+        assert_eq!(xft_scale(&[0xff]), 1.0);
+    }
+}
 fn error(e: impl std::fmt::Display) -> io::Error {
     io::Error::other(e.to_string())
 }
@@ -187,6 +236,40 @@ impl EditorWindow {
             configured: Cell::new(false),
             parent: Some(parent),
         })
+    }
+    pub fn scale(&self) -> f32 {
+        // Query this window's root, not the default screen: embedded parents may
+        // belong to another screen on the same display connection.
+        let resource = (|| {
+            let root = self
+                .connection
+                .get_geometry(self.window)
+                .ok()?
+                .reply()
+                .ok()?
+                .root;
+            let atom = self
+                .connection
+                .intern_atom(true, b"RESOURCE_MANAGER")
+                .ok()?
+                .reply()
+                .ok()?
+                .atom;
+            if atom == 0 {
+                return None;
+            }
+            let reply = self
+                .connection
+                .get_property(false, root, atom, AtomEnum::STRING, 0, 262144)
+                .ok()?
+                .reply()
+                .ok()?;
+            if reply.format != 8 || reply.bytes_after != 0 {
+                return None;
+            }
+            Some(reply.value)
+        })();
+        resource.as_deref().map_or(1.0, xft_scale)
     }
     pub fn parent(&self) -> Option<vst_audio_protocol::ParentWindow> {
         self.parent

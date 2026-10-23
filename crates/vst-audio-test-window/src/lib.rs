@@ -3,7 +3,7 @@
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
-pub use linux::Parent;
+pub use linux::{Parent, ResourceManager};
 #[cfg(windows)]
 #[allow(unsafe_code)]
 mod windows;
