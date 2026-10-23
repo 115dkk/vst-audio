@@ -259,6 +259,12 @@ fn gui(case: Case, app: &Path, root: &Path, library: &Path) -> (PluginLine, usiz
         "METRIC {{\"case\":{:?},\"editor_pixels_changed\":{changed}}}",
         case.name()
     );
+    // Apply first, as a user would before closing the panel.
+    if let Some(button) = desktop::find_named(dialog.handle, "Apply", None) {
+        let (x, y) = button.center();
+        desktop::click(pid, x, y);
+        std::thread::sleep(Duration::from_millis(500));
+    }
     let button = until(5, "panel OK", || {
         desktop::find_named(dialog.handle, "OK", None)
     });
@@ -703,43 +709,42 @@ pub fn compare(case: Case) {
         set(&reverse, &entries, name, value);
     }
     let mut line = format!("VSTPlugin: Library \"{}\"", library.display());
-    let mut reverse_long = None;
+    let mut by_name = None;
     if case.format() == PluginFormat::Vst3 {
         line.push_str(&format!(
             " ChunkData \"{}\"",
             base64_encode(&component(&reverse))
         ));
     } else {
-        // Shortest decimal that reads back as the plugin's f32, as the Editor
-        // writes it. The f64 form of the same value is kept as an observation.
-        let mut long = line.clone();
+        // Parameters by index, each value as the shortest decimal that reads
+        // back as the plugin's f32. The same values by name are an observation:
+        // names that share a prefix ("Low", "Low-Mid Freq") are ambiguous.
+        let mut named = line.clone();
         for p in parameters(&reverse) {
             assert!(!p.name.contains('"'));
-            line.push_str(&format!(" \"{}\" {}", p.name, p.value as f32));
-            long.push_str(&format!(" \"{}\" {}", p.name, p.value));
+            line.push_str(&format!(" {} {}", p.id, p.value as f32));
+            named.push_str(&format!(" \"{}\" {}", p.name, p.value as f32));
         }
-        if long != line {
-            reverse_long = Some(long);
-        }
+        by_name = Some(named);
     }
     println!(
         "METRIC {{\"case\":{:?},\"reverse_line\":{line:?}}}",
         case.name()
     );
     let y2 = render(reverse, &x);
-    compare_output(case, "reverse", &app, &root, &x, &y2, &line);
-    if let Some(long) = reverse_long {
+    if let Some(named) = by_name {
         let max = plain_difference(
             &app,
             &root,
-            &format!("{}-reverse-f64", case.name()),
+            &format!("{}-reverse-by-name", case.name()),
             &x,
             &y2,
-            &long,
+            &named,
         );
         println!(
-            "METRIC {{\"case\":{:?},\"observation\":\"VST 2 values written as f64 decimals\",\"plain_max_lsb\":{max}}}",
+            "METRIC {{\"case\":{:?},\"observation\":\"VST 2 parameters written by name\",\"line\":{named:?},\"plain_max_lsb\":{max}}}",
             case.name()
         );
     }
+    compare_output(case, "reverse", &app, &root, &x, &y2, &line);
 }

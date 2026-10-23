@@ -172,7 +172,13 @@ def main():
         env = dict(os.environ, VST_AUDIO_WORKER=str(worker), **{f"VST_AUDIO_REAL_{key}": str(value) for key, value in paths.items()})
         if sys.platform == "win32":
             env["GALLIUM_DRIVER"] = "llvmpipe"
-            env["VST_AUDIO_EAPO"] = str(install_eapo(root))
+            app = install_eapo(root)
+            # EQ APO XT loads plugins with the default search order, which starts
+            # at its own folder: Mesa there renders the DPF editors in its panel.
+            mesa = root / "mesa" / "x64"
+            for dll in ("opengl32.dll", "libgallium_wgl.dll"):
+                shutil.copy2(mesa / dll, app / dll)
+            env["VST_AUDIO_EAPO"] = str(app)
             work = root / "eapo-work"
             work.mkdir(exist_ok=True)
             assert not any(work.iterdir()), "EqualizerAPO comparison needs an empty eapo-work directory"
