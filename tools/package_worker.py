@@ -11,9 +11,8 @@ import sys
 import tempfile
 import tomllib
 import zipfile
-import urllib.request
 import urllib.error
-from fixtures import ROOT, prepare, target_directory
+from fixtures import ROOT, download, prepare, target_directory
 
 def run(*args, **options):
     subprocess.run(list(map(str,args)),cwd=ROOT,check=True,**options)
@@ -53,7 +52,7 @@ def dependency_notices(destination,target):
             for filename in ["LICENSE","LICENSE-MIT","LICENSE-APACHE","LICENSE.txt","COPYING","LICENSE.md"]:
                 url=f"https://raw.githubusercontent.com/{path}/{revision}/{filename}"
                 try:
-                    with urllib.request.urlopen(url,timeout=30) as response: contents=response.read()
+                    contents=download(url)
                 except urllib.error.HTTPError as error:
                     if error.code==404: continue
                     raise

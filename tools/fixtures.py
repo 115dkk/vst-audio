@@ -6,9 +6,29 @@ import plistlib
 import shutil
 import subprocess
 import sys
+import time
+import urllib.error
+import urllib.request
 import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
+
+def download(url, timeout=30):
+    """Fetch `url`, retrying network failures and 5xx/429 answers four times.
+
+    Hosted runners lose DNS or connections now and then; a release must not
+    stop on one. Other HTTP errors (a 404 included) are raised at once."""
+    for delay in (2, 4, 8, 16, None):
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as response:
+                return response.read()
+        except urllib.error.HTTPError as error:
+            if delay is None or not (error.code == 429 or error.code >= 500):
+                raise
+        except OSError:
+            if delay is None:
+                raise
+        time.sleep(delay)
 
 def copy_fresh(source, target):
     # A new inode avoids macOS retaining a code-signature cache for overwritten
