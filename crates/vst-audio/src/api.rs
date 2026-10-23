@@ -64,6 +64,12 @@ pub enum RecoveryPolicy {
         attempts: u8,
         backoff_ms: u32,
     },
+    /// Restart a failed worker the way the low-level watch does: after 0.5 s,
+    /// 2 s, then 8 s, and give up (status `Failed`, `RecoveryRequired`) after
+    /// three failures in ten minutes. A respawn restores the newest state, or the
+    /// one before when the worker failed right after restoring the newest. The
+    /// failure window and both states belong to the instance, not one process.
+    Watch,
 }
 #[derive(Clone, Debug)]
 pub(crate) struct Launch {

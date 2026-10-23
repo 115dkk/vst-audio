@@ -28,6 +28,10 @@ from this repository. Required CI executes the implementation on Windows x64, Li
 | Delivery | Seven crate archives consumed outside the checkout; optimized worker ZIPs extracted and executed; manifests, checksums and dependency licenses |
 | Toolchain | Rust 1.99.0 minimum, tested directly; nightly is used only by the extended test lane |
 
+`RecoveryPolicy::Watch` exposes the low-level 0.5/2/8-second restart schedule to
+high-level instances, preserves two state snapshots across workers, and disables
+automatic recovery after three failures in ten minutes.
+
 The [independent-plugin ledger](independent-plugins.md) records the exact pinned
 upstreams and assertions. DPF's pinned VST3 adapter has no SysEx input conversion
 and no program-change parameter; these are recorded as upstream limitations.

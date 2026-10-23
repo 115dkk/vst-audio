@@ -5,7 +5,7 @@ use std::{
 };
 use vst_audio::{
     AudioStatus, BlockError, BlockStatus, Command, Configuration, EditPhase, Host, HostEvent,
-    PluginDescriptor, PluginFormat, Status,
+    PluginDescriptor, PluginFormat, RecoveryPolicy, Status,
 };
 
 #[global_allocator]
@@ -413,6 +413,180 @@ fn recovery_replaces_resources_only_at_an_audio_boundary() {
         }
         assert!(recovered);
         assert!((refs[0][100] - 0.25).abs() < 1e-6);
+    }
+}
+
+fn watch_configuration() -> Configuration {
+    Configuration {
+        recovery: RecoveryPolicy::Watch,
+        ..Configuration::default()
+    }
+}
+
+#[test]
+#[ignore = "native fixtures required"]
+fn watch_policy_respawns_a_crashed_worker_with_its_state() {
+    for format in [PluginFormat::Vst2, PluginFormat::Vst3] {
+        let mut instance = host()
+            .spawn(
+                &descriptor(format),
+                &watch_configuration(),
+                Some(&state(format, 0)),
+            )
+            .unwrap();
+        let controller = instance.controller();
+        let mut audio = instance.take_audio().unwrap();
+        let saved = controller.request(Command::SaveState).unwrap();
+        let crash = controller
+            .request(Command::RestoreState(state(format, 1)))
+            .unwrap();
+        let input = [0.25; 128];
+        let mut output = [[0.0; 128]; 6];
+        let mut refs: Vec<_> = output.iter_mut().map(|plane| &mut plane[..]).collect();
+        audio.process(&[&input, &input], &mut refs);
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(4);
+        let mut saw_saved = false;
+        let mut saw_crash_ack = false;
+        let mut saw_failed = false;
+        let mut recovered_at = None;
+        while Instant::now() < deadline {
+            if let Some(event) = instance.try_next_event() {
+                match event {
+                    HostEvent::State { request, .. } if request == Some(saved) => saw_saved = true,
+                    HostEvent::Completed { request } if request == crash => saw_crash_ack = true,
+                    HostEvent::Failed { .. } => {
+                        saw_failed = true;
+                        assert_eq!(controller.status(), Status::Recovering);
+                    }
+                    HostEvent::Recovered { generation: 2 } => {
+                        recovered_at = Some(started.elapsed());
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            audio.process(&[&input, &input], &mut refs);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let delay = recovered_at.expect("watch did not recover generation 2");
+        eprintln!("{format:?} watch respawn recovered after {delay:?}");
+        assert!(saw_saved);
+        assert!(saw_crash_ack);
+        assert!(saw_failed);
+        assert!(delay >= Duration::from_millis(500));
+        let processing_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < processing_deadline {
+            if audio.process(&[&input, &input], &mut refs) == AudioStatus::Processed
+                && (refs[0][100] - 0.25).abs() < 1e-6
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(controller.status(), Status::Running);
+        assert!((refs[0][100] - 0.25).abs() < 1e-6);
+    }
+}
+
+#[test]
+#[ignore = "native fixtures required"]
+fn watch_policy_disables_after_three_failures() {
+    for format in [PluginFormat::Vst2, PluginFormat::Vst3] {
+        let mut instance = host()
+            .spawn(&descriptor(format), &watch_configuration(), None)
+            .unwrap();
+        let controller = instance.controller();
+        let mut audio = instance.take_audio().unwrap();
+        let input = [0.25; 128];
+        let mut output = [[0.0; 128]; 6];
+        let mut refs: Vec<_> = output.iter_mut().map(|plane| &mut plane[..]).collect();
+        for generation in [2, 3] {
+            controller
+                .request(Command::RestoreState(state(format, 1)))
+                .unwrap();
+            audio.process(&[&input, &input], &mut refs);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                audio.process(&[&input, &input], &mut refs);
+                if matches!(instance.try_next_event(), Some(HostEvent::Recovered { generation: value }) if value == generation)
+                {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "missing generation {generation}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        controller
+            .request(Command::RestoreState(state(format, 1)))
+            .unwrap();
+        audio.process(&[&input, &input], &mut refs);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut recovery_required = false;
+        while Instant::now() < deadline {
+            audio.process(&[&input, &input], &mut refs);
+            if matches!(instance.try_next_event(), Some(HostEvent::RecoveryRequired)) {
+                recovery_required = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(recovery_required);
+        assert_eq!(controller.status(), Status::Failed);
+        let pid = controller.worker_pid();
+        std::thread::sleep(Duration::from_secs(1));
+        assert_eq!(controller.worker_pid(), pid);
+        let recover = controller
+            .request(Command::Recover { use_previous: true })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(4);
+        loop {
+            audio.process(&[&input, &input], &mut refs);
+            if matches!(instance.try_next_event(), Some(HostEvent::Completed { request }) if request == recover)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "manual recovery did not start a fresh window"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+#[test]
+#[ignore = "native fixtures required"]
+fn watch_policy_shutdown_during_backoff_does_not_respawn() {
+    for format in [PluginFormat::Vst2, PluginFormat::Vst3] {
+        let mut instance = host()
+            .spawn(&descriptor(format), &watch_configuration(), None)
+            .unwrap();
+        let controller = instance.controller();
+        let mut audio = instance.take_audio().unwrap();
+        let input = [0.25; 128];
+        let mut output = [[0.0; 128]; 6];
+        let mut refs: Vec<_> = output.iter_mut().map(|plane| &mut plane[..]).collect();
+        controller
+            .request(Command::RestoreState(state(format, 1)))
+            .unwrap();
+        audio.process(&[&input, &input], &mut refs);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while controller.status() != Status::Recovering {
+            audio.process(&[&input, &input], &mut refs);
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let pid = controller.worker_pid();
+        controller.request(Command::Shutdown).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while controller.status() != Status::Stopped {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::thread::sleep(Duration::from_millis(700));
+        assert_eq!(controller.status(), Status::Stopped);
+        assert_eq!(controller.worker_pid(), pid);
     }
 }
 

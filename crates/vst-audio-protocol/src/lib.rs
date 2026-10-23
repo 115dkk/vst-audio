@@ -1346,6 +1346,17 @@ impl StateHistory {
             self.current.as_deref()
         }
     }
+    /// The state a respawned worker restores: the newest, unless the worker
+    /// failed right after restoring the newest, then the one before. Marks the
+    /// chosen state as being restored, so a failure right after it moves on.
+    pub fn respawn_state(&mut self) -> Option<Vec<u8>> {
+        let after_crash = self.crash_after_restore().map(<[u8]>::to_vec);
+        if after_crash.as_deref() == self.current() {
+            self.begin_restore().map(<[u8]>::to_vec)
+        } else {
+            after_crash
+        }
+    }
     pub fn current(&self) -> Option<&[u8]> {
         self.current.as_deref()
     }
@@ -1356,4 +1367,21 @@ impl StateHistory {
 
 pub fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod state_history_tests {
+    use super::StateHistory;
+
+    #[test]
+    fn respawn_uses_current_then_previous_after_a_failed_restore() {
+        let mut history = StateHistory::new();
+        assert_eq!(history.respawn_state(), None);
+        history.save(vec![1]);
+        history.save(vec![2]);
+        assert_eq!(history.respawn_state(), Some(vec![2]));
+        assert_eq!(history.respawn_state(), Some(vec![1]));
+        history.save(vec![3]);
+        assert_eq!(history.respawn_state(), Some(vec![3]));
+    }
 }

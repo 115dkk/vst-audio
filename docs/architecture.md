@@ -213,6 +213,9 @@ Crashes and hangs are confined to one worker. Effects can use latency-aligned
 bypass, silence or caller-provided fallback; instruments use silence. Recovery
 creates a new process and session, restores the last successful state and
 reconciles transport/notes. Past MIDI/automation is not blindly replayed.
+`RecoveryPolicy::Watch` carries the low-level watch across processes: it retries
+after 0.5, 2 and 8 seconds, retains two saved states for restore fallback, and
+disables automatic recovery after three failures in ten minutes.
 `Configuration::sandbox` and `ProcessingOptions::sandbox` optionally select an
 OS sandbox; `None` preserves plugin compatibility. `SandboxPolicy` denies
 network access, execution of other programs and writes outside per-worker

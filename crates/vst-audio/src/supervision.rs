@@ -3,6 +3,7 @@ use crate::{
     Command, ControlEvent, HostEvent, PluginControl, RequestId, Started,
     api::{Launch, RecoveryPolicy, Shared},
     audio::PreparedAudio,
+    watch::ControlWatch,
 };
 use std::{
     collections::BTreeMap,
@@ -21,6 +22,80 @@ pub(crate) struct RecoveryConfig {
     pub geometry: vst_audio_ring::Geometry,
     pub setup: vst_audio_protocol::ProcessingSetup,
 }
+
+struct OrphanedWatch {
+    watch: ControlWatch,
+    base_ms: u64,
+    taken_at: Instant,
+}
+
+impl OrphanedWatch {
+    fn new(watch: ControlWatch, base_ms: u64, taken_at: Instant) -> Self {
+        Self {
+            watch,
+            base_ms,
+            taken_at,
+        }
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.base_ms.saturating_add(
+            self.taken_at
+                .elapsed()
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64,
+        )
+    }
+}
+
+fn prepare_audio_handover(
+    started: Started,
+    expected_geometry: vst_audio_ring::Geometry,
+    expected_setup: &vst_audio_protocol::ProcessingSetup,
+    shared: &Shared,
+    updates: &mut rtrb::Producer<PreparedAudio>,
+) -> Result<(PluginControl, u64), String> {
+    if started.geometry != expected_geometry
+        || started.setup != *expected_setup
+        || updates.is_full()
+    {
+        return Err("recovery requires a compatible layout and an available audio boundary".into());
+    }
+    let generation = shared
+        .generation
+        .load(Ordering::Acquire)
+        .checked_add(1)
+        .ok_or_else(|| "recovery generation exhausted".to_string())?;
+    let Started {
+        control,
+        region,
+        work,
+        publisher,
+        geometry,
+        latency_frames,
+        setup,
+        capabilities,
+        ..
+    } = started;
+    let lane = vst_audio_ring::BlockLane::new(region, work, publisher, 0, 1)
+        .map_err(|error| format!("recovery ring lane is invalid: {error:?}"))?;
+    let prepared = PreparedAudio {
+        lane,
+        geometry,
+        latency: latency_frames,
+        setup,
+        capabilities,
+        generation,
+    };
+    updates
+        .push(prepared)
+        .map_err(|_| "recovery audio boundary became unavailable".to_string())?;
+    shared.generation.store(generation, Ordering::Release);
+    shared.status.store(3, Ordering::Release);
+    shared.worker_pid.store(control.pid(), Ordering::Release);
+    Ok((control, generation))
+}
+
 pub(crate) fn supervise(
     initial: PluginControl,
     requests: mpsc::Receiver<(RequestId, Command)>,
@@ -31,7 +106,9 @@ pub(crate) fn supervise(
     recovery_config: RecoveryConfig,
 ) {
     let launch = recovery_config.launch;
+    let watch_policy = launch.configuration.recovery == RecoveryPolicy::Watch;
     let mut control = Some(initial);
+    let mut orphaned_watch: Option<OrphanedWatch> = None;
     let mut pending = BTreeMap::new();
     let mut stopping = false;
     let mut failure_reported = false;
@@ -40,10 +117,24 @@ pub(crate) fn supervise(
     let mut prepared_generation = None;
     let mut restoration_pending = false;
     loop {
-        if shared.processed_generation.load(Ordering::Acquire)
-            == shared.generation.load(Ordering::Acquire)
+        if restoration_pending
+            && shared.processed_generation.load(Ordering::Acquire)
+                == shared.generation.load(Ordering::Acquire)
         {
             restoration_pending = false;
+            if watch_policy {
+                let history = {
+                    let mut history = shared.history.lock().unwrap_or_else(|e| e.into_inner());
+                    history.restore_succeeded();
+                    history.clone()
+                };
+                if let Some(control) = &mut control {
+                    let now_ms = control.elapsed_ms();
+                    let mut watch = control.take_watch();
+                    watch.states = history;
+                    control.restore_watch(watch, now_ms);
+                }
+            }
         }
         while let Ok(retired) = retirements.pop() {
             drop(retired);
@@ -56,11 +147,18 @@ pub(crate) fn supervise(
             prepared_generation = None;
         }
         if shared.stop.load(Ordering::Acquire) && !stopping {
-            if let Some(control) = &mut control {
+            let already_exited = control
+                .as_ref()
+                .and_then(|control| control.exit_code().ok().flatten())
+                .is_some();
+            if already_exited {
+                drop(control.take());
+            } else if let Some(control) = &mut control {
                 let _ = control.shutdown();
             }
             stopping = true;
             recovery = None;
+            orphaned_watch = None;
         }
         if stopping && control.is_none() {
             shared.status.store(2, Ordering::Release);
@@ -72,7 +170,13 @@ pub(crate) fn supervise(
                 break;
             };
             if let Command::Recover { use_previous } = command {
-                if stopping || recovery.is_some() || prepared_generation.is_some() {
+                let watch_pending = watch_policy && shared.status.load(Ordering::Acquire) == 4;
+                if stopping
+                    || recovery.is_some()
+                    || orphaned_watch.is_some()
+                    || prepared_generation.is_some()
+                    || watch_pending
+                {
                     emit(
                         &events,
                         &shared,
@@ -90,10 +194,28 @@ pub(crate) fn supervise(
             if matches!(command, Command::Shutdown) {
                 stopping = true;
                 recovery = None;
-                if let Some(control) = &mut control {
+                orphaned_watch = None;
+                let already_exited = control
+                    .as_ref()
+                    .and_then(|control| control.exit_code().ok().flatten())
+                    .is_some();
+                if already_exited {
+                    drop(control.take());
+                } else if let Some(control) = &mut control {
                     let _ = control.shutdown();
                 }
                 emit(&events, &shared, HostEvent::Completed { request: id });
+                continue;
+            }
+            if watch_policy && shared.status.load(Ordering::Acquire) == 4 {
+                emit(
+                    &events,
+                    &shared,
+                    HostEvent::RequestFailed {
+                        request: id,
+                        reason: "worker is not running".into(),
+                    },
+                );
                 continue;
             }
             let Some(control) = &mut control else {
@@ -175,14 +297,34 @@ pub(crate) fn supervise(
             };
             let result = launch.start(state.as_deref(), shared.stop.clone());
             match result {
-                Ok(started) => {
-                    let valid = started.geometry == recovery_config.geometry
-                        && started.setup == recovery_config.setup;
-                    if !valid || updates.is_full() {
+                Ok(started) => match prepare_audio_handover(
+                    started,
+                    recovery_config.geometry,
+                    &recovery_config.setup,
+                    &shared,
+                    &mut updates,
+                ) {
+                    Ok((mut new_control, generation)) => {
+                        if watch_policy && request.is_some() {
+                            let now_ms = new_control.elapsed_ms();
+                            let mut watch = ControlWatch::new(now_ms);
+                            watch.states = shared
+                                .history
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .clone();
+                            new_control.restore_watch(watch, now_ms);
+                        }
+                        control = Some(new_control);
+                        restoration_pending = true;
+                        prepared_generation = Some(generation);
+                        failure_reported = false;
+                        if let Some(request) = request {
+                            emit(&events, &shared, HostEvent::Completed { request });
+                        }
+                    }
+                    Err(reason) => {
                         shared.status.store(1, Ordering::Release);
-                        let reason =
-                            "recovery requires a compatible layout and an available audio boundary"
-                                .to_string();
                         emit(
                             &events,
                             &shared,
@@ -192,59 +334,8 @@ pub(crate) fn supervise(
                                 HostEvent::Failed { reason }
                             },
                         );
-                        drop(started);
-                        continue;
                     }
-                    let Some(generation) = shared.generation.load(Ordering::Acquire).checked_add(1)
-                    else {
-                        shared.status.store(1, Ordering::Release);
-                        return;
-                    };
-                    let Started {
-                        control: new_control,
-                        region,
-                        work,
-                        publisher,
-                        geometry,
-                        latency_frames,
-                        setup,
-                        capabilities,
-                        ..
-                    } = started;
-                    let lane = match vst_audio_ring::BlockLane::new(region, work, publisher, 0, 1) {
-                        Ok(lane) => lane,
-                        Err(_) => {
-                            shared.status.store(1, Ordering::Release);
-                            drop(new_control);
-                            continue;
-                        }
-                    };
-                    let prepared = PreparedAudio {
-                        lane,
-                        geometry,
-                        latency: latency_frames,
-                        setup,
-                        capabilities,
-                        generation,
-                    };
-                    shared.generation.store(generation, Ordering::Release);
-                    shared.status.store(3, Ordering::Release);
-                    if updates.push(prepared).is_err() {
-                        shared.status.store(1, Ordering::Release);
-                        drop(new_control);
-                        continue;
-                    }
-                    shared
-                        .worker_pid
-                        .store(new_control.pid(), Ordering::Release);
-                    control = Some(new_control);
-                    restoration_pending = true;
-                    prepared_generation = Some(generation);
-                    failure_reported = false;
-                    if let Some(request) = request {
-                        emit(&events, &shared, HostEvent::Completed { request });
-                    }
-                }
+                },
                 Err(error) => {
                     shared.status.store(1, Ordering::Release);
                     if let Some(request) = request {
@@ -285,6 +376,8 @@ pub(crate) fn supervise(
             }
         }
         let mut exited = None;
+        let mut respawn_requested = false;
+        let mut disabled = false;
         if let Some(control) = &mut control {
             for event in control.poll(control.elapsed_ms()) {
                 match event {
@@ -382,30 +475,87 @@ pub(crate) fn supervise(
                     ControlEvent::Exited(code) => {
                         exited = Some(code);
                     }
-                    ControlEvent::Action(
-                        action @ (Action::Kill { .. } | Action::Disable { .. }),
-                    ) => {
+                    ControlEvent::NeedsRespawn if watch_policy => respawn_requested = true,
+                    ControlEvent::Action(action @ Action::Disable { .. }) => {
+                        disabled = true;
                         shared.status.store(1, Ordering::Release);
                         if !stopping && !failure_reported {
                             failure_reported = true;
-                            let reason = match action {
-                                Action::Kill { reason } => {
-                                    format!("worker deadline exceeded ({reason:?})")
-                                }
-                                Action::Disable { reason } => {
-                                    format!("worker disabled ({reason:?})")
-                                }
-                                _ => unreachable!(),
+                            let Action::Disable { reason } = action else {
+                                unreachable!()
                             };
-                            emit(&events, &shared, HostEvent::Failed { reason });
+                            emit(
+                                &events,
+                                &shared,
+                                HostEvent::Failed {
+                                    reason: format!("worker disabled ({reason:?})"),
+                                },
+                            );
+                        }
+                        if watch_policy && !stopping {
+                            emit(&events, &shared, HostEvent::RecoveryRequired);
+                        }
+                    }
+                    ControlEvent::Action(action @ Action::Kill { .. }) => {
+                        shared
+                            .status
+                            .store(if watch_policy { 4 } else { 1 }, Ordering::Release);
+                        if !stopping && !failure_reported {
+                            failure_reported = true;
+                            let Action::Kill { reason } = action else {
+                                unreachable!()
+                            };
+                            emit(
+                                &events,
+                                &shared,
+                                HostEvent::Failed {
+                                    reason: format!("worker deadline exceeded ({reason:?})"),
+                                },
+                            );
+                        }
+                    }
+                    ControlEvent::Action(Action::EnterFallback) if watch_policy => {
+                        shared.status.store(4, Ordering::Release);
+                        if !stopping && !failure_reported {
+                            failure_reported = true;
+                            emit(
+                                &events,
+                                &shared,
+                                HostEvent::Failed {
+                                    reason: "worker entered fallback".into(),
+                                },
+                            );
                         }
                     }
                     _ => {}
                 }
             }
         }
-        if let Some(code) = exited {
+        if disabled && watch_policy {
             drop(control.take());
+        }
+        if respawn_requested && !stopping {
+            for (_, request) in std::mem::take(&mut pending) {
+                emit(
+                    &events,
+                    &shared,
+                    HostEvent::RequestFailed {
+                        request,
+                        reason: "worker replaced".into(),
+                    },
+                );
+            }
+            let mut old_control = control.take().expect("respawn has a control");
+            let base_ms = old_control.elapsed_ms();
+            let taken_at = Instant::now();
+            let watch = old_control.take_watch();
+            orphaned_watch = Some(OrphanedWatch::new(watch, base_ms, taken_at));
+            drop(old_control);
+        }
+        if let Some(code) = exited {
+            if !watch_policy {
+                drop(control.take());
+            }
             prepared_generation = None;
             for (_, request) in std::mem::take(&mut pending) {
                 emit(
@@ -422,8 +572,12 @@ pub(crate) fn supervise(
                 emit(&events, &shared, HostEvent::Stopped);
                 return;
             }
-            shared.status.store(1, Ordering::Release);
+            shared.status.store(
+                if watch_policy && !disabled { 4 } else { 1 },
+                Ordering::Release,
+            );
             if !failure_reported {
+                failure_reported = true;
                 emit(
                     &events,
                     &shared,
@@ -432,7 +586,9 @@ pub(crate) fn supervise(
                     },
                 );
             }
-            emit(&events, &shared, HostEvent::RecoveryRequired);
+            if !watch_policy && !disabled {
+                emit(&events, &shared, HostEvent::RecoveryRequired);
+            }
             if let RecoveryPolicy::Automatic {
                 attempts: limit,
                 backoff_ms,
@@ -446,6 +602,138 @@ pub(crate) fn supervise(
                     restoration_pending,
                     None,
                 ));
+            }
+        }
+        if watch_policy && !stopping && respawn_requested {
+            let mut orphan = orphaned_watch.take().expect("respawn preserved its watch");
+            let state = orphan.watch.states.respawn_state();
+            *shared.history.lock().unwrap_or_else(|e| e.into_inner()) = orphan.watch.states.clone();
+            match launch.start(state.as_deref(), shared.stop.clone()) {
+                Ok(started) => match prepare_audio_handover(
+                    started,
+                    recovery_config.geometry,
+                    &recovery_config.setup,
+                    &shared,
+                    &mut updates,
+                ) {
+                    Ok((mut new_control, generation)) => {
+                        let now_ms = orphan.now_ms();
+                        new_control.restore_watch(orphan.watch, now_ms);
+                        *shared.history.lock().unwrap_or_else(|e| e.into_inner()) =
+                            new_control.state_history();
+                        control = Some(new_control);
+                        restoration_pending = true;
+                        prepared_generation = Some(generation);
+                        failure_reported = false;
+                    }
+                    Err(reason) => {
+                        shared.status.store(1, Ordering::Release);
+                        emit(&events, &shared, HostEvent::Failed { reason });
+                        emit(&events, &shared, HostEvent::RecoveryRequired);
+                    }
+                },
+                Err(error) => {
+                    let now_ms = orphan.now_ms();
+                    let actions = orphan.watch.poll(now_ms, 0, Some(1));
+                    shared.status.store(4, Ordering::Release);
+                    failure_reported = false;
+                    let disabled = actions
+                        .iter()
+                        .any(|action| matches!(action, Action::Disable { .. }));
+                    emit(
+                        &events,
+                        &shared,
+                        HostEvent::Failed {
+                            reason: if disabled {
+                                "worker disabled (ThreeFailuresInTenMinutes)".into()
+                            } else {
+                                format!("recovery failed: {error}")
+                            },
+                        },
+                    );
+                    if disabled {
+                        shared.status.store(1, Ordering::Release);
+                        emit(&events, &shared, HostEvent::RecoveryRequired);
+                    } else {
+                        orphaned_watch = Some(orphan);
+                    }
+                }
+            }
+        } else if watch_policy && !stopping && control.is_none() {
+            let mut spawn = false;
+            let mut disable = None;
+            if let Some(orphan) = &mut orphaned_watch {
+                for action in orphan.watch.poll(orphan.now_ms(), 0, None) {
+                    match action {
+                        Action::Spawn => spawn = true,
+                        Action::Disable { reason } => disable = Some(reason),
+                        _ => {}
+                    }
+                }
+            }
+            if spawn {
+                let orphan = orphaned_watch.as_mut().expect("orphaned watch exists");
+                let state = orphan.watch.states.respawn_state();
+                *shared.history.lock().unwrap_or_else(|e| e.into_inner()) =
+                    orphan.watch.states.clone();
+                match launch.start(state.as_deref(), shared.stop.clone()) {
+                    Ok(started) => match prepare_audio_handover(
+                        started,
+                        recovery_config.geometry,
+                        &recovery_config.setup,
+                        &shared,
+                        &mut updates,
+                    ) {
+                        Ok((mut new_control, generation)) => {
+                            let orphan = orphaned_watch.take().expect("orphaned watch exists");
+                            let now_ms = orphan.now_ms();
+                            new_control.restore_watch(orphan.watch, now_ms);
+                            *shared.history.lock().unwrap_or_else(|e| e.into_inner()) =
+                                new_control.state_history();
+                            control = Some(new_control);
+                            restoration_pending = true;
+                            prepared_generation = Some(generation);
+                            failure_reported = false;
+                        }
+                        Err(reason) => {
+                            orphaned_watch = None;
+                            shared.status.store(1, Ordering::Release);
+                            emit(&events, &shared, HostEvent::Failed { reason });
+                            emit(&events, &shared, HostEvent::RecoveryRequired);
+                        }
+                    },
+                    Err(error) => {
+                        let orphan = orphaned_watch.as_mut().expect("orphaned watch exists");
+                        let actions = orphan.watch.poll(orphan.now_ms(), 0, Some(1));
+                        if actions
+                            .iter()
+                            .any(|action| matches!(action, Action::Disable { .. }))
+                        {
+                            disable =
+                                Some(vst_audio_protocol::DisableReason::ThreeFailuresInTenMinutes);
+                        } else {
+                            emit(
+                                &events,
+                                &shared,
+                                HostEvent::Failed {
+                                    reason: format!("recovery failed: {error}"),
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            if let Some(reason) = disable {
+                orphaned_watch = None;
+                shared.status.store(1, Ordering::Release);
+                emit(
+                    &events,
+                    &shared,
+                    HostEvent::Failed {
+                        reason: format!("worker disabled ({reason:?})"),
+                    },
+                );
+                emit(&events, &shared, HostEvent::RecoveryRequired);
             }
         }
         thread::sleep(Duration::from_millis(5));
