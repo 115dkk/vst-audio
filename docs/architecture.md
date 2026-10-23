@@ -181,11 +181,17 @@ Queued work and notifications have bounded storage and explicit overflow.
 The wire ABI never contains Rust object layout or process-local pointers.
 
 Realtime blocks use preallocated shared memory, sequence numbers, configuration
-generations and sample positions. The parent trusts its own validated geometry.
-Plugin processing receives private scratch buffers, never the shared mapping.
-Late outputs cannot be substituted for a different sample interval.
-The callback does not allocate, block or perform synchronous control I/O.
-Fixed pipeline latency and plugin latency are reported in frames.
+generations and sample positions. Each lane has 2 to 16 contiguous sample slots;
+the configured pipeline depth selects the exact earlier application block to
+consume. Applications that read before publishing may use depth up to the slot
+count; publish-then-read requires one spare slot. The parent trusts its own
+validated geometry. Plugin processing receives private scratch buffers, never
+the shared mapping. Late outputs cannot be substituted for a different sample
+interval. The callback does not allocate, block or perform synchronous control
+I/O. The implemented high-level adapter chooses
+`depth = ceil(max_callback_frames / quantum)`, allocates `depth + 1` slots, and
+reports `(depth + 1) * quantum + plugin latency` frames. The default is depth 1,
+two slots and two quanta plus plugin latency.
 
 Native pointer/lifetime operations are audited in sys crates. For loading a
 plugin, crash isolation does not make unknown native code memory-safe inside the

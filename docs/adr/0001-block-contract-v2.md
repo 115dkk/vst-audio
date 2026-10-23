@@ -14,6 +14,7 @@ VST3 parameter queues retain sample offsets. Buses are configured before audio
 activation, retain native order, and may have discrete/unknown speaker layouts.
 
 The application reblocks variable callbacks into a prepared quantum. Its fixed
-pipeline delay is two quanta, plus reported plugin latency. Recovery transfers
+pipeline delay is two quanta, plus reported plugin latency (configurable since
+[ADR 0003](0003-ring-depth.md)). Recovery transfers
 prebuilt resources through bounded SPSC queues; retired resources are reclaimed
 on the supervisor thread, never in the audio callback.

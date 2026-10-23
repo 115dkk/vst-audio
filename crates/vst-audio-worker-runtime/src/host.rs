@@ -14,6 +14,8 @@ pub struct Args {
     pub region: usize,
     #[arg(long)]
     pub region_bytes: usize,
+    #[arg(long, default_value_t = 2)]
+    pub slots: u32,
     #[arg(long)]
     pub work: u64,
     #[arg(long)]
@@ -372,6 +374,7 @@ mod tests {
         let geometry = Geometry {
             sample_format: vst_audio_ring::SampleFormat::F32,
             lanes: 1,
+            slots: 2,
             input_channels: 2,
             output_channels: 2,
             max_frames: 4,
@@ -515,6 +518,7 @@ mod tests {
         let geometry = Geometry {
             sample_format: vst_audio_ring::SampleFormat::F32,
             lanes: 1,
+            slots: 2,
             input_channels: 2,
             output_channels: 2,
             max_frames: 4,

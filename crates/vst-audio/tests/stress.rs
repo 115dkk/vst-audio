@@ -27,6 +27,7 @@ fn repeated_crash_recovery_keeps_variable_callbacks_and_healthy_peer_running() {
             format,
         );
         let config = Configuration {
+            max_callback_frames: Some(256),
             recovery: RecoveryPolicy::Automatic {
                 attempts: 8,
                 backoff_ms: 20,
@@ -34,9 +35,11 @@ fn repeated_crash_recovery_keeps_variable_callbacks_and_healthy_peer_running() {
             ..Default::default()
         };
         let mut a = host.spawn(&plugin, &config, None).unwrap();
-        let mut b = host
-            .spawn(&plugin, &Configuration::default(), None)
-            .unwrap();
+        let healthy = Configuration {
+            max_callback_frames: Some(256),
+            ..Default::default()
+        };
+        let mut b = host.spawn(&plugin, &healthy, None).unwrap();
         let mut audio_a = a.take_audio().unwrap();
         let mut audio_b = b.take_audio().unwrap();
         let saved = a.controller().request(Command::SaveState).unwrap();
@@ -85,6 +88,8 @@ fn repeated_crash_recovery_keeps_variable_callbacks_and_healthy_peer_running() {
         let mut output_b = [[0.0; 256]; 6];
         let mut blocks = 0;
         let mut completed = 0;
+        let mut healthy_measured = 0;
+        let mut healthy_processed = 0;
         let mut frames = 0;
         let mut injections = 0;
         let mut recovered = 0;
@@ -108,9 +113,13 @@ fn repeated_crash_recovery_keeps_variable_callbacks_and_healthy_peer_running() {
                 (status, failed)
             });
             frames += count;
-            if status == AudioStatus::Processed && frames > 1024 {
-                completed += 1;
-                assert!(right[0].iter().all(|v| (*v - 0.25).abs() < 1e-6));
+            if frames > 1024 {
+                healthy_measured += 1;
+                if status == AudioStatus::Processed {
+                    healthy_processed += 1;
+                    completed += 1;
+                    assert!(right[0].iter().all(|v| (*v - 0.25).abs() < 1e-6));
+                }
             }
             assert_eq!(b.status(), Status::Running);
             for _ in 0..32 {
@@ -152,8 +161,15 @@ fn repeated_crash_recovery_keeps_variable_callbacks_and_healthy_peer_running() {
         }
         assert_eq!(injections, 4);
         assert!(audio_a.generation() >= 5);
+        let ratio = healthy_processed as f64 / healthy_measured as f64;
+        assert!(
+            ratio >= 0.9,
+            "{format:?}: only {:.1}% healthy-peer callbacks processed",
+            ratio * 100.0
+        );
         println!(
-            "STRESS {format:?}: {completed} numeric healthy callbacks, {frames} frames, {recovered} successful recoveries"
+            "STRESS {format:?}: {completed}/{healthy_measured} healthy callbacks processed ({:.1}%), {frames} frames, {recovered} successful recoveries",
+            ratio * 100.0
         );
     }
 }

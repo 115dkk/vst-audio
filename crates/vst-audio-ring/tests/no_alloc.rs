@@ -26,6 +26,7 @@ fn producer_per_block_path_does_not_allocate() {
     let storage = RegionBuf::new(Geometry {
         sample_format: vst_audio_ring::SampleFormat::F32,
         lanes: 1,
+        slots: 2,
         input_channels: 2,
         output_channels: 6,
         max_frames: 480,
@@ -40,6 +41,7 @@ fn producer_per_block_path_does_not_allocate() {
             Geometry {
                 sample_format: vst_audio_ring::SampleFormat::F32,
                 lanes: 1,
+                slots: 2,
                 input_channels: 2,
                 output_channels: 6,
                 max_frames: 480,

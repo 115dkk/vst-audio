@@ -19,7 +19,7 @@ use vst_audio_protocol::{
 use vst_audio_protocol::{
     BusConfiguration, BusInfo, BusKind, Capabilities, ProcessingSetup, SampleFormat,
 };
-use vst_audio_ring::{Geometry, Producer, Publisher, Signal, Waited};
+use vst_audio_ring::{Geometry, MAX_SLOTS, Producer, Publisher, Signal, Waited};
 use vst_audio_transport_sys::{
     Event, SharedRegion,
     runtime::{self, ChildProcess, Pipe},
@@ -188,6 +188,7 @@ pub struct ProcessingOptions {
     pub cancel: Option<Arc<AtomicBool>>,
     pub sample_rate: u32,
     pub quantum: u32,
+    pub slots: u32,
     pub sample_format: SampleFormat,
     pub offline: bool,
     pub sandbox: Option<crate::SandboxPolicy>,
@@ -202,6 +203,7 @@ impl Default for ProcessingOptions {
             cancel: None,
             sample_rate: 48000,
             quantum: 128,
+            slots: 2,
             sample_format: SampleFormat::F32,
             offline: false,
             sandbox: None,
@@ -540,12 +542,19 @@ impl PluginProcess {
         options: &ProcessingOptions,
         state: Option<&[u8]>,
     ) -> Result<Started, StartError> {
+        if !(2..=MAX_SLOTS).contains(&options.slots) {
+            return Err(StartError(format!(
+                "ring slots must be 2..={MAX_SLOTS}, got {}",
+                options.slots
+            )));
+        }
         let rate = options.sample_rate;
         let frames = options.quantum;
         let origin = Instant::now();
         let maximum = Geometry {
             sample_format: options.sample_format,
             lanes: 1,
+            slots: options.slots,
             input_channels: 64,
             output_channels: 64,
             max_frames: frames,
@@ -720,6 +729,7 @@ impl PluginProcess {
         let geometry = Geometry {
             sample_format: vst_audio_ring::SampleFormat::F32,
             lanes: 1,
+            slots: 2,
             input_channels: 2,
             output_channels: 32,
             max_frames: 480,
@@ -831,6 +841,8 @@ fn spawn(
     }
     args.push("--region-bytes".into());
     args.push(region.bytes().to_string().into());
+    args.push("--slots".into());
+    args.push(geometry.slots.to_string().into());
     args.push("--linux-editor".into());
     args.push(linux_editor.argument().into());
     sandbox.arguments(&mut args);

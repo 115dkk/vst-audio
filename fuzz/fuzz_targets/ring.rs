@@ -5,9 +5,11 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use vst_audio_ring::*;
 
 fuzz_target!(|data: &[u8]| {
+    let slots = 2 + u32::from(data.first().copied().unwrap_or(0)) % (MAX_SLOTS - 1);
     let geometry = Geometry {
         sample_format: SampleFormat::F64,
         lanes: 1,
+        slots,
         input_channels: 0,
         output_channels: 2,
         max_frames: 8,

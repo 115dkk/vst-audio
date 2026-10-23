@@ -30,10 +30,12 @@
 //! | 40 | 4 | fault code |
 //! | 44 | 4 | producer pid |
 //! | 48 | 4 | consumer pid |
-//! | 64 | 24 | lane geometry: two slot offsets and slot bytes, per lane |
+//! | 52 | 4 | sample format |
+//! | 56 | 4 | slots per lane |
+//! | 64 | 24 | lane geometry: first slot offset, slot bytes, slot count, per lane |
 //! | 128 | 8 | lane sequences (one u32 per lane; own cache line) |
 //! | 192 | 8 | lane completions (one u32 per lane; own cache line) |
-//! | 512 | variable | two 64-byte-aligned sample slots per lane |
+//! | 512 | variable | `slots` 64-byte-aligned sample slots per lane |
 //! | rounded slot end | 64 | heartbeat u64 and padding |
 //! | +64 | 64 | last error u64 and padding |
 
@@ -60,11 +62,12 @@ impl SampleFormat {
 }
 
 pub const MAGIC: u32 = u32::from_le_bytes(*b"SSRR");
-pub const LAYOUT_VERSION: u32 = 2;
+pub const LAYOUT_VERSION: u32 = 3;
 pub const HEADER_BYTES: usize = 512;
 pub const CACHE_LINE: usize = 64;
 pub const MAX_CHANNELS: u32 = 64;
 pub const MAX_FRAMES: u32 = 65_536;
+pub const MAX_SLOTS: u32 = 16;
 pub const MAX_REGION_BYTES: usize = 128 * 1024 * 1024;
 const COUNTER_BYTES: usize = 2 * CACHE_LINE;
 const HEADER_WORDS: usize = HEADER_BYTES / 4;
@@ -84,6 +87,7 @@ const FAULT_I: usize = 10;
 const PRODUCER_PID_I: usize = 11;
 const CONSUMER_PID_I: usize = 12;
 const FORMAT_I: usize = 13;
+const SLOTS_I: usize = 14;
 const LANE_GEOMETRY_I: usize = 16;
 const SEQUENCE_I: usize = 32;
 const COMPLETED_I: usize = 48;
@@ -124,6 +128,7 @@ pub enum Fault {
 pub struct Geometry {
     pub sample_format: SampleFormat,
     pub lanes: u32,
+    pub slots: u32,
     pub input_channels: u32,
     pub output_channels: u32,
     pub max_frames: u32,
@@ -135,6 +140,9 @@ impl Geometry {
     pub fn validate(self) -> Result<Self, GeometryError> {
         if !(1..=2).contains(&self.lanes) {
             return Err(GeometryError::LaneCount);
+        }
+        if !(2..=MAX_SLOTS).contains(&self.slots) {
+            return Err(GeometryError::Slots);
         }
         if self.input_channels > MAX_CHANNELS || self.output_channels > MAX_CHANNELS {
             return Err(GeometryError::Channels);
@@ -170,6 +178,7 @@ impl Geometry {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GeometryError {
     LaneCount,
+    Slots,
     Channels,
     Frames,
     SampleRate,
@@ -179,9 +188,16 @@ pub enum GeometryError {
 #[derive(Clone, Copy, Debug)]
 struct Layout {
     slot_bytes: usize,
-    slot_offsets: [[usize; 2]; 2],
+    first_slot_offsets: [usize; 2],
+    slots: u32,
     prefix_bytes: usize,
     total_bytes: usize,
+}
+
+impl Layout {
+    fn slot_offset(self, lane: usize, sequence: u32) -> usize {
+        self.first_slot_offsets[lane] + (sequence % self.slots) as usize * self.slot_bytes
+    }
 }
 
 fn round_up(value: usize, alignment: usize) -> Option<usize> {
@@ -199,18 +215,17 @@ fn layout(geometry: Geometry) -> Option<Layout> {
         CACHE_LINE,
     )?;
     let mut offset = HEADER_BYTES;
-    let mut slot_offsets = [[0; 2]; 2];
-    for lane_slots in slot_offsets.iter_mut().take(geometry.lanes as usize) {
-        for slot_offset in lane_slots {
-            *slot_offset = offset;
-            offset = offset.checked_add(slot_bytes)?;
-        }
+    let mut first_slot_offsets = [0; 2];
+    for first_slot_offset in first_slot_offsets.iter_mut().take(geometry.lanes as usize) {
+        *first_slot_offset = offset;
+        offset = offset.checked_add(slot_bytes.checked_mul(geometry.slots as usize)?)?;
     }
     let prefix_bytes = round_up(offset, CACHE_LINE)?;
     let total_bytes = prefix_bytes.checked_add(COUNTER_BYTES)?;
     (total_bytes < MAX_REGION_BYTES).then_some(Layout {
         slot_bytes,
-        slot_offsets,
+        first_slot_offsets,
+        slots: geometry.slots,
         prefix_bytes,
         total_bytes,
     })
@@ -443,7 +458,9 @@ impl Publisher {
 
     /// Writes `sequence` (never 0) into its slot and publishes it, then
     /// signals `work`. `Dropped`, touching nothing, unless the consumer is
-    /// `Ready` and has completed `sequence - 2`, whose slot this reuses.
+    /// `Ready` and has completed `sequence - slots`, whose slot this reuses.
+    /// Sequences start at 1, advance once per publish, and must not wrap; a
+    /// lane therefore carries at most `u32::MAX` sequences.
     pub fn try_publish<F>(
         &self,
         region: Region<'_>,
@@ -462,10 +479,12 @@ impl Publisher {
             return Publish::Dropped;
         }
         let completed = self.completed(region, lane);
-        if sequence > 2 && !sequence_at_least(completed, sequence.wrapping_sub(2)) {
+        if sequence > self.geometry.slots
+            && !sequence_at_least(completed, sequence - self.geometry.slots)
+        {
             return Publish::Dropped;
         }
-        let offset = self.layout.slot_offsets[lane][sequence as usize & 1] / 4;
+        let offset = self.layout.slot_offset(lane, sequence) / 4;
         let Some(samples) = region.words32.get(
             offset..offset + self.geometry.samples_per_slot() * self.geometry.sample_format.words(),
         ) else {
@@ -503,7 +522,11 @@ impl Publisher {
         {
             return false;
         }
-        let offset = self.layout.slot_offsets[lane][sequence as usize & 1] / 4;
+        let published = u32::from_le(region.load32(SEQUENCE_I + lane, Ordering::Acquire));
+        if published.wrapping_sub(sequence) >= self.geometry.slots {
+            return false;
+        }
+        let offset = self.layout.slot_offset(lane, sequence) / 4;
         let Some(samples) = region.words32.get(
             offset..offset + self.geometry.samples_per_slot() * self.geometry.sample_format.words(),
         ) else {
@@ -576,6 +599,7 @@ impl<'a> Producer<'a> {
             (FRAMES_I, geometry.max_frames),
             (RATE_I, geometry.sample_rate),
             (FORMAT_I, geometry.sample_format as u32),
+            (SLOTS_I, geometry.slots),
             (LATENCY_I, geometry.latency_bound_frames),
             (PRODUCER_PID_I, producer_pid),
         ];
@@ -586,19 +610,16 @@ impl<'a> Producer<'a> {
             let base = LANE_GEOMETRY_I + lane * 3;
             self.region.store32(
                 base,
-                (layout.slot_offsets[lane][0] as u32).to_le(),
+                (layout.first_slot_offsets[lane] as u32).to_le(),
                 Ordering::Relaxed,
             );
             self.region.store32(
                 base + 1,
-                (layout.slot_offsets[lane][1] as u32).to_le(),
-                Ordering::Relaxed,
-            );
-            self.region.store32(
-                base + 2,
                 (layout.slot_bytes as u32).to_le(),
                 Ordering::Relaxed,
             );
+            self.region
+                .store32(base + 2, geometry.slots.to_le(), Ordering::Relaxed);
         }
         self.region
             .store32(FAULT_I, Fault::None as u32, Ordering::Release);
@@ -892,7 +913,7 @@ impl<'a> Consumer<'a> {
         {
             return false;
         }
-        let offset = layout.slot_offsets[lane][sequence as usize & 1] / 4;
+        let offset = layout.slot_offset(lane, sequence) / 4;
         let samples = &self.region.words32[offset..offset + buffer.len()];
         for (destination, sample) in buffer.iter_mut().zip(samples) {
             *destination = f32::from_bits(sample.load(Ordering::Relaxed));
@@ -923,7 +944,7 @@ impl<'a> Consumer<'a> {
         {
             return false;
         }
-        let offset = layout.slot_offsets[lane][sequence as usize & 1] / 4;
+        let offset = layout.slot_offset(lane, sequence) / 4;
         let samples = &self.region.words32[offset..offset + buffer.len() * 2];
         for (to, from) in buffer.iter_mut().zip(samples.as_chunks::<2>().0.iter()) {
             *to = f64::from_bits(
@@ -944,7 +965,7 @@ impl<'a> Consumer<'a> {
         if lane >= geometry.lanes as usize {
             return None;
         }
-        let offset = layout.slot_offsets[lane][sequence as usize & 1] / 4
+        let offset = layout.slot_offset(lane, sequence) / 4
             + geometry.samples_per_slot() * geometry.sample_format.words();
         self.region.words32.get(offset..offset + METADATA_WORDS)
     }
@@ -1033,6 +1054,7 @@ fn validate_header(region: Region<'_>) -> Result<Geometry, HeaderError> {
             _ => return Err(HeaderError::Version),
         },
         lanes: u32::from_le(region.load32(LANES_I, Ordering::Relaxed)),
+        slots: u32::from_le(region.load32(SLOTS_I, Ordering::Relaxed)),
         input_channels: u32::from_le(region.load32(INPUTS_I, Ordering::Relaxed)),
         output_channels: u32::from_le(region.load32(OUTPUTS_I, Ordering::Relaxed)),
         max_frames: u32::from_le(region.load32(FRAMES_I, Ordering::Relaxed)),
@@ -1056,9 +1078,9 @@ fn validate_header(region: Region<'_>) -> Result<Geometry, HeaderError> {
         ];
         if actual
             != [
-                expected.slot_offsets[lane][0],
-                expected.slot_offsets[lane][1],
+                expected.first_slot_offsets[lane],
                 expected.slot_bytes,
+                expected.slots as usize,
             ]
         {
             return Err(HeaderError::LaneGeometry);
@@ -1079,10 +1101,20 @@ struct PipelineEntry {
     valid: bool,
 }
 
-/// Two-slot metadata enforcing ADR 0021's one-block pipeline rule.
-#[derive(Debug, Default)]
+/// Metadata enforcing a fixed-depth pipeline.
+///
+/// An application that publishes block `k` and then reads must use
+/// `depth <= slots - 1`; read-then-publish order allows `depth <= slots`.
+#[derive(Debug)]
 pub struct Pipeline {
-    entries: [PipelineEntry; 2],
+    entries: [PipelineEntry; MAX_SLOTS as usize],
+    depth: u32,
+}
+
+impl Default for Pipeline {
+    fn default() -> Self {
+        Self::with_depth(1)
+    }
 }
 
 impl Pipeline {
@@ -1090,8 +1122,26 @@ impl Pipeline {
         Self::default()
     }
 
+    pub fn with_depth(depth: u32) -> Self {
+        assert!((1..=MAX_SLOTS).contains(&depth));
+        Self {
+            entries: array::from_fn(|_| PipelineEntry::default()),
+            depth,
+        }
+    }
+
+    pub fn depth(&self) -> u32 {
+        self.depth
+    }
+
+    pub fn set_depth(&mut self, depth: u32) {
+        assert!((1..=MAX_SLOTS).contains(&depth));
+        self.depth = depth;
+        self.clear();
+    }
+
     pub fn published(&mut self, sequence: u32, app_block: u64, generation: u64) {
-        self.entries[sequence as usize & 1] = PipelineEntry {
+        self.entries[sequence as usize % MAX_SLOTS as usize] = PipelineEntry {
             sequence,
             app_block,
             generation,
@@ -1099,15 +1149,15 @@ impl Pipeline {
         };
     }
 
-    /// Returns the sequence for `app_block - 1` only when that exact block was
-    /// published, completed, and belongs to the current generation.
+    /// Returns the sequence for `app_block - depth` only when that exact block
+    /// was published, completed, and belongs to the current generation.
     pub fn output_sequence(
         &mut self,
         app_block: u64,
         generation: u64,
         completed: u32,
     ) -> Option<u32> {
-        let wanted = app_block.checked_sub(1)?;
+        let wanted = app_block.checked_sub(u64::from(self.depth))?;
         let found = self.entries.iter_mut().find(|entry| {
             entry.valid && entry.app_block == wanted && entry.generation == generation
         })?;
