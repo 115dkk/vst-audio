@@ -199,8 +199,9 @@ def main():
                 probe = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
                     ROOT / "tools/eapo_probe.ps1", "-Root", root / "eapo-probe", "-App", app,
                     "-Vst3", paths["EQ_VST3"], "-Vst2", paths["EQ_VST2"]],
-                    capture_output=True, text=True, timeout=420, env=probe_env)
-                print(probe.stdout[-200000:], probe.stderr[-20000:], flush=True)
+                    capture_output=True, timeout=420, env=probe_env)
+                text = (probe.stdout or b"").decode("utf-8", "replace") + (probe.stderr or b"").decode("utf-8", "replace")
+                print(text[-200000:].encode("ascii", "backslashreplace").decode("ascii"), flush=True)
             except Exception as error:
                 print(f"PROBE failed to run: {error}", flush=True)
         if report["returncode"]:
