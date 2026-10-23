@@ -780,7 +780,8 @@ impl Vst2Plugin {
             scale: self.editor_scale,
             scaling: self.editor_scaling,
             resize_supported: false,
-            scale_supported: self.editor_scale_supported,
+            // macOS leaves Retina scaling to the system and refuses `Scale`.
+            scale_supported: self.editor_scale_supported && !cfg!(target_os = "macos"),
         }))
     }
     pub fn request_editor_close(&mut self) -> Result<(), PluginError> {

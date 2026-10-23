@@ -1314,10 +1314,13 @@ impl Vst3Plugin {
             check(result, "attached")?;
         }
         frame_guard.active = false;
+        // As before scaling modes existed: whether the view takes host scale
+        // requests, not whether this open sent one (macOS and Off send none).
+        let scale_supported = accepted || view.cast::<IPlugViewContentScaleSupport>().is_some();
         let editor = Editor {
             mode: scaling,
             scaling: effective,
-            scale_supported: accepted,
+            scale_supported,
             scale: applied_scale,
             #[cfg(target_os = "linux")]
             output_scale: window.wayland().map_or(1.0, |w| w.scale()),
