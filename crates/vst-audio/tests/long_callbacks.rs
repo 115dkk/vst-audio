@@ -32,6 +32,81 @@ fn callback(audio: &mut AudioEndpoint, frames: usize) -> (AudioStatus, Vec<Vec<f
     (status, planes)
 }
 
+struct Paced {
+    measured: usize,
+    processed: usize,
+    max_late: Duration,
+    late_starts: usize,
+    late_misses: usize,
+}
+
+impl Paced {
+    fn ratio(&self) -> f64 {
+        self.processed as f64 / self.measured as f64
+    }
+}
+
+impl std::fmt::Display for Paced {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}/{} processed ({:.1}%), {} starts over 1 ms late (max {:?}), {} misses right after one",
+            self.processed,
+            self.measured,
+            self.ratio() * 100.0,
+            self.late_starts,
+            self.max_late,
+            self.late_misses
+        )
+    }
+}
+
+/// Calls `frames`-frame callbacks every `period`, as an audio device would,
+/// and counts processed outputs. After warm-up the fixture passes plane 0's
+/// 0.25 through; before it, its own 64-frame delay still shows.
+fn paced(
+    audio: &mut AudioEndpoint,
+    frames: usize,
+    count: usize,
+    period: Duration,
+    warm: bool,
+) -> Paced {
+    let mut run = Paced {
+        measured: 0,
+        processed: 0,
+        max_late: Duration::ZERO,
+        late_starts: 0,
+        late_misses: 0,
+    };
+    let mut due = Instant::now();
+    let mut previous_late = false;
+    for _ in 0..count {
+        let late = Instant::now().saturating_duration_since(due);
+        run.max_late = run.max_late.max(late);
+        let (status, outputs) = callback(audio, frames);
+        run.measured += 1;
+        if status == AudioStatus::Processed {
+            run.processed += 1;
+            assert!(
+                !warm
+                    || outputs[0]
+                        .iter()
+                        .all(|sample| (*sample - 0.25).abs() < 1e-6)
+            );
+        } else if previous_late {
+            run.late_misses += 1;
+        }
+        previous_late = late > Duration::from_millis(1);
+        run.late_starts += usize::from(previous_late);
+        due += period;
+        let now = Instant::now();
+        if due > now {
+            std::thread::sleep(due - now);
+        }
+    }
+    run
+}
+
 #[test]
 #[ignore = "native fixtures required"]
 fn long_callbacks_are_processed_and_oversize_calls_leave_state_untouched() {
@@ -49,41 +124,17 @@ fn long_callbacks_are_processed_and_oversize_calls_leave_state_untouched() {
     assert_eq!(audio.latency_frames(), 5 * 128 + 64);
 
     let period = Duration::from_secs_f64(480.0 / 48_000.0);
-    let mut deadline = Instant::now();
-    for _ in 0..100 {
-        deadline += period;
-        let _ = callback(&mut audio, 480);
-        let now = Instant::now();
-        if deadline > now {
-            std::thread::sleep(deadline - now);
-        }
+    paced(&mut audio, 480, 100, period, false);
+    let run = paced(&mut audio, 480, 300, period, true);
+    println!("LONG_CALLBACKS 480/128: {run}");
+    if run.ratio() < 0.95 {
+        // Diagnosis only: the same endpoint with twice the time per callback.
+        println!(
+            "LONG_CALLBACKS 480/128 at half speed: {}",
+            paced(&mut audio, 480, 200, 2 * period, true)
+        );
     }
-
-    let mut measured = 0;
-    let mut processed = 0;
-    for _ in 0..300 {
-        deadline += period;
-        let (status, outputs) = callback(&mut audio, 480);
-        measured += 1;
-        if status == AudioStatus::Processed {
-            processed += 1;
-            assert!(
-                outputs[0]
-                    .iter()
-                    .all(|sample| (*sample - 0.25).abs() < 1e-6)
-            );
-        }
-        let now = Instant::now();
-        if deadline > now {
-            std::thread::sleep(deadline - now);
-        }
-    }
-    let ratio = processed as f64 / measured as f64;
-    println!(
-        "LONG_CALLBACKS: {processed}/{measured} processed ({:.1}%)",
-        ratio * 100.0
-    );
-    assert!(ratio >= 0.95);
+    assert!(run.ratio() >= 0.95);
 
     let (status, outputs) = callback(&mut audio, 481);
     assert_eq!(status, AudioStatus::InvalidBuffer);
@@ -103,6 +154,14 @@ fn default_limit_and_invalid_configurations_are_rejected() {
         .spawn(&plugin, &Configuration::default(), None)
         .unwrap();
     let mut audio = instance.take_audio().unwrap();
+    // For comparison with the long callbacks: quantum-sized callbacks at
+    // depth 1 have a third of their time to come back.
+    let period = Duration::from_secs_f64(128.0 / 48_000.0);
+    paced(&mut audio, 128, 300, period, false);
+    println!(
+        "LONG_CALLBACKS 128/128 (default): {}",
+        paced(&mut audio, 128, 900, period, true)
+    );
     let (status, outputs) = callback(&mut audio, 129);
     assert_eq!(status, AudioStatus::InvalidBuffer);
     assert!(outputs.iter().flatten().all(|sample| *sample == 0.0));
