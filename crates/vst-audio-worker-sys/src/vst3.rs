@@ -1113,7 +1113,12 @@ impl Vst3Plugin {
         #[cfg(target_os = "linux")]
         let platform = {
             use crate::linux_editor::{Policy, policy, wayland_allowed};
-            let native = !_force_x11 && parent.is_none() && wayland_allowed();
+            // A stretched editor goes to the desktop's XWayland, which the
+            // compositor scales; a native Wayland view is never stretched.
+            let native = !_force_x11
+                && parent.is_none()
+                && wayland_allowed()
+                && scaling != EditorScaling::Stretch;
             // SAFETY: retained main-thread view, static SDK platform identifier.
             let supported = native
                 && unsafe { view.isPlatformTypeSupported(kPlatformTypeWaylandSurfaceID) }

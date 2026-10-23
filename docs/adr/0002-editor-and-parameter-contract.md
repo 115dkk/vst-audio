@@ -31,8 +31,10 @@ unknown-kind handling are unchanged.
 
 `Auto` prefers plugin scaling, falls back to system stretching for Windows
 floating editors, and otherwise leaves the editor 1:1. `Plugin` never uses
-system stretching. `Stretch` requires a Windows floating window; `Off` sends no
-plugin scale request. macOS retains its existing Retina behavior for all modes.
+system stretching. `Stretch` needs a floating window on Windows, or a Wayland
+session with the desktop's XWayland, where the editor opens as an X11 window at
+scale 1 for the compositor to scale; elsewhere it is a request error. `Off` sends
+no plugin scale request. macOS retains its existing Retina behavior for all modes.
 
 VST2 has no standard scale opcode, but plugins advertising
 `supportsViewDpiScaling` accept the de-facto vendor request: opcode 50,
@@ -52,3 +54,12 @@ finite positive result to 0.5–4.0; invalid or missing resources use 1.0.
 Native Wayland keeps its existing integer output-scale convention, except that
 `Off` suppresses content-scale requests. Other compositors and real mixed-DPI
 multi-monitor setups still need native verification.
+
+Windows DPI functions are looked up at run time, so a worker on a Windows
+release without them still starts and opens editors at scale 1.
+
+A private rootful Xwayland per editor is not implemented. Plugins open their
+own X connection from `DISPLAY`, which would have to name the private server
+before the plugin loads, and an X server cannot be stopped under a plugin's
+connection because Xlib's default I/O error handler exits the process. VST 2 and
+X11-only VST 3 editors in a Wayland session use the desktop's XWayland.

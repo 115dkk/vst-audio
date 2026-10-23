@@ -72,13 +72,14 @@ and a caller-rendered parameter UI remain the portable alternatives.
 backend. Other operating systems ignore the Linux choice. Embedded X11 windows
 always use the session `DISPLAY`, regardless of that choice.
 
-The intended three routes are native VST 3 Wayland, the session X display
-(Xorg or desktop XWayland), and a private rootful Xwayland per editor. Native
-Wayland and session X are implemented; **private Xwayland is not implemented in
-this change**. `Auto` currently tries a supporting VST 3 view on Wayland and then
-the session X display. `Wayland` rejects VST 2/unsupported views; `X11` never
-exposes a Wayland host. Private Xwayland is planned, not implemented, and has no
-public selection or wire tag. Both public backend enums are non-exhaustive.
+Two routes are implemented: native VST 3 Wayland and the session X display
+(Xorg or desktop XWayland). `Auto` tries a supporting VST 3 view on Wayland and
+then the session X display. `Wayland` rejects VST 2/unsupported views; `X11` never
+exposes a Wayland host. `EditorScaling::Stretch` skips native Wayland so that the
+compositor scales the desktop XWayland window. A private rootful Xwayland per
+editor was considered and not implemented: plugins connect to `DISPLAY`
+themselves, and an X server cannot be stopped under a plugin's connection
+(`docs/support.md` has the details). Both public backend enums are non-exhaustive.
 `Auto` also retries a fresh view on X11 after Wayland setup or attachment fails;
 explicit `Wayland` never falls back.
 

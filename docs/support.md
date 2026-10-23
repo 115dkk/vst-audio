@@ -19,7 +19,7 @@ from this repository. Required CI executes the implementation on Windows x64, Li
 | Editor negotiation | VST3 constrained resize and optional content-scale interface; VST2 post-open sizing, plugin sizeWindow and optional `supportsViewDpiScaling` vendor scaling. Both formats emit coalesced EditorResized with actual dimensions, floating and embedded. VST2 host-driven resize remains unsupported |
 | GUI consumers | Separate egui and iced example workspace; the same IPC API runs each editor lifecycle on all four native targets |
 | Linux Wayland editor | Native VST 3 floating view, shared host display, xdg-shell, shm background, optional decoration/activation, logical resize and integer output scale. Tested on Weston 13 headless/pixman at scales 1 and 2, with and without default sandbox. Hide tears down the view; Show recreates it. Capture and embedding unsupported; other compositors unverified |
-| Private Xwayland editor | Planned, not implemented; no public selection value. Auto stops after native Wayland/session X |
+| Private Xwayland editor | Not implemented, by decision (see the Linux editor section). VST 2 and X11-only VST 3 editors use the session X display; `Stretch` in a Wayland session uses the desktop's XWayland |
 | Linux event loop | VST3 IRunLoop on host context and editor frame, with timers and file descriptors |
 | Recovery | Saved-state history, bounded manual/automatic restart, generation changes and endpoint handover at audio boundaries; old resources reclaimed off audio |
 | Stress | Variable callbacks and four repeated crashes per format, with 400 numeric healthy-peer callbacks and latest-checkpoint preservation |
@@ -64,11 +64,11 @@ Use `Command::OpenEditorWith { parent, scaling }` or
 `EditorStatus.scaling` reports `Plugin`, `Stretch` or `Off`, not the requested
 `Auto`. `scale` is the factor sent to the plugin, or 1.0 when none was sent.
 
-| Mode | Windows floating | Windows embedded / X11 / native Wayland |
+| Mode | Windows floating | Windows embedded / X11 / Wayland session |
 |---|---|---|
 | `Auto` | Plugin scaling when accepted; otherwise system stretching | Plugin scaling when accepted; otherwise 1:1 |
 | `Plugin` | Plugin scaling when accepted; otherwise 1:1 | Same |
-| `Stretch` | System-stretched 1:1 drawing; may be blurry | Request error: `stretched editors need a Windows floating window` |
+| `Stretch` | System-stretched 1:1 drawing; may be blurry | Wayland session with the desktop's XWayland (`DISPLAY`): a floating X11 window at scale 1, which the compositor scales as its setting for X11 applications decides; embedded, plain X11 or no `DISPLAY`: request error |
 | `Off` | No plugin scale request; 1:1 physical pixels | No plugin scale request |
 
 macOS retains its existing Retina behavior for every mode. Its status is `Off`
@@ -126,12 +126,20 @@ rejection, and EditorClosed plus continued audio after compositor exit. Direct
 host query and createInstance return the same interface. Other compositors,
 keyboard/IME and popup behavior have not been tested.
 
-The planned private-rootful-Xwayland route needs Xwayland 23.1 or later and one
-extra process per editor. Its root confines menus/popups to the editor bounds;
-clipboard integration is unverified. Without `-hidpi`, the compositor scales
-its scale-1 buffer, potentially making it blurry. Process creation must be
-allowed by the sandbox. Process startup, RandR resizing, hide/show, child reaping
-and parent-death cleanup for this route are **not implemented or tested here**.
+A private rootful Xwayland per editor was planned and is not implemented.
+Plugins open their own X connection from `DISPLAY`, so a private server would
+have to be chosen before the plugin loads, or `DISPLAY` changed in a worker whose
+plugin threads may read the environment. The server also cannot be stopped while
+a plugin holds a connection: Xlib's default I/O error handler exits the process.
+Xwayland 23.2 (Ubuntu 24.04) has no `-hidpi`; probes on it confirmed rootful
+startup with `-geometry`, `-displayfd` and `-decorate`, and RandR custom modes.
+VST 2 and X11-only VST 3 editors therefore need the session X display (desktop
+XWayland on GNOME, KDE and most compositors); without one they fail with an
+explicit error. `EditorScaling::Stretch` in a Wayland session opens the editor on
+the desktop's XWayland at scale 1, and the compositor scales it as its setting for
+X11 applications decides (GNOME and KDE can also leave X11 windows unscaled).
+`tools/wayland_tests.py` checks the routing under Weston's XWayland, not the
+compositor's scaling.
 
 ## Sandbox policy and platform exceptions
 

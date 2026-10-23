@@ -406,3 +406,46 @@ fn compositor_disconnect_closes_editor_and_preserves_audio() {
     }
     eprintln!("post-disconnect audio blocks={processed}");
 }
+
+#[test]
+#[ignore = "native fixtures and display required"]
+fn stretch_uses_the_desktop_xwayland() {
+    // A Wayland session with the desktop's XWayland: both sockets are set.
+    assert!(std::env::var_os("WAYLAND_DISPLAY").is_some() && std::env::var_os("DISPLAY").is_some());
+    let stretch = Command::OpenEditorWith {
+        parent: None,
+        scaling: EditorScaling::Stretch,
+    };
+    for format in [PluginFormat::Vst3, PluginFormat::Vst2] {
+        let instance = spawn(format, LinuxEditor::Auto, false);
+        let opened = response(&instance, stretch.clone());
+        assert!(matches!(opened, HostEvent::Completed { .. }), "{opened:?}");
+        let HostEvent::EditorStatus { status, .. } =
+            response(&instance, Command::Editor(A::Inspect))
+        else {
+            panic!("missing status")
+        };
+        assert_eq!(status.platform, EditorPlatform::X11, "{format:?}");
+        assert_eq!(status.scaling, EditorScaling::Stretch, "{format:?}");
+        assert_eq!((status.scale, status.width, status.height), (1.0, 320, 200));
+        let HostEvent::EditorImage { image, .. } = response(&instance, Command::Editor(A::Capture))
+        else {
+            panic!("X11 capture failed")
+        };
+        let count = image
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| p[..3] == [32, 64, 128])
+            .count();
+        eprintln!("stretch {format:?} platform=X11 pixels={count}");
+        assert_eq!(count, 64000);
+    }
+    // The explicit Wayland policy never uses an X server.
+    let instance = spawn(PluginFormat::Vst3, LinuxEditor::Wayland, false);
+    assert!(matches!(
+        response(&instance, stretch),
+        HostEvent::RequestFailed { reason, .. } if reason.starts_with("stretched editors need")
+    ));
+}

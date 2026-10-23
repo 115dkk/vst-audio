@@ -6,23 +6,33 @@ pub(crate) fn validate(
     mode: EditorScaling,
     parent: Option<ParentWindow>,
 ) -> Result<(), PluginError> {
-    if mode == EditorScaling::Stretch
-        && !cfg!(target_os = "macos")
-        && (!cfg!(windows) || parent.is_some())
-    {
-        return Err(PluginError(
-            "stretched editors need a Windows floating window".into(),
-        ));
+    if mode == EditorScaling::Stretch && !cfg!(target_os = "macos") && !stretches(parent) {
+        return Err(PluginError(STRETCH_UNAVAILABLE.into()));
     }
     Ok(())
+}
+pub(crate) const STRETCH_UNAVAILABLE: &str = "stretched editors need a floating window on Windows \
+     or in a Wayland session with the desktop's XWayland";
+/// Whether the system can stretch a floating editor drawn at scale 1: a
+/// GDI-scaled window on Windows, or the desktop's XWayland, which the
+/// compositor scales like any X11 application (as its settings for X11
+/// applications decide). A plain X server stretches nothing.
+fn stretches(parent: Option<ParentWindow>) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        parent.is_none() && crate::linux_editor::desktop_xwayland()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        cfg!(windows) && parent.is_none()
+    }
 }
 pub(crate) fn requests_scale(mode: EditorScaling) -> bool {
     matches!(mode, EditorScaling::Auto | EditorScaling::Plugin)
 }
 pub(crate) fn fallback(mode: EditorScaling, parent: Option<ParentWindow>) -> EditorScaling {
-    if cfg!(windows)
-        && parent.is_none()
-        && matches!(mode, EditorScaling::Auto | EditorScaling::Stretch)
+    if (cfg!(windows) && parent.is_none() && mode == EditorScaling::Auto)
+        || (mode == EditorScaling::Stretch && stretches(parent))
     {
         EditorScaling::Stretch
     } else {

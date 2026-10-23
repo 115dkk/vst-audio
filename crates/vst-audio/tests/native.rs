@@ -221,7 +221,7 @@ macro_rules! format_tests {
                 assert!(matches!(
                     response(&mut started, request),
                     Message::RequestError { text, .. }
-                        if text == "stretched editors need a Windows floating window"
+                        if text.starts_with("stretched editors need a floating window")
                 ));
                 #[cfg(windows)]
                 {
@@ -552,7 +552,7 @@ fn nonscaling_vst2_auto_resolves_off() {
     assert!(matches!(
         wait(&mut started, request),
         Message::RequestError { text, .. }
-            if text == "stretched editors need a Windows floating window"
+            if text.starts_with("stretched editors need a floating window")
     ));
 }
 
