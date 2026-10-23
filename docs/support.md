@@ -262,7 +262,7 @@ logs and JSON reports are suitable CI artifacts.
 
 ## EQ APO XT engine comparison (Windows)
 
-On Windows `tools/third_party.py` also downloads EQ APO XT v2.60.4 (x64-sse2
+On Windows `tools/third_party.py` also downloads EQ APO XT v2.60.6 (x64-sse2
 full package, SHA-256 pinned) and extracts its application folder into the
 external build tree. Nothing is installed: no driver, service or registry
 entry. EQ APO XT is GPL software and serves only as an independent engine
@@ -319,8 +319,13 @@ or of the plugin, recorded by the test, and not vst-audio defects.
 - **Benchmark output parameter changes:** Benchmark.exe passes no output
   parameter change list to VST 3 `process()`; DPF prints an assertion message
   and continues.
-- **Configuration encoding:** `config.txt` must be UTF-8 without a byte order
-  mark. A BOM makes EQ APO XT ignore the first command.
+- **VST 2 values saved before v2.60.5:** the Editor wrote VST 2 parameter
+  values with six significant digits, so a saved value could read back as a
+  different float. EqualizerAPO-XT#439 writes the shortest decimal that reads
+  back as the same float.
+- **Configuration encoding before v2.60.6:** a `config.txt` that starts with a
+  UTF-8 byte order mark lost its first command (EqualizerAPO-XT#440). The test
+  writes UTF-8 without a BOM.
 - **3 Band EQ initial crossover:** the pinned 3 Band EQ reports a 220 Hz low
   crossover but filters at 200 Hz until "Low-Mid Freq" is written. EQ APO XT
   applies every parameter when it loads a line or a chunk, and the reverse
