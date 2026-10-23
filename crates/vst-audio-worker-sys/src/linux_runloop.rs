@@ -80,6 +80,12 @@ impl RunLoop {
             kResultFalse
         }
     }
+    pub fn has_event(&self, fd: i32) -> bool {
+        self.events
+            .borrow()
+            .iter()
+            .any(|(_, registered)| *registered == fd)
+    }
     pub fn poll(&self) {
         // Main-thread work may allocate. Clone retained references and end all
         // RefCell borrows before calling foreign code (callbacks may unregister).

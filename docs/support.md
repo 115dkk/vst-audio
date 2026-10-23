@@ -18,6 +18,8 @@ from this repository. Required CI executes the implementation on Windows x64, Li
 | Editor embedding | Worker-owned child of an application HWND or X11 window; parent destruction closes only the editor. Linux x86_64/X11 VST2/VST3 parent pixels, lifecycle and default sandbox and Windows x64 VST2/VST3 parent pixels and lifecycle are native-tested. Windows refuses a sandboxed (AppContainer) worker's child under the application window: that request fails explicitly, so sandboxed Windows editors float. Mixed DPI is untested. macOS returns explicit unsupported; no floating fallback |
 | Editor negotiation | VST3 constrained resize and optional content-scale interface; VST2 returns explicit unsupported results for host-driven resize/scale |
 | GUI consumers | Separate egui and iced example workspace; the same IPC API runs each editor lifecycle on all four native targets |
+| Linux Wayland editor | Native VST 3 floating view, shared host display, xdg-shell, shm background, optional decoration/activation, logical resize and integer output scale. Tested on Weston 13 headless/pixman at scales 1 and 2, with and without default sandbox. Hide tears down the view; Show recreates it. Capture and embedding unsupported; other compositors unverified |
+| Private Xwayland editor | Planned, not implemented; no public selection value. Auto stops after native Wayland/session X |
 | Linux event loop | VST3 IRunLoop on host context and editor frame, with timers and file descriptors |
 | Recovery | Saved-state history, bounded manual/automatic restart, generation changes and endpoint handover at audio boundaries; old resources reclaimed off audio |
 | Stress | Variable callbacks and four repeated crashes per format, with 400 numeric healthy-peer callbacks and latest-checkpoint preservation |
@@ -42,13 +44,42 @@ unsupported binary headers retain the native-worker fallback. Run
 `xvfb-run -a python3 tools/cross_arch_tests.py i686-unknown-linux-gnu` on Linux;
 on Windows/macOS run the script without Xvfb with the desired Rust target.
 
-Native macOS cross-process editor embedding, native Wayland editor
-hosting, Linux aarch64-to-x86_64 emulation and 32-bit macOS remain outside this
+Native macOS cross-process editor embedding, Wayland cross-process embedding,
+private Xwayland hosting, Linux aarch64-to-x86_64 emulation and 32-bit macOS remain outside this
 0.1.0 scope. The optional sandbox does not bound CPU or memory exhaustion,
 isolate same-session window messages/input, or protect against kernel vulnerabilities. Recovery starts a new instance and
 does not replay old MIDI notes; applications can send current musical state
 after `Recovered`.
 A changed layout requires a newly prepared application audio endpoint.
+
+## Linux editor verification and remaining work
+
+Run `python3 tools/wayland_tests.py`: Weston is required, not silently skipped.
+The native Wayland fixture is tested without `DISPLAY`; scale-2 captures show a
+320×200 logical view as 640×400 physical pixels. Hide removes all fixture-color
+pixels. Hiding a Wayland editor tears down its view; showing it creates a new
+view. Parameters and state remain in the controller. The display connection stays
+open, and the last size and scale are retained; a resize while hidden is applied
+on Show. Native tests check two hide/show cycles, view creation/attachment/removal
+and destruction counts, hidden resize, and continued audio. Growing a window can
+clip against the compositor output because placement belongs to the compositor. The same script starts
+Weston's desktop XWayland and runs existing VST2/VST3 floating, capture and
+embedded-editor tests, including default-sandbox embedding.
+
+Native Wayland has no capture API and no application-window embedding. On
+compositors without server-side decoration (including GNOME), no title bar is
+drawn by this host. Native tests cover initial configure, pre-attachment scale 2,
+scale rejection retaining scale 1, Auto fallback to X11 after Wayland attachment
+rejection, and EditorClosed plus continued audio after compositor exit. Direct
+host query and createInstance return the same interface. Other compositors,
+keyboard/IME and popup behavior have not been tested.
+
+The planned private-rootful-Xwayland route needs Xwayland 23.1 or later and one
+extra process per editor. Its root confines menus/popups to the editor bounds;
+clipboard integration is unverified. Without `-hidpi`, the compositor scales
+its scale-1 buffer, potentially making it blurry. Process creation must be
+allowed by the sandbox. Process startup, RandR resizing, hide/show, child reaping
+and parent-death cleanup for this route are **not implemented or tested here**.
 
 ## Sandbox policy and platform exceptions
 

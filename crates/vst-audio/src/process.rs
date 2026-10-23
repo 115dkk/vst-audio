@@ -191,6 +191,7 @@ pub struct ProcessingOptions {
     pub sample_format: SampleFormat,
     pub offline: bool,
     pub sandbox: Option<crate::SandboxPolicy>,
+    pub linux_editor: crate::LinuxEditor,
     pub buses: Option<BusSelector>,
     pub inputs: Option<Vec<BusConfiguration>>,
     pub outputs: Option<Vec<BusConfiguration>>,
@@ -204,6 +205,7 @@ impl Default for ProcessingOptions {
             sample_format: SampleFormat::F32,
             offline: false,
             sandbox: None,
+            linux_editor: crate::LinuxEditor::Auto,
             buses: None,
             inputs: None,
             outputs: None,
@@ -558,6 +560,7 @@ impl PluginProcess {
             maximum,
             options.cancel.clone(),
             options.sandbox.as_ref(),
+            options.linux_editor,
         )?;
         let sandbox = sandbox_report(&transport, options.sandbox.as_ref())?;
         let mut watch = ControlWatch::new(0);
@@ -723,7 +726,8 @@ impl PluginProcess {
             sample_rate: 48000,
             latency_bound_frames: 96000,
         };
-        let (process, transport, ..) = spawn(exe, path, geometry, None, policy)?;
+        let (process, transport, ..) =
+            spawn(exe, path, geometry, None, policy, crate::LinuxEditor::Auto)?;
         sandbox_report(&transport, policy)?;
         if transport.response(0, Duration::from_secs(5))?.message != Message::hello() {
             return Err(StartError("expected Hello".into()));
@@ -784,6 +788,7 @@ fn spawn(
     geometry: Geometry,
     cancel: Option<Arc<AtomicBool>>,
     policy: Option<&crate::SandboxPolicy>,
+    linux_editor: crate::LinuxEditor,
 ) -> Result<Spawned, StartError> {
     let sandbox =
         vst_audio_transport_sys::sandbox::SandboxLaunch::new(policy, plugin).map_err(error)?;
@@ -826,6 +831,8 @@ fn spawn(
     }
     args.push("--region-bytes".into());
     args.push(region.bytes().to_string().into());
+    args.push("--linux-editor".into());
+    args.push(linux_editor.argument().into());
     sandbox.arguments(&mut args);
     let process =
         Arc::new(runtime::spawn_handles(exe, &args, &values, parent, sandbox).map_err(error)?);

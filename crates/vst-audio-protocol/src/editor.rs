@@ -19,8 +19,19 @@ pub enum EditorAction {
     Inspect,
     Capture,
 }
+/// The backend actually hosting the editor, independent of the requested policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+#[non_exhaustive]
+pub enum EditorPlatform {
+    Win32 = 0,
+    Cocoa = 1,
+    X11 = 2,
+    Wayland = 3,
+}
 #[derive(Clone, Debug, PartialEq)]
 pub struct EditorStatus {
+    pub platform: EditorPlatform,
     pub visible: bool,
     pub embedded: bool,
     pub width: u32,

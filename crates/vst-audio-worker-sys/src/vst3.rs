@@ -85,6 +85,8 @@ pub struct Vst3Module {
     host: ComPtr<FUnknown>,
     #[cfg(target_os = "linux")]
     run_loop: Rc<crate::linux_runloop::RunLoop>,
+    #[cfg(target_os = "linux")]
+    wayland: Rc<crate::wayland_editor::WaylandHost>,
     library: Arc<ModuleLibrary>,
 }
 impl std::fmt::Debug for Vst3Module {
@@ -187,9 +189,9 @@ impl Vst3Module {
         let host_object = Host::new();
         #[cfg(target_os = "linux")]
         let run_loop = host_object.run_loop.clone();
-        let host = ComWrapper::new(host_object)
-            .to_com_ptr::<FUnknown>()
-            .expect("host interface");
+        #[cfg(target_os = "linux")]
+        let wayland = host_object.wayland.clone();
+        let host = host_object.wrap();
         if let Some(factory3) = factory.cast::<IPluginFactory3>() {
             // SAFETY: main thread, live factory and retained host context.
             let _ = unsafe { factory3.setHostContext(host.as_ptr()) };
@@ -199,6 +201,8 @@ impl Vst3Module {
             host,
             #[cfg(target_os = "linux")]
             run_loop,
+            #[cfg(target_os = "linux")]
+            wayland,
             library,
         })
     }
@@ -291,6 +295,8 @@ impl Shared {
 }
 struct Editor {
     scale: f32,
+    #[cfg(target_os = "linux")]
+    output_scale: f32,
     view: ComPtr<IPlugView>,
     _frame: ComPtr<IPlugFrame>,
     window: Rc<EditorWindow>,
@@ -303,6 +309,11 @@ impl Drop for Editor {
         let _ = unsafe { self.view.setFrame(std::ptr::null_mut()) };
     }
 }
+#[cfg(target_os = "linux")]
+struct HiddenWaylandEditor {
+    status: vst_audio_protocol::EditorStatus,
+    closed: std::cell::Cell<bool>,
+}
 pub struct Vst3Plugin {
     controller: Option<ComPtr<IEditController>>,
     separate: bool,
@@ -310,6 +321,8 @@ pub struct Vst3Plugin {
     controller_initialized: bool,
     connection: Option<(ComPtr<IConnectionPoint>, ComPtr<IConnectionPoint>)>,
     editor: Option<Editor>,
+    #[cfg(target_os = "linux")]
+    hidden_wayland: Option<HiddenWaylandEditor>,
     handler: ComPtr<IComponentHandler>,
     shared: Arc<Shared>,
     // Child interfaces must be released before the component (DPF enforces this).
@@ -363,6 +376,8 @@ impl Vst3Plugin {
             controller_initialized: false,
             connection: None,
             editor: None,
+            #[cfg(target_os = "linux")]
+            hidden_wayland: None,
             handler,
             shared,
             info: Info {
@@ -984,6 +999,13 @@ impl Vst3Plugin {
         &mut self,
         parent: Option<vst_audio_protocol::ParentWindow>,
     ) -> Result<(), PluginError> {
+        #[cfg(target_os = "linux")]
+        if self.hidden_wayland.is_some() {
+            if parent.is_none() {
+                return Ok(());
+            }
+            self.hidden_wayland = None;
+        }
         if self
             .editor
             .as_ref()
@@ -992,6 +1014,26 @@ impl Vst3Plugin {
             return Ok(());
         }
         self.editor = None;
+        let mut attempted_wayland = false;
+        let result = self.attach_editor(parent, false, &mut attempted_wayland, None);
+        #[cfg(target_os = "linux")]
+        if result.is_err() && attempted_wayland {
+            self.module.wayland.reset();
+            if crate::linux_editor::policy() == crate::linux_editor::Policy::Auto
+                && crate::linux_editor::x11_available()
+            {
+                return self.attach_editor(parent, true, &mut attempted_wayland, None);
+            }
+        }
+        result
+    }
+    fn attach_editor(
+        &mut self,
+        parent: Option<vst_audio_protocol::ParentWindow>,
+        _force_x11: bool,
+        _attempted_wayland: &mut bool,
+        _restore: Option<&vst_audio_protocol::EditorStatus>,
+    ) -> Result<(), PluginError> {
         let controller = self
             .controller
             .as_ref()
@@ -1001,9 +1043,37 @@ impl Vst3Plugin {
         // SAFETY: createView transfers an owned interface reference, nullable for no editor.
         let view = unsafe { ComPtr::from_raw(pointer) }
             .ok_or_else(|| PluginError("no VST 3 editor".into()))?;
+        let platform = crate::editor_platform();
+        #[cfg(target_os = "linux")]
+        let platform = {
+            use crate::linux_editor::{Policy, policy, wayland_allowed};
+            let native = !_force_x11 && parent.is_none() && wayland_allowed();
+            // SAFETY: retained main-thread view, static SDK platform identifier.
+            let supported = native
+                && unsafe { view.isPlatformTypeSupported(kPlatformTypeWaylandSurfaceID) }
+                    == kResultTrue;
+            if native && policy() == Policy::Wayland && !supported {
+                return Err(PluginError(
+                    "the plugin does not support Wayland editors".into(),
+                ));
+            }
+            let connected = supported && self.module.wayland.connection().is_ok();
+            if native && policy() == Policy::Wayland && !connected {
+                return Err(PluginError("no Wayland session is available".into()));
+            }
+            if _restore.is_some() && !connected {
+                return Err(PluginError("cannot recreate Wayland editor".into()));
+            }
+            if connected {
+                *_attempted_wayland = true;
+                c"WaylandSurfaceID"
+            } else {
+                platform
+            }
+        };
         check(
-            // SAFETY: live view, SDK Windows platform string, on main thread.
-            unsafe { view.isPlatformTypeSupported(crate::editor_platform().as_ptr()) },
+            // SAFETY: live view and static platform string, queried on main thread.
+            unsafe { view.isPlatformTypeSupported(platform.as_ptr()) },
             "native editor support",
         )?;
         let mut size = ViewRect {
@@ -1014,6 +1084,21 @@ impl Vst3Plugin {
         };
         // SAFETY: writable view rectangle, queried before attachment.
         check(unsafe { view.getSize(&mut size) }, "getSize")?;
+        if let Some(status) = _restore {
+            size = ViewRect {
+                left: 0,
+                top: 0,
+                right: status.width as i32,
+                bottom: status.height as i32,
+            };
+            if status.resize_supported {
+                check(
+                    // SAFETY: fresh main-thread view and writable saved-size rectangle.
+                    unsafe { view.checkSizeConstraint(&mut size) },
+                    "checkSizeConstraint",
+                )?;
+            }
+        }
         let width = size
             .right
             .checked_sub(size.left)
@@ -1027,8 +1112,25 @@ impl Vst3Plugin {
         let window = Rc::new(match parent {
             Some(parent) => EditorWindow::open_embedded(parent, width, height)
                 .map_err(|e| PluginError(e.to_string()))?,
-            None => EditorWindow::open(&self.info.class.name, width, height)
-                .map_err(|e| PluginError(e.to_string()))?,
+            None => {
+                #[cfg(target_os = "linux")]
+                if platform == c"WaylandSurfaceID" {
+                    // SAFETY: retained UI-thread view, queried before attachment.
+                    let resizable = unsafe { view.canResize() } == kResultTrue;
+                    EditorWindow::open_wayland(
+                        self.module.wayland.clone(),
+                        &self.info.class.name,
+                        width,
+                        height,
+                        resizable,
+                    )
+                } else {
+                    EditorWindow::open(&self.info.class.name, width, height)
+                }
+                #[cfg(not(target_os = "linux"))]
+                EditorWindow::open(&self.info.class.name, width, height)
+            }
+            .map_err(|e| PluginError(e.to_string()))?,
         });
         let frame = ComWrapper::new(Frame {
             window: window.clone(),
@@ -1038,25 +1140,52 @@ impl Vst3Plugin {
         .to_com_ptr::<IPlugFrame>()
         .expect("frame interface");
         // SAFETY: retained frame and main-thread view; frame owns the window lifetime.
-        check(unsafe { view.setFrame(frame.as_ptr()) }, "setFrame")?;
-        // SAFETY: live host-owned HWND, platform type matches support query.
-        let result = unsafe {
-            view.attached(
-                window.handle_value() as *mut c_void,
-                crate::editor_platform().as_ptr(),
-            )
-        };
+        let result = unsafe { view.setFrame(frame.as_ptr()) };
         if result != kResultOk {
+            // SAFETY: undo any partial frame retention before dropping the failed view.
+            let _ = unsafe { view.setFrame(std::ptr::null_mut()) };
+            check(result, "setFrame")?;
+        }
+        #[allow(unused_mut)]
+        let mut applied_scale = 1.0;
+        #[cfg(target_os = "linux")]
+        if let (Some(window), Some(scale)) = (
+            window.wayland(),
+            view.cast::<IPlugViewContentScaleSupport>(),
+        ) {
+            let requested = _restore.map_or(window.scale(), |status| status.scale);
+            // SAFETY: live UI-thread interface, bounded compositor or previously accepted scale.
+            if unsafe { scale.setContentScaleFactor(requested) } == kResultOk {
+                applied_scale = requested;
+            }
+        }
+        // SAFETY: live host-owned native parent, platform type matches support query.
+        let result =
+            unsafe { view.attached(window.handle_value() as *mut c_void, platform.as_ptr()) };
+        if result != kResultOk {
+            // SAFETY: clean up even a partially attached view before releasing the parent.
+            let _ = unsafe { view.removed() };
             // SAFETY: release installed frame before returning attachment error.
             let _ = unsafe { view.setFrame(std::ptr::null_mut()) };
             check(result, "attached")?;
         }
-        self.editor = Some(Editor {
-            scale: 1.0,
+        let editor = Editor {
+            scale: applied_scale,
+            #[cfg(target_os = "linux")]
+            output_scale: window.wayland().map_or(1.0, |w| w.scale()),
             view,
             _frame: frame,
             window,
-        });
+        };
+        if _restore.is_some() {
+            // SAFETY: attached fresh view, validated saved-size rectangle on the UI thread.
+            check(unsafe { editor.view.onSize(&mut size) }, "onSize")?;
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(wayland) = editor.window.wayland() {
+            wayland.commit().map_err(|e| PluginError(e.to_string()))?;
+        }
+        self.editor = Some(editor);
         Ok(())
     }
     pub fn editor_action(
@@ -1064,6 +1193,63 @@ impl Vst3Plugin {
         action: vst_audio_protocol::EditorAction,
     ) -> Result<vst_audio_protocol::EditorReply, PluginError> {
         use vst_audio_protocol::{EditorAction as A, EditorReply, EditorStatus};
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(hidden) = self.hidden_wayland.as_mut() {
+                match action {
+                    A::Show => {
+                        let saved = self.hidden_wayland.take().expect("hidden editor").status;
+                        if let Err(error) =
+                            self.attach_editor(None, false, &mut false, Some(&saved))
+                        {
+                            self.closed_editor = true;
+                            return Err(error);
+                        }
+                        return self.editor_action(A::Inspect);
+                    }
+                    A::Resize { width, height } => {
+                        if !hidden.status.resize_supported
+                            || !(1..=8192).contains(&width)
+                            || !(1..=8192).contains(&height)
+                        {
+                            return Err(PluginError("editor resize unsupported or invalid".into()));
+                        }
+                        hidden.status.width = width;
+                        hidden.status.height = height;
+                    }
+                    A::Capture => {
+                        return Err(PluginError(
+                            "editor capture is not available for Wayland editors".into(),
+                        ));
+                    }
+                    A::Scale(_) => {
+                        return Err(PluginError(
+                            "editor scaling unavailable while hidden".into(),
+                        ));
+                    }
+                    A::Hide | A::Focus | A::Inspect => {}
+                }
+                return Ok(EditorReply::Status(hidden.status.clone()));
+            }
+            if matches!(action, A::Hide)
+                && self
+                    .editor
+                    .as_ref()
+                    .is_some_and(|e| e.window.wayland().is_some())
+            {
+                let EditorReply::Status(mut status) = self.editor_action(A::Inspect)? else {
+                    unreachable!("Inspect returns status")
+                };
+                status.visible = false;
+                // Drop calls removed and releases the view/frame before the parent objects.
+                self.editor = None;
+                self.hidden_wayland = Some(HiddenWaylandEditor {
+                    status: status.clone(),
+                    closed: std::cell::Cell::new(false),
+                });
+                return Ok(EditorReply::Status(status));
+            }
+        }
         let editor = self
             .editor
             .as_mut()
@@ -1146,6 +1332,10 @@ impl Vst3Plugin {
             .status()
             .map_err(|e| PluginError(e.to_string()))?;
         Ok(EditorReply::Status(EditorStatus {
+            #[cfg(target_os = "linux")]
+            platform: editor.window.platform(),
+            #[cfg(not(target_os = "linux"))]
+            platform: crate::native_editor_platform(),
             visible,
             embedded: editor.window.parent().is_some(),
             width,
@@ -1156,6 +1346,10 @@ impl Vst3Plugin {
         }))
     }
     pub fn request_editor_close(&self) -> Result<(), PluginError> {
+        #[cfg(target_os = "linux")]
+        if let Some(hidden) = &self.hidden_wayland {
+            hidden.closed.set(true);
+        }
         if let Some(editor) = &self.editor {
             editor
                 .window
@@ -1166,7 +1360,26 @@ impl Vst3Plugin {
     }
     pub fn idle(&mut self) {
         #[cfg(target_os = "linux")]
-        self.module.run_loop.poll();
+        {
+            if self.hidden_wayland.as_ref().is_some_and(|e| e.closed.get()) {
+                self.hidden_wayland = None;
+                self.closed_editor = true;
+            }
+            self.module.run_loop.poll();
+            if self.module.wayland.pump(&self.module.run_loop).is_err() {
+                if self
+                    .editor
+                    .as_ref()
+                    .is_some_and(|e| e.window.wayland().is_some())
+                    || self.hidden_wayland.is_some()
+                {
+                    self.editor = None;
+                    self.hidden_wayland = None;
+                    self.closed_editor = true;
+                }
+                self.module.wayland.reset();
+            }
+        }
         if self
             .editor
             .as_ref()
@@ -1174,6 +1387,47 @@ impl Vst3Plugin {
         {
             self.editor = None;
             self.closed_editor = true;
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(editor) = self.editor.as_mut()
+            && let Some(window) = editor.window.wayland()
+        {
+            if let Some((width, height)) = window.take_size() {
+                // SAFETY: retained main-thread view; compositor dimensions are negotiated before use.
+                if unsafe { editor.view.canResize() } == kResultTrue {
+                    let mut rect = ViewRect {
+                        left: 0,
+                        top: 0,
+                        right: width,
+                        bottom: height,
+                    };
+                    // SAFETY: live view and writable stack rectangle.
+                    let constrained = unsafe { editor.view.checkSizeConstraint(&mut rect) };
+                    if constrained == kResultOk
+                        && let Some(width) = rect
+                            .right
+                            .checked_sub(rect.left)
+                            .filter(|v| (1..=8192).contains(v))
+                        && let Some(height) = rect
+                            .bottom
+                            .checked_sub(rect.top)
+                            .filter(|v| (1..=8192).contains(v))
+                    {
+                        let _ = window.resize(width, height);
+                        // SAFETY: constrained rectangle remains live during the UI callback.
+                        let _ = unsafe { editor.view.onSize(&mut rect) };
+                    }
+                }
+            }
+            if editor.output_scale != window.scale()
+                && let Some(scale) = editor.view.cast::<IPlugViewContentScaleSupport>()
+            {
+                // SAFETY: retained main-thread scale interface and bounded compositor scale.
+                if unsafe { scale.setContentScaleFactor(window.scale()) } == kResultOk {
+                    editor.scale = window.scale();
+                    editor.output_scale = window.scale();
+                }
+            }
         }
     }
     pub fn take_events(&mut self) -> Events {

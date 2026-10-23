@@ -34,6 +34,10 @@ struct Matrix {
     active: AtomicBool,
     delay: UnsafeCell<Delay>,
     handler: RefCell<Option<ComPtr<IComponentHandler>>>,
+    #[cfg(target_os = "linux")]
+    context: RefCell<Option<ComPtr<IHostApplication>>>,
+    #[cfg(target_os = "linux")]
+    lifecycle: std::rc::Rc<std::cell::Cell<[u32; 4]>>,
 }
 impl Matrix {
     fn new() -> Self {
@@ -47,6 +51,10 @@ impl Matrix {
                 cursor: 0,
             }),
             handler: RefCell::new(None),
+            #[cfg(target_os = "linux")]
+            context: RefCell::new(None),
+            #[cfg(target_os = "linux")]
+            lifecycle: Default::default(),
         }
     }
     unsafe fn restore(&self, state: *mut IBStream) -> tresult {
@@ -83,6 +91,7 @@ impl Matrix {
             return kInvalidArgument;
         };
         let mode = self.mode.load(Ordering::Relaxed);
+        #[allow(unused_mut)]
         let mut bytes = [
             1,
             mode,
@@ -91,6 +100,18 @@ impl Matrix {
             self.probe[2].load(Ordering::Relaxed),
         ];
         let length = if mode == 6 { 5 } else { 2 };
+        #[cfg(target_os = "linux")]
+        let mut bytes = if std::env::var_os("VST_AUDIO_VIEW_LIFECYCLE").is_some() {
+            bytes[..length as usize]
+                .iter()
+                .copied()
+                .chain(self.lifecycle.get().into_iter().flat_map(u32::to_le_bytes))
+                .collect::<Vec<_>>()
+        } else {
+            bytes[..length as usize].to_vec()
+        };
+        #[cfg(target_os = "linux")]
+        let length = bytes.len() as i32;
         let mut written = 0;
         // SAFETY: stream reads length initialized stack bytes synchronously; count output is writable.
         let result = unsafe { stream.write(bytes.as_mut_ptr().cast(), length, &mut written) };
@@ -112,6 +133,7 @@ impl IPluginBaseTrait for Matrix {
             let Some(context) = (unsafe { ComRef::from_raw(_context) }) else {
                 return kInvalidArgument;
             };
+            *self.context.borrow_mut() = context.cast::<IHostApplication>();
             if context.cast::<Linux::IRunLoop>().is_none() {
                 return kNoInterface;
             }
@@ -442,11 +464,23 @@ impl IEditControllerTrait for Matrix {
         if unsafe { CStr::from_ptr(name) } != c"editor" {
             return std::ptr::null_mut();
         }
+        #[cfg(target_os = "linux")]
+        {
+            let mut counts = self.lifecycle.get();
+            counts[0] += 1;
+            self.lifecycle.set(counts);
+        }
         ComWrapper::new(View {
+            #[cfg(target_os = "linux")]
+            lifecycle: self.lifecycle.clone(),
             canvas: std::cell::RefCell::new(None),
             size: std::cell::Cell::new((320, 200)),
             scale: std::cell::Cell::new(1.0),
             handler: self.handler.borrow().clone(),
+            #[cfg(target_os = "linux")]
+            context: self.context.borrow().clone(),
+            #[cfg(target_os = "linux")]
+            wayland: RefCell::new(None),
         })
         .to_com_ptr::<IPlugView>()
         .expect("view interface")
@@ -454,10 +488,24 @@ impl IEditControllerTrait for Matrix {
     }
 }
 struct View {
+    #[cfg(target_os = "linux")]
+    lifecycle: std::rc::Rc<std::cell::Cell<[u32; 4]>>,
     canvas: std::cell::RefCell<Option<crate::visual::Canvas>>,
     size: std::cell::Cell<(i32, i32)>,
     scale: std::cell::Cell<f32>,
     handler: Option<ComPtr<IComponentHandler>>,
+    #[cfg(target_os = "linux")]
+    context: Option<ComPtr<IHostApplication>>,
+    #[cfg(target_os = "linux")]
+    wayland: RefCell<Option<crate::wayland::Canvas>>,
+}
+#[cfg(target_os = "linux")]
+impl Drop for View {
+    fn drop(&mut self) {
+        let mut counts = self.lifecycle.get();
+        counts[3] += 1;
+        self.lifecycle.set(counts);
+    }
 }
 impl Class for View {
     type Interfaces = (IPlugView, IPlugViewContentScaleSupport);
@@ -466,6 +514,11 @@ impl IPlugViewTrait for View {
     unsafe fn isPlatformTypeSupported(&self, platform: FIDString) -> tresult {
         if platform.is_null() {
             return kInvalidArgument;
+        }
+        #[cfg(target_os = "linux")]
+        // SAFETY: SDK platform identifier is a terminated string.
+        if unsafe { CStr::from_ptr(platform) } == c"WaylandSurfaceID" {
+            return kResultTrue;
         }
         // SAFETY: SDK platform string is null-terminated.
         if unsafe { CStr::from_ptr(platform) } == vst_audio_worker_sys::editor_platform() {
@@ -481,6 +534,37 @@ impl IPlugViewTrait for View {
         // SAFETY: forwards identical SDK platform string contract.
         if unsafe { self.isPlatformTypeSupported(platform) } != kResultTrue {
             return kResultFalse;
+        }
+        #[cfg(target_os = "linux")]
+        // SAFETY: validated SDK platform string is terminated.
+        if unsafe { CStr::from_ptr(platform) } == c"WaylandSurfaceID" {
+            if std::env::var_os("VST_AUDIO_REJECT_WAYLAND").is_some()
+                || (std::env::var_os("VST_AUDIO_REJECT_RECREATED_VIEW").is_some()
+                    && self.lifecycle.get()[1] > 0)
+            {
+                return kResultFalse;
+            }
+            if let Ok(expected) = std::env::var("VST_AUDIO_EXPECT_ATTACH_SCALE") {
+                let expected: f32 = expected.parse().expect("fixture scale");
+                eprintln!("fixture pre-attach scale={}", self.scale.get());
+                if self.scale.get() != expected {
+                    return kResultFalse;
+                }
+            }
+            let Some(context) = &self.context else {
+                return kNoInterface;
+            };
+            // SAFETY: attached supplies a live parent surface from this host's connection on the UI thread.
+            return match unsafe { crate::wayland::Canvas::attach(context, parent) } {
+                Ok(canvas) => {
+                    *self.wayland.borrow_mut() = Some(canvas);
+                    let mut counts = self.lifecycle.get();
+                    counts[1] += 1;
+                    self.lifecycle.set(counts);
+                    kResultOk
+                }
+                Err(_) => kResultFalse,
+            };
         }
         // SAFETY: attached supplies a live platform parent on the UI thread.
         *self.canvas.borrow_mut() = unsafe { crate::visual::Canvas::attach(parent) };
@@ -500,6 +584,12 @@ impl IPlugViewTrait for View {
     }
     unsafe fn removed(&self) -> tresult {
         self.canvas.borrow_mut().take();
+        #[cfg(target_os = "linux")]
+        if self.wayland.borrow_mut().take().is_some() {
+            let mut counts = self.lifecycle.get();
+            counts[2] += 1;
+            self.lifecycle.set(counts);
+        }
         kResultOk
     }
     unsafe fn onWheel(&self, _: f32) -> tresult {
@@ -518,10 +608,10 @@ impl IPlugViewTrait for View {
         // SAFETY: writable SDK rectangle output for this fixed-size editor.
         unsafe {
             *rect = ViewRect {
-                left: 0,
-                top: 0,
-                right: self.size.get().0,
-                bottom: self.size.get().1,
+                left: 17,
+                top: 23,
+                right: 17 + self.size.get().0,
+                bottom: 23 + self.size.get().1,
             }
         };
         kResultOk
@@ -534,6 +624,12 @@ impl IPlugViewTrait for View {
         let rect = unsafe { *rect };
         self.size
             .set((rect.right - rect.left, rect.bottom - rect.top));
+        #[cfg(target_os = "linux")]
+        if let Some(canvas) = self.wayland.borrow().as_ref()
+            && canvas.resize(self.size.get().0, self.size.get().1).is_err()
+        {
+            return kResultFalse;
+        }
         kResultOk
     }
     unsafe fn onFocus(&self, _: TBool) -> tresult {
@@ -561,6 +657,11 @@ impl IPlugViewTrait for View {
         let rect = unsafe { &mut *rect };
         rect.right = rect.right.max(rect.left + 320);
         rect.bottom = rect.bottom.max(rect.top + 200);
+        let (width, height) = (rect.right - rect.left, rect.bottom - rect.top);
+        rect.left = 17;
+        rect.top = 23;
+        rect.right = 17 + width;
+        rect.bottom = 23 + height;
         kResultOk
     }
 }
@@ -568,6 +669,9 @@ impl IPlugViewContentScaleSupportTrait for View {
     unsafe fn setContentScaleFactor(&self, scale: f32) -> tresult {
         if !scale.is_finite() || scale <= 0.0 {
             return kInvalidArgument;
+        }
+        if std::env::var_os("VST_AUDIO_REJECT_SCALE").is_some() {
+            return kResultFalse;
         }
         self.scale.set(scale);
         kResultOk

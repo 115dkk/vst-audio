@@ -3,7 +3,9 @@
 pub mod watch;
 pub use layout::wave_bits;
 pub use vst_audio_protocol::{Bus, BusInfo, BusKind, ClassInfo, PluginFormat, layout, state};
+mod linux_editor;
 mod process;
+pub use linux_editor::LinuxEditor;
 pub use process::{
     BusChoice, BusSelector, ControlEvent, PluginControl, PluginProcess, ProcessingOptions,
     StartError, Started,
@@ -32,4 +34,6 @@ pub use audio::{AudioEndpoint, AudioStatus, ProcessReport};
 
 mod supervision;
 
-pub use vst_audio_protocol::{EditorAction, EditorImage, EditorStatus, ParentWindow};
+pub use vst_audio_protocol::{
+    EditorAction, EditorImage, EditorPlatform, EditorStatus, ParentWindow,
+};

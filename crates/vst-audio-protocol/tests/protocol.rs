@@ -8,6 +8,41 @@ use vst_audio_protocol::{
     StateHistory, WatchState, decode_frame, encode_frame, read_frame,
 };
 
+#[test]
+fn editor_platforms_round_trip_and_reject_unknown_tags() {
+    use vst_audio_protocol::{EditorPlatform, EditorStatus};
+    for platform in [
+        EditorPlatform::Win32,
+        EditorPlatform::Cocoa,
+        EditorPlatform::X11,
+        EditorPlatform::Wayland,
+    ] {
+        let message = Message::EditorStatus(EditorStatus {
+            platform,
+            visible: true,
+            embedded: false,
+            width: 320,
+            height: 200,
+            scale: 1.0,
+            resize_supported: true,
+            scale_supported: false,
+        });
+        round_trip(message.clone());
+        let mut bytes = encode_frame(&Frame {
+            flags: 0,
+            request: 1,
+            message,
+        })
+        .unwrap();
+        let offset = bytes.len() - 17;
+        bytes[offset] = 4;
+        assert!(matches!(
+            decode_frame(&bytes),
+            Err(CodecError::InvalidValue)
+        ));
+    }
+}
+
 fn round_trip(message: Message) {
     let frame = Frame {
         flags: 7,
@@ -68,6 +103,7 @@ fn codec_round_trips_every_message() {
             parent: vst_audio_protocol::ParentWindow::X11 { window: 0x12345678 },
         },
         Message::EditorStatus(vst_audio_protocol::EditorStatus {
+            platform: vst_audio_protocol::EditorPlatform::Wayland,
             visible: true,
             embedded: true,
             width: 640,

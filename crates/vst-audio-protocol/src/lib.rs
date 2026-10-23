@@ -10,7 +10,9 @@ use std::time::Duration;
 pub mod editor;
 pub mod layout;
 pub mod processing;
-pub use editor::{EditorAction, EditorImage, EditorReply, EditorStatus, ParentWindow};
+pub use editor::{
+    EditorAction, EditorImage, EditorPlatform, EditorReply, EditorStatus, ParentWindow,
+};
 pub use processing::{BusConfiguration, Capabilities, ProcessingSetup, SampleFormat};
 pub mod state;
 #[derive(Clone, Debug, thiserror::Error)]
@@ -480,6 +482,7 @@ fn encode_message(message: &Message, out: &mut Vec<u8>) -> Result<(), CodecError
             put_u64(out, *handle);
         }
         Message::EditorStatus(status) => {
+            out.push(status.platform as u8);
             out.push(u8::from(status.visible));
             out.push(u8::from(status.embedded));
             put_u32(out, status.width);
@@ -687,6 +690,13 @@ fn decode_message(kind: u16, body: &[u8]) -> Result<Option<Message>, CodecError>
             },
         },
         27 => Message::EditorStatus(EditorStatus {
+            platform: match cursor.u8()? {
+                0 => EditorPlatform::Win32,
+                1 => EditorPlatform::Cocoa,
+                2 => EditorPlatform::X11,
+                3 => EditorPlatform::Wayland,
+                _ => return Err(CodecError::InvalidValue),
+            },
             visible: cursor.boolean()?,
             embedded: cursor.boolean()?,
             width: cursor.u32()?,

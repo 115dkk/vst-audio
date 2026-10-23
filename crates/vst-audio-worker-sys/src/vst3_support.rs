@@ -12,6 +12,9 @@ use std::{
 };
 use vst3::{Class, ComRef, ComWrapper, Steinberg::Vst::*, Steinberg::*};
 
+#[cfg(target_os = "linux")]
+use vst3::{wl_display, wl_surface, xdg_surface, xdg_toplevel};
+
 pub(crate) const CAPACITY: usize = 256;
 pub(crate) struct Edits {
     slots: [(AtomicU32, AtomicU64); CAPACITY],
@@ -53,27 +56,41 @@ impl Edits {
         Some(edit)
     }
 }
-pub(crate) struct Host {
+pub(crate) struct Host<const WAYLAND: bool = false> {
     #[cfg(target_os = "linux")]
     pub run_loop: Rc<crate::linux_runloop::RunLoop>,
+    #[cfg(target_os = "linux")]
+    pub wayland: Rc<crate::wayland_editor::WaylandHost>,
+    #[cfg(target_os = "linux")]
+    wayland_interface: std::cell::Cell<*mut IWaylandHost>,
 }
-impl Host {
+impl<const WAYLAND: bool> Host<WAYLAND> {
     pub fn new() -> Self {
         Self {
             #[cfg(target_os = "linux")]
             run_loop: Rc::new(crate::linux_runloop::RunLoop::default()),
+            #[cfg(target_os = "linux")]
+            wayland: Rc::new(crate::wayland_editor::WaylandHost::default()),
+            #[cfg(target_os = "linux")]
+            wayland_interface: std::cell::Cell::new(std::ptr::null_mut()),
         }
     }
 }
 #[cfg(target_os = "linux")]
-crate::linux_runloop::implement!(Host, run_loop);
+crate::linux_runloop::implement!(Host<false>, run_loop);
+#[cfg(target_os = "linux")]
+crate::linux_runloop::implement!(Host<true>, run_loop);
 impl Class for Host {
     #[cfg(not(target_os = "linux"))]
     type Interfaces = (IHostApplication,);
     #[cfg(target_os = "linux")]
     type Interfaces = (IHostApplication, Linux::IRunLoop);
 }
-impl IHostApplicationTrait for Host {
+#[cfg(target_os = "linux")]
+impl Class for Host<true> {
+    type Interfaces = (IHostApplication, Linux::IRunLoop, IWaylandHost);
+}
+impl<const WAYLAND: bool> IHostApplicationTrait for Host<WAYLAND> {
     unsafe fn getName(&self, name: *mut String128) -> tresult {
         if name.is_null() {
             return kInvalidArgument;
@@ -88,15 +105,60 @@ impl IHostApplicationTrait for Host {
     }
     unsafe fn createInstance(
         &self,
-        _: *mut TUID,
-        _: *mut TUID,
+        _cid: *mut TUID,
+        _iid: *mut TUID,
         object: *mut *mut c_void,
     ) -> tresult {
         if !object.is_null() {
             // SAFETY: optional SDK output pointer; no object is created.
             unsafe { *object = std::ptr::null_mut() };
         }
+        #[cfg(target_os = "linux")]
+        if !object.is_null() && !_iid.is_null() && WAYLAND {
+            // SAFETY: createInstance supplies a readable SDK interface identifier.
+            if unsafe { *_iid } == IWaylandHost_iid {
+                // SAFETY: wrap() installs this non-owning self pointer before publishing
+                // the COM object. This synchronous call retains the object itself.
+                let host = unsafe { ComRef::from_raw(self.wayland_interface.get()) }
+                    .expect("Wayland interface")
+                    .to_com_ptr();
+                // SAFETY: caller provided a writable interface output; transfer one owned COM reference.
+                unsafe { *object = host.into_raw().cast() };
+                return kResultOk;
+            }
+        }
         kNotImplemented
+    }
+}
+#[cfg(target_os = "linux")]
+impl IWaylandHostTrait for Host<true> {
+    unsafe fn openWaylandConnection(&self) -> *mut wl_display {
+        self.wayland.open().cast()
+    }
+    unsafe fn closeWaylandConnection(&self, display: *mut wl_display) -> tresult {
+        if self.wayland.close(display.cast()) {
+            kResultOk
+        } else {
+            kInvalidArgument
+        }
+    }
+}
+impl Host {
+    pub fn wrap(self) -> vst3::ComPtr<FUnknown> {
+        #[cfg(target_os = "linux")]
+        if crate::linux_editor::wayland_allowed() {
+            let host = ComWrapper::new(Host::<true> {
+                run_loop: self.run_loop,
+                wayland: self.wayland,
+                wayland_interface: std::cell::Cell::new(std::ptr::null_mut()),
+            });
+            let interface = host.to_com_ptr::<IWaylandHost>().expect("Wayland host");
+            host.wayland_interface.set(interface.as_ptr());
+            return host.to_com_ptr::<FUnknown>().expect("host interface");
+        }
+        ComWrapper::new(self)
+            .to_com_ptr::<FUnknown>()
+            .expect("host interface")
     }
 }
 pub(crate) struct Handler(pub Arc<Edits>);
@@ -248,7 +310,47 @@ impl Class for Frame {
     #[cfg(not(target_os = "linux"))]
     type Interfaces = (IPlugFrame,);
     #[cfg(target_os = "linux")]
-    type Interfaces = (IPlugFrame, Linux::IRunLoop);
+    type Interfaces = (IPlugFrame, Linux::IRunLoop, IWaylandFrame);
+}
+#[cfg(target_os = "linux")]
+impl IWaylandFrameTrait for Frame {
+    unsafe fn getWaylandSurface(&self, display: *mut wl_display) -> *mut wl_surface {
+        self.window
+            .wayland()
+            .filter(|w| w.matches(display.cast()))
+            .map_or(std::ptr::null_mut(), |w| w.surface().cast())
+    }
+    unsafe fn getParentSurface(
+        &self,
+        rect: *mut ViewRect,
+        display: *mut wl_display,
+    ) -> *mut xdg_surface {
+        let Some(window) = self.window.wayland().filter(|w| w.matches(display.cast())) else {
+            return std::ptr::null_mut();
+        };
+        if rect.is_null() {
+            return std::ptr::null_mut();
+        }
+        let Ok((_, width, height)) = window.status() else {
+            return std::ptr::null_mut();
+        };
+        // SAFETY: SDK caller supplies a writable ViewRect, used only during this UI-thread call.
+        unsafe {
+            *rect = ViewRect {
+                left: 0,
+                top: 0,
+                right: width as i32,
+                bottom: height as i32,
+            }
+        };
+        window.xdg().cast()
+    }
+    unsafe fn getParentToplevel(&self, display: *mut wl_display) -> *mut xdg_toplevel {
+        self.window
+            .wayland()
+            .filter(|w| w.matches(display.cast()))
+            .map_or(std::ptr::null_mut(), |w| w.toplevel().cast())
+    }
 }
 impl IPlugFrameTrait for Frame {
     unsafe fn resizeView(&self, view: *mut IPlugView, rect: *mut ViewRect) -> tresult {
@@ -281,6 +383,31 @@ impl IPlugFrameTrait for Frame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wayland_host_query_obeys_policy_and_identity() {
+        crate::linux_editor::configure("x11", true);
+        let host = Host::new().wrap();
+        assert!(host.cast::<IWaylandHost>().is_none());
+        crate::linux_editor::configure("wayland", true);
+        let host = Host::new().wrap();
+        let context = host.cast::<IHostApplication>().unwrap();
+        let queried = context.cast::<IWaylandHost>().unwrap();
+        let mut iid = IWaylandHost_iid;
+        let mut pointer = std::ptr::null_mut();
+        assert_eq!(
+            // SAFETY: retained context and writable IID and interface output.
+            unsafe { context.createInstance(&mut iid, &mut iid, &mut pointer) },
+            kResultOk
+        );
+        // SAFETY: successful createInstance transferred an owned interface reference.
+        let created = unsafe { vst3::ComPtr::<IWaylandHost>::from_raw(pointer.cast()) }.unwrap();
+        assert_eq!(queried.as_ptr(), created.as_ptr());
+        drop((host, context, queried));
+        assert!(created.cast::<IHostApplication>().is_some());
+        crate::linux_editor::configure("auto", true);
+    }
 
     #[test]
     fn a_locked_stream_refuses_instead_of_racing() {

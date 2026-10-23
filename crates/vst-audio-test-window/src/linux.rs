@@ -46,10 +46,34 @@ impl Parent {
             .unwrap();
         connection.map_window(window).unwrap().check().unwrap();
         connection.flush().unwrap();
-        Self {
+        let parent = Self {
             connection,
             window,
             destroyed: Cell::new(false),
+        };
+        parent.wait_visible(true);
+        parent
+    }
+    fn wait_visible(&self, visible: bool) {
+        // A desktop WM handles MapWindow asynchronously; request acceptance is
+        // not evidence that the parent is mapped. Do not assume a particular size.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            self.pump();
+            let attributes = self
+                .connection
+                .get_window_attributes(self.window)
+                .unwrap()
+                .reply()
+                .unwrap();
+            if (attributes.map_state == MapState::VIEWABLE) == visible {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "parent mapping timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
         }
     }
     pub fn handle(&self) -> ParentWindow {
@@ -154,6 +178,7 @@ impl Parent {
                 .unwrap();
         }
         self.connection.flush().unwrap();
+        self.wait_visible(visible);
     }
     pub fn destroy(&self) {
         if !self.destroyed.replace(true) {

@@ -230,6 +230,11 @@ impl Plugin for Vst2 {
 
 pub fn host_main(args: Args) -> Result<(), StartError> {
     runtime::suppress_error_dialogs();
+    #[cfg(target_os = "linux")]
+    vst_audio_worker_sys::linux_editor::configure(
+        &args.linux_editor,
+        !args.sandbox || args.sandbox_processes,
+    );
     let trace = std::env::var_os("VST_AUDIO_TRACE").is_some();
     if trace {
         eprintln!("worker {} starting", std::process::id());

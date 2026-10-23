@@ -24,6 +24,8 @@ pub struct Args {
     pub parent: usize,
     #[arg(long)]
     pub sandbox: bool,
+    #[arg(long, default_value = "auto", value_parser = ["auto", "wayland", "x11"])]
+    pub linux_editor: String,
     #[arg(long)]
     pub sandbox_network: bool,
     #[arg(long)]

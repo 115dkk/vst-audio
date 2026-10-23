@@ -65,6 +65,82 @@ embedding explicitly returns unsupported because an NSView belongs to its
 own process; native Wayland embedding is outside this contract. Floating editors
 and a caller-rendered parameter UI remain the portable alternatives.
 
+### Linux floating editor backends
+
+`Configuration::linux_editor` and `ProcessingOptions::linux_editor` preserve a
+`LinuxEditor` choice across recovery. `EditorStatus.platform` reports the actual
+backend. Other operating systems ignore the Linux choice. Embedded X11 windows
+always use the session `DISPLAY`, regardless of that choice.
+
+The intended three routes are native VST 3 Wayland, the session X display
+(Xorg or desktop XWayland), and a private rootful Xwayland per editor. Native
+Wayland and session X are implemented; **private Xwayland is not implemented in
+this change**. `Auto` currently tries a supporting VST 3 view on Wayland and then
+the session X display. `Wayland` rejects VST 2/unsupported views; `X11` never
+exposes a Wayland host. Private Xwayland is planned, not implemented, and has no
+public selection or wire tag. Both public backend enums are non-exhaustive.
+`Auto` also retries a fresh view on X11 after Wayland setup or attachment fails;
+explicit `Wayland` never falls back.
+
+VST 2 cannot render natively to Wayland: Linux `effEditOpen` receives an X11
+window ID, and existing plugin binaries call X11 themselves. Substituting a
+Wayland pointer cannot change that ABI. A private X server must also arrange
+for the plugin's own X connection to target that server, not merely change the
+parent window ID. Changing process-global `DISPLAY` after worker threads have
+started is not a safe solution. A pre-load display-routing/launch boundary is
+needed before that route can be considered implemented.
+
+For native Wayland the worker **is** the host UI. It opens one connection to
+the session compositor and supplies its `wl_display*` through
+`IHostApplication::createInstance(IWaylandHost)` or direct `queryInterface`. The worker's parent surface,
+view subsurface and popup parents therefore belong to one real connection.
+There is no nested compositor or request-delegating server. This differs from
+an SDK EditorHost whose UI and plugin have separate connections. Direct
+`queryInterface(IWaylandHost)` returns the same host identity as `createInstance`,
+with an owned reference; X11-only workers expose neither route.
+The connection normally remains retained through module/controller teardown;
+balanced open/close calls are counted. Failed setup and lost connections release
+it after view teardown, so the next open reconnects.
+
+Linux-only `wayland-client` uses the libwayland system backend with runtime
+`dlopen`. The backend creates an internal event queue and assigns its own
+proxies to it; plugin proxies use the default queue or a guest/private queue.
+On each main-thread iteration, IRunLoop descriptor handlers run first, then
+the host dispatches its inner queue and flushes. Without a registered plugin
+handler for the display fd, the host polls nonblocking, prepares/reads only
+when readable, and dispatches pending default-queue events too. The host never
+reads behind a registered handler that may already have drained the socket.
+
+The xdg-shell parent uses shm background buffers, ping/pong, optional server
+decoration and optional activation requests. Parent-buffer scale follows
+preferred-buffer-scale or the largest entered-output scale; logical view size
+is kept separate from physical buffer size. Optional view content scale is
+passed before attachment and on subsequent scale changes. The VST 3.8 Wayland
+header defines no additional DPI coordinate convention. Capture fails explicitly:
+Wayland clients cannot read desktop pixels. Wayland cross-process embedding is
+not supported. Without the decoration protocol (notably GNOME), windows have no
+host-drawn title bar. Initial mapping waits up to five seconds for a fresh
+configure and acknowledges it before attaching a buffer. Wayland Hide calls
+`removed()`, releases the plugin view/frame, and destroys the entire parent
+`wl_surface`, xdg roles, decoration and shm buffers. The editor stays open but
+hidden, preserving its last size/accepted scale and the host display connection.
+Show creates a fresh view and top-level through the initial mapping procedure,
+restores size and scale, and attaches it. Failed recreation closes the editor
+and emits `EditorClosed`; repeated Hide/Show in the corresponding state is a no-op.
+Hidden Resize only records the next size (constraints are checked on recreation);
+Focus is a no-op without a surface, Capture remains unsupported, and Scale fails
+while no view exists. Parameters and plugin state remain in the controller.
+
+This avoids Weston 13's missing configure when remapping a null-buffer-unmapped
+xdg top-level. Reusing an old configure would violate xdg-shell. Recreating only
+the xdg roles on the same surface is also unsuitable: a live plugin view may
+retain the old pointers from `IWaylandFrame::getParentSurface`/`getParentToplevel`.
+Destroying the view first avoids leaving those pointers stale. X11 continues to
+unmap/map the same window and view. Background buffers are reused only after
+release, with at most two live buffers per visible Wayland editor.
+Initial surface synchronization precedes view attachment and content-scale setup;
+rejected content scales leave the last accepted scale unchanged.
+
 ## Data planes
 
 Control frames have explicit byte order, version, length, bounded payloads and

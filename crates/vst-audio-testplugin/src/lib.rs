@@ -6,3 +6,5 @@ mod probe;
 mod vst3;
 
 mod visual;
+#[cfg(target_os = "linux")]
+mod wayland;

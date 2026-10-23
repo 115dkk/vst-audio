@@ -578,6 +578,10 @@ impl Vst2Plugin {
         }
         let (visible, width, height) = window.status().map_err(|e| PluginError(e.to_string()))?;
         Ok(EditorReply::Status(EditorStatus {
+            #[cfg(target_os = "linux")]
+            platform: window.platform(),
+            #[cfg(not(target_os = "linux"))]
+            platform: crate::native_editor_platform(),
             visible,
             embedded: window.parent().is_some(),
             width,

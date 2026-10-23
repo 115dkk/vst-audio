@@ -15,6 +15,7 @@ pub struct EditorWindow {
     delete: u32,
     protocols: u32,
     closed: Cell<bool>,
+    configured: Cell<bool>,
     parent: Option<vst_audio_protocol::ParentWindow>,
 }
 fn error(e: impl std::fmt::Display) -> io::Error {
@@ -74,14 +75,17 @@ impl EditorWindow {
             .map_err(error)?;
         connection.map_window(window).map_err(error)?;
         connection.flush().map_err(error)?;
-        Ok(Self {
+        let editor = Self {
             connection,
             window,
             protocols,
             delete,
             closed: Cell::new(false),
+            configured: Cell::new(false),
             parent: None,
-        })
+        };
+        editor.wait_mapped()?;
+        Ok(editor)
     }
     pub fn open_embedded(
         parent: vst_audio_protocol::ParentWindow,
@@ -149,6 +153,7 @@ impl EditorWindow {
             delete: 0,
             protocols: 0,
             closed: Cell::new(false),
+            configured: Cell::new(false),
             parent: Some(parent),
         })
     }
@@ -170,10 +175,25 @@ impl EditorWindow {
                 // Only destruction closes an embedded editor: the application
                 // may unmap its parent to minimize or switch views.
                 Event::DestroyNotify(_) => self.closed.set(true),
+                Event::ConfigureNotify(event) if event.window == self.window => {
+                    self.configured.set(true);
+                }
                 _ => {}
             }
         }
         self.closed.get()
+    }
+    fn wait_mapped(&self) -> io::Result<()> {
+        // A desktop WM redirects MapWindow asynchronously (unlike bare Xvfb).
+        // Only floating windows wait; an embedded parent's visibility is external.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while self.parent.is_none() && !self.status()?.0 {
+            if std::time::Instant::now() >= deadline {
+                return Err(error("editor mapping timed out"));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        Ok(())
     }
     pub fn show(&self, visible: bool) -> io::Result<()> {
         if visible {
@@ -189,7 +209,11 @@ impl EditorWindow {
                 .check()
                 .map_err(error)?;
         }
-        self.connection.flush().map_err(error)
+        self.connection.flush().map_err(error)?;
+        if visible {
+            self.wait_mapped()?;
+        }
+        Ok(())
     }
     pub fn focus(&self) -> io::Result<()> {
         self.connection
@@ -293,6 +317,14 @@ impl EditorWindow {
         Ok(())
     }
     pub fn resize(&self, width: i32, height: i32) -> io::Result<()> {
+        // Drain older notifications before starting this request.
+        let (_, w, h) = self.status()?;
+        self.pump();
+        self.configured.set(false);
+        let expected = (width.clamp(1, 8192) as u32, height.clamp(1, 8192) as u32);
+        if (w, h) == expected {
+            return Ok(());
+        }
         self.connection
             .configure_window(
                 self.window,
@@ -301,7 +333,20 @@ impl EditorWindow {
                     .height(height.clamp(1, 8192) as u32),
             )
             .map_err(error)?;
-        self.connection.flush().map_err(error)
+        self.connection.flush().map_err(error)?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if self.pump() {
+                return Err(error("editor closed during resize"));
+            }
+            if self.configured.get() {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(error("editor resize timed out"));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
     }
 }
 impl Drop for EditorWindow {
