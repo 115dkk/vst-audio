@@ -126,9 +126,9 @@ def install_eapo(root) -> Path:
     """Verify and unpack the black-box GPL engine only in the external work tree."""
     import zipfile
     url, digest = EAPO
-    download = root / "eapo-package"
-    download.mkdir(exist_ok=True)
-    package = download / "release.nupkg"
+    folder = root / "eapo-package"
+    folder.mkdir(exist_ok=True)
+    package = folder / "release.nupkg"
     if not package.exists() or hashlib.sha256(package.read_bytes()).hexdigest() != digest:
         package.write_bytes(download(url, timeout=120))
     actual = hashlib.sha256(package.read_bytes()).hexdigest()
