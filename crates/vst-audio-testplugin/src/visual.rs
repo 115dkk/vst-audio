@@ -29,7 +29,6 @@ impl Canvas {
         Some(Self(view))
     }
     pub fn resize(&self, width: i32, height: i32) {
-        use objc2::MainThreadOnly;
         use objc2_foundation::{NSPoint, NSRect, NSSize};
         self.0.setFrame(NSRect::new(
             NSPoint::new(0.0, 0.0),
