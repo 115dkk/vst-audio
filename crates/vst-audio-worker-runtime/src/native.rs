@@ -243,6 +243,7 @@ impl Plugin for Vst2 {
         self.info.latency_frames = self.inner.info().latency;
         PluginEvents {
             params_changed: events.params,
+            parameter_edits: events.parameter_edits,
             latency_changed: events.latency.then_some(self.info.latency_frames),
             editor_closed: events.closed,
             editor_resized: events.resized,
@@ -712,6 +713,40 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
                     })?;
                     failed = true;
                     break;
+                }
+                let mut pending_perform: Option<(u32, f64)> = None;
+                for (id, phase, value) in events.parameter_edits {
+                    if phase == 1 && pending_perform.is_some_and(|(pending, _)| pending == id) {
+                        pending_perform = Some((id, value));
+                        continue;
+                    }
+                    if let Some((id, value)) = pending_perform.take() {
+                        send(Message::ParameterEdit {
+                            id,
+                            phase: vst_audio_protocol::EditPhase::Perform,
+                            value,
+                        })?;
+                    }
+                    if phase == 1 {
+                        pending_perform = Some((id, value));
+                    } else {
+                        send(Message::ParameterEdit {
+                            id,
+                            phase: if phase == 0 {
+                                vst_audio_protocol::EditPhase::Begin
+                            } else {
+                                vst_audio_protocol::EditPhase::End
+                            },
+                            value,
+                        })?;
+                    }
+                }
+                if let Some((id, value)) = pending_perform {
+                    send(Message::ParameterEdit {
+                        id,
+                        phase: vst_audio_protocol::EditPhase::Perform,
+                        value,
+                    })?;
                 }
                 if events.params_changed {
                     send(Message::ParamsChanged)?;

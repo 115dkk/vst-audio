@@ -9,7 +9,7 @@ use crate::{
     editor::EditorWindow,
     library::Library,
     plugin::PluginError,
-    vst3_support::{Changes, Edits, Frame, Handler, Host, Stream},
+    vst3_support::{Changes, Edits, Frame, Handler, Host, NotificationGuard, Stream},
 };
 use std::{
     ffi::{c_char, c_void},
@@ -59,6 +59,7 @@ pub struct Info {
 #[derive(Debug, Default)]
 pub struct Events {
     pub params: bool,
+    pub parameter_edits: Vec<(u32, u8, f64)>,
     pub latency: Option<u32>,
     pub closed: bool,
     pub resized: Option<(u32, u32)>,
@@ -917,11 +918,13 @@ impl Vst3Plugin {
             .controller
             .as_ref()
             .ok_or_else(|| PluginError("no controller".into()))?;
+        let _notifications = NotificationGuard::enter();
         check(
             // SAFETY: main-thread live controller, validated ID and normalized value.
             unsafe { controller.setParamNormalized(id, value) },
             "setParamNormalized",
         )?;
+        self.shared.edits.forget_deferred(id);
         if !self.shared.edits.push(id, value) {
             return Err(PluginError("parameter queue full".into()));
         }
@@ -961,6 +964,7 @@ impl Vst3Plugin {
     }
     pub fn set_state(&mut self, component: &[u8], controller: &[u8]) -> Result<(), PluginError> {
         let _control = self.shared.control();
+        let _notifications = NotificationGuard::enter();
         let stream = Stream::try_from_slice(component)
             .map_err(|_| PluginError("out of memory for plugin state".into()))?;
         let pointer = stream.to_com_ptr::<IBStream>().expect("stream interface");
@@ -1437,6 +1441,7 @@ impl Vst3Plugin {
         }
     }
     pub fn take_events(&mut self) -> Events {
+        self.shared.edits.flush_deferred();
         let flags = self.shared.edits.flags.swap(0, Ordering::AcqRel);
         let latency = if flags & 2 != 0 {
             // SAFETY: SDK latency notification handled on main thread, live processor.
@@ -1456,15 +1461,18 @@ impl Vst3Plugin {
             None
         };
         self.editor_size = size;
+        let mut parameter_edits = Vec::new();
+        while let Some(edit) = self.shared.edits.pop_notification() {
+            parameter_edits.push(edit);
+        }
         Events {
             resized,
-            params: flags & 1 != 0,
+            params: flags & 1 != 0 || self.shared.edits.take_overflow(),
+            parameter_edits,
             latency,
             closed: std::mem::take(&mut self.closed_editor),
             fault: if flags & 4 != 0 {
                 Some("bus layout changed")
-            } else if flags & 8 != 0 {
-                Some("parameter queue overflow")
             } else if flags & 16 != 0 {
                 Some("VST 3 audio processing failed")
             } else {

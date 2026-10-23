@@ -132,6 +132,7 @@ impl Plugin for Vst3 {
         let events = self.inner.take_events();
         PluginEvents {
             params_changed: events.params,
+            parameter_edits: events.parameter_edits,
             latency_changed: events.latency,
             editor_closed: events.closed,
             editor_resized: events.resized,

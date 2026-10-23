@@ -17,6 +17,9 @@ struct Instance {
     shell: bool,
     shell_children: usize,
     child: i32,
+    audio_automate: bool,
+    audio_automated: AtomicBool,
+    flood_edits: bool,
     control: UnsafeCell<Control>,
     audio: UnsafeCell<Audio>,
 }
@@ -80,6 +83,9 @@ pub extern "C" fn VSTPluginMain(host: Callback) -> *mut AEffect {
         shell,
         shell_children,
         child,
+        audio_automate: std::env::var_os("VST_AUDIO_TEST_AUDIO_AUTOMATE").is_some(),
+        audio_automated: AtomicBool::new(false),
+        flood_edits: std::env::var_os("VST_AUDIO_TEST_EDIT_FLOOD").is_some(),
         control: UnsafeCell::new(Control {
             chunk: [0; 128],
             input: Arrangement::new(ARR_STEREO, &[1, 2]),
@@ -216,6 +222,24 @@ unsafe extern "C" fn dispatch(
             1
         }
         EDIT_OPEN => {
+            // SAFETY: editor opening reports one valid parameter gesture synchronously.
+            unsafe { host(effect, 43, 0, 0, std::ptr::null_mut()) };
+            // SAFETY: immutable fixture option remains live through the editor call.
+            let flood_edits = unsafe { (*raw).flood_edits };
+            let edits = if flood_edits { 5000 } else { 1 };
+            for step in 0..edits {
+                let value = if edits == 1 {
+                    0.5
+                } else {
+                    0.75 * step as f32 / (edits - 1) as f32
+                };
+                // SAFETY: immutable callback pointer remains live until CLOSE.
+                let callback = unsafe { (*raw).host };
+                // SAFETY: automate carries no borrowed payload.
+                unsafe { callback(effect, MASTER_AUTOMATE, 0, 0, std::ptr::null_mut(), value) };
+            }
+            // SAFETY: editor opening closes the same valid parameter gesture.
+            unsafe { host(effect, 44, 0, 0, std::ptr::null_mut()) };
             if mode.load(Ordering::Relaxed) == 13 {
                 control.rect.right = 480;
                 control.rect.bottom = 260;
@@ -422,6 +446,16 @@ unsafe extern "C" fn process(
     // SAFETY: observation counters are atomic and remain allocated until CLOSE.
     let observations = unsafe { &(*raw).observations };
     observations[6].fetch_add(1, Ordering::Relaxed);
+    // SAFETY: immutable fixture mode remains live through processing.
+    let audio_automate = unsafe { (*raw).audio_automate };
+    // SAFETY: atomic once flag remains live through processing.
+    let audio_automated = unsafe { &(*raw).audio_automated };
+    if audio_automate && !audio_automated.swap(true, Ordering::Relaxed) {
+        // SAFETY: immutable callback pointer remains live until CLOSE.
+        let callback = unsafe { (*raw).host };
+        // SAFETY: automate carries no borrowed payload.
+        unsafe { callback(effect, MASTER_AUTOMATE, 0, 0, std::ptr::null_mut(), 0.5) };
+    }
     if mode == 9 || (mode == 17 && observations[9].load(Ordering::Relaxed) != 0) {
         observations[8].fetch_add(1, Ordering::Relaxed);
         return;

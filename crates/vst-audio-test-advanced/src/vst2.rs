@@ -86,8 +86,18 @@ unsafe extern "C" fn dispatch(
             unsafe { callback(effect, 8, 0, 0, pointer, 0.0) };
             1
         }
-        OPEN | SET_SAMPLE_RATE | SET_BLOCK_SIZE | START_PROCESS | STOP_PROCESS | EDIT_OPEN
-        | EDIT_CLOSE | EDIT_IDLE | SET_PROGRAM => 1,
+        EDIT_OPEN => {
+            let host = instance.host;
+            // SAFETY: editor opening reports one valid parameter gesture synchronously.
+            unsafe { host(effect, 43, 0, 0, std::ptr::null_mut(), 0.0) };
+            // SAFETY: automate reports normalized parameter zero without borrowed payload.
+            unsafe { host(effect, MASTER_AUTOMATE, 0, 0, std::ptr::null_mut(), 0.5) };
+            // SAFETY: editor opening closes the same valid parameter gesture.
+            unsafe { host(effect, 44, 0, 0, std::ptr::null_mut(), 0.0) };
+            1
+        }
+        OPEN | SET_SAMPLE_RATE | SET_BLOCK_SIZE | START_PROCESS | STOP_PROCESS | EDIT_CLOSE
+        | EDIT_IDLE | SET_PROGRAM => 1,
         GET_PROGRAM => 0,
         MAINS_CHANGED => {
             instance.active.store(value != 0, Ordering::Relaxed);

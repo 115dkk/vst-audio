@@ -4,7 +4,8 @@ use std::{
     time::{Duration, Instant},
 };
 use vst_audio::{
-    AudioStatus, Command, Configuration, Host, HostEvent, PluginDescriptor, PluginFormat, Status,
+    AudioStatus, Command, Configuration, EditPhase, Host, HostEvent, PluginDescriptor,
+    PluginFormat, Status,
 };
 
 #[global_allocator]
@@ -152,6 +153,140 @@ fn gui_contract_is_only_requests_and_events() {
 }
 
 #[test]
+#[ignore = "native fixtures and display required"]
+fn editor_reports_plugin_parameter_gesture_in_order() {
+    for format in [PluginFormat::Vst2, PluginFormat::Vst3] {
+        let instance = host()
+            .spawn(&descriptor(format), &Configuration::default(), None)
+            .unwrap();
+        let open = instance.controller().request(Command::OpenEditor).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut edits = Vec::new();
+        let mut completed = false;
+        while (!completed || edits.len() < 3) && Instant::now() < deadline {
+            if let Some(event) = instance.try_next_event() {
+                match event {
+                    HostEvent::Completed { request } if request == open => completed = true,
+                    HostEvent::ParameterEdited { id, phase, value } => {
+                        edits.push((id, phase, value))
+                    }
+                    _ => {}
+                }
+            } else {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        assert!(completed);
+        assert_eq!(
+            edits,
+            vec![
+                (0, EditPhase::Begin, 0.0),
+                (0, EditPhase::Perform, 0.5),
+                (0, EditPhase::End, 0.0),
+            ]
+        );
+    }
+}
+
+#[test]
+#[ignore = "native VST2 fixture required"]
+fn audio_thread_automate_is_reported_without_allocating() {
+    let mut instance = host()
+        .spawn(
+            &descriptor(PluginFormat::Vst2),
+            &Configuration::default(),
+            None,
+        )
+        .unwrap();
+    let mut audio = instance.take_audio().unwrap();
+    let input = [0.25; 128];
+    let mut output = [[0.0; 128]; 6];
+    let mut refs: Vec<_> = output.iter_mut().map(|plane| &mut plane[..]).collect();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        assert_no_alloc::assert_no_alloc(|| audio.process(&[&input, &input], &mut refs));
+        while let Some(event) = instance.try_next_event() {
+            if matches!(
+                event,
+                HostEvent::ParameterEdited {
+                    id: 0,
+                    phase: EditPhase::Perform,
+                    value: 0.5,
+                }
+            ) {
+                return;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!("missing audio-thread parameter edit");
+}
+
+#[test]
+#[ignore = "native fixtures and display required"]
+fn parameter_edit_overflow_keeps_latest_value_and_reports_refresh() {
+    for format in [PluginFormat::Vst2, PluginFormat::Vst3] {
+        let mut instance = host()
+            .spawn(&descriptor(format), &Configuration::default(), None)
+            .unwrap();
+        let open = instance.controller().request(Command::OpenEditor).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut edit_count = 0;
+        let mut last = None;
+        let mut changed = false;
+        let mut completed = false;
+        while (!completed || last != Some(0.75) || !changed) && Instant::now() < deadline {
+            if let Some(event) = instance.try_next_event() {
+                match event {
+                    HostEvent::Completed { request } if request == open => completed = true,
+                    HostEvent::ParameterEdited {
+                        phase: EditPhase::Perform,
+                        value,
+                        ..
+                    } => {
+                        edit_count += 1;
+                        last = Some(value);
+                    }
+                    HostEvent::ParametersChanged => changed = true,
+                    _ => {}
+                }
+            } else {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        assert!(completed);
+        assert_eq!(last, Some(0.75));
+        assert!(changed);
+        assert!(edit_count > 0);
+        eprintln!("{format:?} overflow delivered {edit_count} Perform events");
+        if format == PluginFormat::Vst3 {
+            // The burst exceeds the processor queue. The processor must still end on
+            // the editor's last value (rear channels are 0.5 * input * Width).
+            let mut audio = instance.take_audio().unwrap();
+            let input = [1.0f32; 128];
+            let mut output = [[0.0f32; 128]; 6];
+            // The first callbacks may fall back while the worker starts processing.
+            let (mut processed, mut rear) = (0, f32::NAN);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while processed < 8 && Instant::now() < deadline {
+                let mut refs: Vec<_> = output.iter_mut().map(|p| &mut p[..]).collect();
+                if audio.process(&[&input, &input], &mut refs) == AudioStatus::Processed {
+                    processed += 1;
+                    rear = output[4][127];
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert_eq!(processed, 8, "audio did not process");
+            assert!(
+                (rear - 0.375).abs() < 1e-6,
+                "processor width after burst: {rear}"
+            );
+            eprintln!("Vst3 processor rear channel after burst={rear}");
+        }
+    }
+}
+
+#[test]
 #[ignore = "native fixtures required"]
 fn parameter_pages_and_invalid_edits_do_not_kill_instances() {
     for format in [PluginFormat::Vst2, PluginFormat::Vst3] {
@@ -194,6 +329,17 @@ fn parameter_pages_and_invalid_edits_do_not_kill_instances() {
             .request(Command::SetParameter { id, value: 0.25 })
             .unwrap();
         assert!(matches!(wait(edit), HostEvent::Completed { .. }));
+        let quiet_deadline = Instant::now() + Duration::from_millis(300);
+        while Instant::now() < quiet_deadline {
+            if let Some(event) = instance.try_next_event() {
+                assert!(
+                    !matches!(event, HostEvent::ParameterEdited { .. }),
+                    "app SetParameter was reported as a plugin edit"
+                );
+            } else {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
         let invalid = control
             .request(Command::SetParameter {
                 id: u32::MAX,

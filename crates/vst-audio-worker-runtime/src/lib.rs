@@ -15,9 +15,10 @@ pub struct PluginInfo {
     pub outputs: Vec<BusInfo>,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct PluginEvents {
     pub params_changed: bool,
+    pub parameter_edits: Vec<(u32, u8, f64)>,
     pub latency_changed: Option<u32>,
     pub editor_closed: bool,
     pub editor_resized: Option<(u32, u32)>,

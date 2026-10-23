@@ -91,6 +91,13 @@ pub struct Parameter {
     pub hidden: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EditPhase {
+    Begin,
+    Perform,
+    End,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Message {
     /// Sent before Hello only when an OS sandbox was requested and installed.
@@ -179,6 +186,11 @@ pub enum Message {
         width: u32,
         height: u32,
     },
+    ParameterEdit {
+        id: u32,
+        phase: EditPhase,
+        value: f64,
+    },
 }
 
 impl Message {
@@ -224,6 +236,7 @@ impl Message {
             Self::Ack => 16,
             Self::EditorClosed => 17,
             Self::EditorResized { .. } => 31,
+            Self::ParameterEdit { .. } => 32,
         }
     }
 }
@@ -550,6 +563,18 @@ fn encode_message(message: &Message, out: &mut Vec<u8>) -> Result<(), CodecError
             put_u32(out, *id);
             put_u64(out, value.to_bits());
         }
+        Message::ParameterEdit { id, phase, value } => {
+            if !value.is_finite() || !(0.0..=1.0).contains(value) {
+                return Err(CodecError::InvalidValue);
+            }
+            put_u32(out, *id);
+            out.push(match phase {
+                EditPhase::Begin => 0,
+                EditPhase::Perform => 1,
+                EditPhase::End => 2,
+            });
+            put_u64(out, value.to_bits());
+        }
         Message::Parameters { total, entries } => {
             if entries.len() > 32 || *total > 16384 {
                 return Err(CodecError::InvalidValue);
@@ -849,6 +874,16 @@ fn decode_message(kind: u16, body: &[u8]) -> Result<Option<Message>, CodecError>
         22 => Message::RequestError {
             code: cursor.u32()?,
             text: cursor.string()?,
+        },
+        32 => Message::ParameterEdit {
+            id: cursor.u32()?,
+            phase: match cursor.u8()? {
+                0 => EditPhase::Begin,
+                1 => EditPhase::Perform,
+                2 => EditPhase::End,
+                _ => return Err(CodecError::InvalidValue),
+            },
+            value: cursor.normalized()?,
         },
         _ => return Ok(None),
     };

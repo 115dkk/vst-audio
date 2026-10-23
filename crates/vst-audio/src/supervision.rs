@@ -354,6 +354,11 @@ pub(crate) fn supervise(
                             Message::EditorClosed => {
                                 emit(&events, &shared, HostEvent::EditorClosed)
                             }
+                            Message::ParameterEdit { id, phase, value } => emit(
+                                &events,
+                                &shared,
+                                HostEvent::ParameterEdited { id, phase, value },
+                            ),
                             Message::ParamsChanged => {
                                 emit(&events, &shared, HostEvent::ParametersChanged)
                             }

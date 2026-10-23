@@ -32,6 +32,7 @@ struct Matrix {
     probe: [AtomicU8; 3],
     width: AtomicU64,
     active: AtomicBool,
+    flood_edits: bool,
     delay: UnsafeCell<Delay>,
     handler: RefCell<Option<ComPtr<IComponentHandler>>>,
     #[cfg(target_os = "linux")]
@@ -46,6 +47,7 @@ impl Matrix {
             probe: [const { AtomicU8::new(0) }; 3],
             width: AtomicU64::new(1.0f64.to_bits()),
             active: AtomicBool::new(false),
+            flood_edits: std::env::var_os("VST_AUDIO_TEST_EDIT_FLOOD").is_some(),
             delay: UnsafeCell::new(Delay {
                 samples: [[0.0; 64]; 6],
                 cursor: 0,
@@ -477,6 +479,7 @@ impl IEditControllerTrait for Matrix {
             size: std::cell::Cell::new((320, 200)),
             scale: std::cell::Cell::new(1.0),
             handler: self.handler.borrow().clone(),
+            flood_edits: self.flood_edits,
             #[cfg(target_os = "linux")]
             context: self.context.borrow().clone(),
             #[cfg(target_os = "linux")]
@@ -496,6 +499,7 @@ struct View {
     size: std::cell::Cell<(i32, i32)>,
     scale: std::cell::Cell<f32>,
     handler: Option<ComPtr<IComponentHandler>>,
+    flood_edits: bool,
     #[cfg(target_os = "linux")]
     context: Option<ComPtr<IHostApplication>>,
     #[cfg(target_os = "linux")]
@@ -579,8 +583,17 @@ impl IPlugViewTrait for View {
         if let Some(handler) = &self.handler {
             // SAFETY: attached is on UI thread; retained host handler and known parameter zero.
             let _ = unsafe { handler.beginEdit(0) };
-            // SAFETY: UI-thread normalized edit for Width; processor receives it via queue.
-            let _ = unsafe { handler.performEdit(0, 0.5) };
+            let edits = if self.flood_edits { 5000 } else { 1 };
+            for step in 0..edits {
+                let value = if edits == 1 {
+                    0.5
+                } else {
+                    // Ends away from the initial 1.0 so a stale processor shows in audio.
+                    0.75 * step as f64 / (edits - 1) as f64
+                };
+                // SAFETY: UI-thread normalized edit for Width; processor receives it via queue.
+                let _ = unsafe { handler.performEdit(0, value) };
+            }
             // SAFETY: finishes the preceding UI-thread edit gesture.
             let _ = unsafe { handler.endEdit(0) };
         }

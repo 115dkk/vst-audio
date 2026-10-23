@@ -254,8 +254,9 @@ Host canDo returns 1 only for `sendVstEvents`, `sendVstMidiEvent`,
 `offline`, file selectors, `editFile`, `reportConnectionChanges` and
 `sendVstMidiEventFlagIsRealtime`, return 0. Input strings are bounded to 128 bytes.
 Events mean MIDI and bounded SysEx, not every historical VST event type.
-`updateDisplay` and endEdit coalesce into `ParamsChanged`; gesture boundaries do
-not cross the protocol yet.
+`updateDisplay` remains a coarse `ParamsChanged` notification. Valid beginEdit,
+automate and endEdit callbacks cross the protocol as bounded, ordered parameter
+edit notifications; invalid or overflowed callbacks also produce `ParamsChanged`.
 
 Shell enumeration is bounded to 1024 entries. A child class ID is `b"VST2"` +
 its signed unique ID's four big-endian bytes + eight zero bytes. Non-shell class

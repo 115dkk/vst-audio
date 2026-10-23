@@ -311,6 +311,14 @@ pub enum HostEvent {
         width: u32,
         height: u32,
     },
+    /// A plugin-originated edit, normally from its editor. App `SetParameter` and
+    /// state restores do not emit this. `ParametersChanged` reports bulk changes
+    /// or lost edit notifications.
+    ParameterEdited {
+        id: u32,
+        phase: vst_audio_protocol::EditPhase,
+        value: f64,
+    },
     ParametersChanged,
     LatencyChanged(u32),
     RequestFailed {

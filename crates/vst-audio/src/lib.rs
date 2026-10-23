@@ -22,7 +22,7 @@ pub use api::{
     PluginDescriptor, RecoveryPolicy, RequestId, Status,
 };
 
-pub use vst_audio_protocol::Parameter;
+pub use vst_audio_protocol::{EditPhase, Parameter};
 
 pub use vst_audio_protocol::{BusConfiguration, Capabilities, ProcessingSetup, SampleFormat};
 pub use vst_audio_ring::{

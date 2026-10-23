@@ -3,8 +3,8 @@
 use std::io::Cursor;
 
 use vst_audio_protocol::{
-    Action, Bus, BusInfo, BusKind, ClassInfo, CodecError, DecodedFrame, DisableReason, Frame,
-    HostWatch, KillReason, MAX_STRING_BYTES, Message, PluginFormat, Received, RequestKind,
+    Action, Bus, BusInfo, BusKind, ClassInfo, CodecError, DecodedFrame, DisableReason, EditPhase,
+    Frame, HostWatch, KillReason, MAX_STRING_BYTES, Message, PluginFormat, Received, RequestKind,
     StateHistory, WatchState, decode_frame, encode_frame, read_frame,
 };
 
@@ -147,12 +147,59 @@ fn codec_round_trips_every_message() {
             width: 500,
             height: 280,
         },
+        Message::ParameterEdit {
+            id: 42,
+            phase: EditPhase::Perform,
+            value: 0.5,
+        },
         Message::Scan {
             path: "C:\\".to_owned() + &"a".repeat(MAX_STRING_BYTES - 3),
         },
     ] {
         round_trip(message);
     }
+}
+
+#[test]
+fn parameter_edit_rejects_invalid_payloads() {
+    let valid = encode_frame(&Frame {
+        flags: 0,
+        request: 0,
+        message: Message::ParameterEdit {
+            id: 7,
+            phase: EditPhase::Perform,
+            value: 0.5,
+        },
+    })
+    .unwrap();
+
+    let mut phase = valid.clone();
+    phase[16] = 3;
+    assert!(matches!(
+        decode_frame(&phase),
+        Err(CodecError::InvalidValue)
+    ));
+
+    for value in [f64::NAN, 1.5] {
+        let mut bytes = valid.clone();
+        bytes[17..25].copy_from_slice(&value.to_le_bytes());
+        assert!(matches!(
+            decode_frame(&bytes),
+            Err(CodecError::InvalidValue)
+        ));
+    }
+
+    let mut short = valid.clone();
+    short.truncate(short.len() - 1);
+    assert!(matches!(decode_frame(&short), Err(CodecError::Truncated)));
+
+    let mut trailing = valid;
+    trailing[0..4].copy_from_slice(&22_u32.to_le_bytes());
+    trailing.push(0);
+    assert!(matches!(
+        decode_frame(&trailing),
+        Err(CodecError::TrailingBytes)
+    ));
 }
 
 #[test]

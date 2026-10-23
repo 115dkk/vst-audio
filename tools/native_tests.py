@@ -19,7 +19,16 @@ run("cargo", "test", "--locked", "-p", "vst-audio", "--test", "native",
 run("cargo", "test", "--locked", "-p", "vst-audio-worker-sys", "--test", "lifecycle",
     "--", "--ignored", "--test-threads=1", env=env)
 run("cargo", "test", "--locked", "-p", "vst-audio", "--test", "application",
-    "--", "--ignored", "--test-threads=1", env=env)
+    "--", "--ignored", "--test-threads=1", "--skip", "audio_thread_automate_is_reported_without_allocating",
+    "--skip", "parameter_edit_overflow_keeps_latest_value_and_reports_refresh", env=env)
+run("cargo", "test", "--locked", "-p", "vst-audio", "--test", "application",
+    "audio_thread_automate_is_reported_without_allocating",
+    "--", "--ignored", "--nocapture", "--test-threads=1",
+    env=dict(env, VST_AUDIO_TEST_AUDIO_AUTOMATE="1"))
+run("cargo", "test", "--locked", "-p", "vst-audio", "--test", "application",
+    "parameter_edit_overflow_keeps_latest_value_and_reports_refresh",
+    "--", "--ignored", "--nocapture", "--test-threads=1",
+    env=dict(env, VST_AUDIO_TEST_EDIT_FLOOD="1"))
 
 run("cargo", "test", "--locked", "-p", "vst-audio", "--test", "features", "--", "--ignored", "--test-threads=1", env=env)
 

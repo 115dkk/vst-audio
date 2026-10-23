@@ -2,12 +2,13 @@
 //! Host-owned COM objects. Controller callbacks are UI-thread-only (SDK threading model).
 use crate::{editor::EditorWindow, state_buffer::StateBuffer};
 use std::{
+    cell::Cell,
     ffi::c_void,
     io::{Read, Seek, SeekFrom, Write},
     rc::Rc,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
     },
 };
 use vst3::{Class, ComRef, ComWrapper, Steinberg::Vst::*, Steinberg::*};
@@ -16,11 +17,36 @@ use vst3::{Class, ComRef, ComWrapper, Steinberg::Vst::*, Steinberg::*};
 use vst3::{wl_display, wl_surface, xdg_surface, xdg_toplevel};
 
 pub(crate) const CAPACITY: usize = 256;
+pub(crate) const NOTIFICATION_CAPACITY: usize = 1024;
+thread_local! {
+    static SUPPRESS_NOTIFICATIONS: Cell<u32> = const { Cell::new(0) };
+}
+pub(crate) struct NotificationGuard;
+impl NotificationGuard {
+    pub(crate) fn enter() -> Self {
+        SUPPRESS_NOTIFICATIONS.set(SUPPRESS_NOTIFICATIONS.get() + 1);
+        Self
+    }
+}
+impl Drop for NotificationGuard {
+    fn drop(&mut self) {
+        SUPPRESS_NOTIFICATIONS.set(SUPPRESS_NOTIFICATIONS.get() - 1);
+    }
+}
+fn notifications_suppressed() -> bool {
+    SUPPRESS_NOTIFICATIONS.get() != 0
+}
+
 pub(crate) struct Edits {
     slots: [(AtomicU32, AtomicU64); CAPACITY],
     read: AtomicUsize,
     write: AtomicUsize,
     pub flags: AtomicU32,
+    notifications: crossbeam_queue::ArrayQueue<(u32, u8, f64)>,
+    overflow: AtomicBool,
+    // Editor edits that did not fit the processor queue, latest value per ID.
+    // Main thread only; flushed in order before newer edits are queued.
+    deferred: Mutex<Vec<(u32, f64)>>,
 }
 impl Edits {
     pub fn new() -> Self {
@@ -29,7 +55,39 @@ impl Edits {
             read: AtomicUsize::new(0),
             write: AtomicUsize::new(0),
             flags: AtomicU32::new(0),
+            notifications: crossbeam_queue::ArrayQueue::new(NOTIFICATION_CAPACITY),
+            overflow: AtomicBool::new(false),
+            deferred: Mutex::new(Vec::new()),
         }
+    }
+    /// Queues an editor edit for the processor. A burst larger than the queue
+    /// keeps each parameter's latest value for the next main-thread flush, so the
+    /// processor never stays on a value the editor already replaced.
+    fn push_edit(&self, id: u32, value: f64) {
+        let mut deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
+        if deferred.is_empty() && self.push(id, value) {
+            return;
+        }
+        match deferred.iter_mut().find(|(pending, _)| *pending == id) {
+            Some(entry) => entry.1 = value,
+            None => deferred.push((id, value)),
+        }
+    }
+    /// Moves deferred editor edits into the processor queue as space frees.
+    pub fn flush_deferred(&self) {
+        let mut deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
+        let sent = deferred
+            .iter()
+            .take_while(|(id, value)| self.push(*id, *value))
+            .count();
+        deferred.drain(..sent);
+    }
+    /// An application value supersedes an older deferred editor value.
+    pub fn forget_deferred(&self, id: u32) {
+        self.deferred
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(pending, _)| *pending != id);
     }
     pub(crate) fn push(&self, id: u32, value: f64) -> bool {
         let write = self.write.load(Ordering::Relaxed);
@@ -41,6 +99,23 @@ impl Edits {
         slot.1.store(value.to_bits(), Ordering::Relaxed);
         self.write.store(write.wrapping_add(1), Ordering::Release);
         true
+    }
+    pub fn notify(&self, id: u32, phase: u8, value: f64) {
+        if notifications_suppressed() {
+            return;
+        }
+        let edit = (id, phase, value);
+        if self.notifications.push(edit).is_err() {
+            self.overflow.store(true, Ordering::Release);
+            let _ = self.notifications.pop();
+            let _ = self.notifications.push(edit);
+        }
+    }
+    pub fn pop_notification(&self) -> Option<(u32, u8, f64)> {
+        self.notifications.pop()
+    }
+    pub fn take_overflow(&self) -> bool {
+        self.overflow.swap(false, Ordering::AcqRel)
     }
     pub fn pop(&self) -> Option<(u32, f64)> {
         let read = self.read.load(Ordering::Relaxed);
@@ -166,28 +241,27 @@ impl Class for Handler {
     type Interfaces = (IComponentHandler,);
 }
 impl IComponentHandlerTrait for Handler {
-    unsafe fn beginEdit(&self, _: u32) -> tresult {
-        self.0.flags.fetch_or(1, Ordering::Release);
+    unsafe fn beginEdit(&self, id: u32) -> tresult {
+        self.0.notify(id, 0, 0.0);
         kResultOk
     }
     unsafe fn performEdit(&self, id: u32, value: f64) -> tresult {
-        self.0.flags.fetch_or(1, Ordering::Release);
         if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+            self.0.flags.fetch_or(1, Ordering::Release);
             return kInvalidArgument;
         }
-        if self.0.push(id, value) {
-            kResultOk
-        } else {
-            // Never silently drop automation: report a fault if the bounded queue is exhausted.
-            self.0.flags.fetch_or(8, Ordering::Release);
-            kResultFalse
-        }
+        self.0.notify(id, 1, value);
+        self.0.push_edit(id, value);
+        kResultOk
     }
-    unsafe fn endEdit(&self, _: u32) -> tresult {
-        self.0.flags.fetch_or(1, Ordering::Release);
+    unsafe fn endEdit(&self, id: u32) -> tresult {
+        self.0.notify(id, 2, 0.0);
         kResultOk
     }
     unsafe fn restartComponent(&self, flags: i32) -> tresult {
+        if flags & (RestartFlags_::kParamValuesChanged | RestartFlags_::kParamTitlesChanged) != 0 {
+            self.0.flags.fetch_or(1, Ordering::Release);
+        }
         if flags & RestartFlags_::kLatencyChanged != 0 {
             self.0.flags.fetch_or(2, Ordering::Release);
         }
