@@ -636,10 +636,22 @@ mod editor_input {
                 {
                     return actual;
                 }
-                assert!(
-                    Instant::now() < deadline,
-                    "pixel {point:?}: {actual:?}, expected {expected:?}"
-                );
+                if Instant::now() >= deadline {
+                    // Name the colors the capture did contain: a blank editor, the
+                    // wrong window and a shifted layout read differently.
+                    let image = self.parent.capture();
+                    let mut counts = std::collections::HashMap::<[u8; 3], usize>::new();
+                    for pixel in image.rgba.chunks_exact(4) {
+                        *counts.entry([pixel[0], pixel[1], pixel[2]]).or_default() += 1;
+                    }
+                    let mut counts: Vec<_> = counts.into_iter().collect();
+                    counts.sort_by(|a, b| b.1.cmp(&a.1));
+                    counts.truncate(5);
+                    panic!(
+                        "pixel {point:?}: {actual:?}, expected {expected:?}; capture {}x{} top colors {counts:?}",
+                        image.width, image.height
+                    );
+                }
                 self.collect(Duration::from_millis(20));
             }
         }
