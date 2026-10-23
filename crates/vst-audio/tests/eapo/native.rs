@@ -647,49 +647,46 @@ pub fn compare(case: Case) {
             .count();
         changed >= 2
     };
-    if !saved_edit {
-        // The editor's pixels prove the drags reached it. A VST 3 edit that the
-        // host then kept out of ChunkData is the engine's side; the reverse
-        // direction below still compares the two engines.
-        assert!(
-            case.format() == PluginFormat::Vst3 && changed_pixels >= 100,
-            "EQ APO XT GUI edit did not change the plugin state ({changed_pixels} editor pixels changed)"
-        );
-        println!(
-            "METRIC {{\"case\":\"known limitation: EQ APO XT v2.60.3 does not save VST 3 editor edits\",\"plugin\":{:?},\"editor_pixels_changed\":{changed_pixels}}}",
-            case.name()
-        );
+    // The editor's pixels show whether the drags reached it; the saved line
+    // shows whether the host kept the edit. EQ APO XT up to v2.60.3 lost DPF
+    // VST 3 panel edits (EqualizerAPO-XT#437).
+    assert!(
+        changed_pixels >= 100,
+        "the drags did not reach the plugin editor ({changed_pixels} pixels changed)"
+    );
+    assert!(
+        saved_edit,
+        "EQ APO XT GUI edit did not change the saved plugin state ({changed_pixels} editor pixels changed)"
+    );
+    if let Some(chunk) = &saved.chunk {
+        restore(&forward, chunk);
     } else {
-        if let Some(chunk) = &saved.chunk {
-            restore(&forward, chunk);
-        } else {
-            for (name, value) in &saved.parameters {
-                set(&forward, &defaults, name, *value);
-            }
+        for (name, value) in &saved.parameters {
+            set(&forward, &defaults, name, *value);
         }
-        let y1 = render(&mut forward, &x);
-        let change = y0
-            .iter()
-            .flatten()
-            .zip(y1.iter().flatten())
-            .map(|(a, b)| f64::from((a - b).abs()))
-            .fold(0.0, f64::max);
-        println!(
-            "METRIC {{\"case\":{:?},\"state\":{:?},\"gui_edits\":2,\"sound_change_db\":{}}}",
-            case.name(),
-            if saved.chunk.is_some() {
-                "chunk"
-            } else {
-                "parameters"
-            },
-            db(change)
-        );
-        assert!(
-            change > 1e-3,
-            "GUI edit did not change sound by more than -60 dBFS"
-        );
-        compare_output(case, "forward", &app, &root, &x, &y1, &saved.raw);
     }
+    let y1 = render(&mut forward, &x);
+    let change = y0
+        .iter()
+        .flatten()
+        .zip(y1.iter().flatten())
+        .map(|(a, b)| f64::from((a - b).abs()))
+        .fold(0.0, f64::max);
+    println!(
+        "METRIC {{\"case\":{:?},\"state\":{:?},\"gui_edits\":2,\"sound_change_db\":{}}}",
+        case.name(),
+        if saved.chunk.is_some() {
+            "chunk"
+        } else {
+            "parameters"
+        },
+        db(change)
+    );
+    assert!(
+        change > 1e-3,
+        "GUI edit did not change sound by more than -60 dBFS"
+    );
+    compare_output(case, "forward", &app, &root, &x, &y1, &saved.raw);
     let mut reverse = spawn();
     write_all(&reverse, &parameters(&reverse), case.reverse());
     let library_line = format!("VSTPlugin: Library \"{}\"", library.display());
