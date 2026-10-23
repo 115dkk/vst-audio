@@ -96,6 +96,9 @@ unsandboxed fallback.
   existing Low-integrity writable paths are also writable, not just this policy's
   list. Its default DACL grants the user and SYSTEM, so the worker can open its
   own process and threads (elevated tokens otherwise default to Administrators).
+  Where opening the worker, the plugin or their directories as that token fails
+  (an elevated application whose files are readable only through
+  Administrators), the user receives read/execute entries, likewise not removed.
   The one-active-process job blocks children when `processes` is false.
   Inherited IPC handles retain their granted access. Native execution, GUI,
   inherited-handle behavior and ACL propagation still require Windows CI.

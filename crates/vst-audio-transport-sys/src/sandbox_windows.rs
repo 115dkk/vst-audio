@@ -13,7 +13,8 @@ use windows::{
         Foundation::*,
         Security::{Authorization::*, Isolation::*, *},
         Storage::FileSystem::{
-            DELETE, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+            DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ,
+            FILE_GENERIC_WRITE,
         },
         System::{
             SystemServices::{SE_GROUP_INTEGRITY, SECURITY_MANDATORY_LOW_RID},
@@ -89,19 +90,14 @@ impl LaunchSecurity {
                 Err(error) => return Err(error),
             };
             let sid = Sid(sid);
-            grant(exe, sid.0, false)?;
             // Sibling DLLs and plugin bundle resources need the same read/execute access.
-            if let Some(directory) = exe.parent() {
-                grant(directory, sid.0, false)?;
-            }
-            grant(&launch.plugin, sid.0, false)?;
-            if let Some(directory) = launch.plugin.parent() {
-                grant(directory, sid.0, false)?;
+            for path in executables(exe, &launch.plugin) {
+                grant(path, sid.0, false, true)?;
             }
             for path in
                 std::iter::once(temporary).chain(policy.writable.iter().map(|path| path.as_path()))
             {
-                grant(path, sid.0, true)?;
+                grant(path, sid.0, true, false)?;
                 low_label(path)?;
             }
             security.capabilities = Some(SECURITY_CAPABILITIES {
@@ -115,13 +111,75 @@ impl LaunchSecurity {
             {
                 low_label(path)?;
             }
-            security.token = Some(restricted_token()?);
+            let token = restricted_token()?;
+            // An elevated application's files may be readable only through
+            // Administrators, which this token denies. Grant the user read/execute
+            // only where opening as the worker actually fails.
+            let mut user = [0u64; 16];
+            let mut bytes = 0;
+            // SAFETY: aligned storage exceeds TOKEN_USER plus maximum SID size.
+            unsafe {
+                GetTokenInformation(
+                    raw(&token),
+                    TokenUser,
+                    Some(user.as_mut_ptr().cast()),
+                    size_of_val(&user) as u32,
+                    &mut bytes,
+                )
+            }?;
+            // SAFETY: successful TokenUser query initialized a TOKEN_USER in aligned storage.
+            let user = unsafe { &*user.as_ptr().cast::<TOKEN_USER>() }.User.Sid;
+            for path in executables(exe, &launch.plugin) {
+                if !openable(&token, path)? {
+                    grant(path, user, false, false)?;
+                    if !openable(&token, path)? {
+                        return Err(windows::core::Error::new(
+                            E_ACCESSDENIED,
+                            format!("the sandboxed worker cannot read {}", path.display()),
+                        ));
+                    }
+                }
+            }
+            security.token = Some(token);
         }
         Ok(security)
     }
 }
 
-fn grant(path: &Path, sid: PSID, writable: bool) -> windows::core::Result<()> {
+fn executables<'a>(exe: &'a Path, plugin: &'a Path) -> impl Iterator<Item = &'a Path> {
+    [Some(exe), exe.parent(), Some(plugin), plugin.parent()]
+        .into_iter()
+        .flatten()
+}
+
+/// Opens `path` for read/execute while impersonating the worker token: the
+/// file system's own decision, including deny-only groups and integrity.
+fn openable(token: &OwnedHandle, path: &Path) -> windows::core::Result<bool> {
+    use std::os::windows::fs::OpenOptionsExt;
+    let mut impersonation = HANDLE::default();
+    // SAFETY: the restricted token was created with duplicate access; output uniquely owned.
+    unsafe { DuplicateToken(raw(token), SecurityImpersonation, &mut impersonation) }?;
+    let impersonation = own(impersonation);
+    // SAFETY: impersonates on this thread only; reverted before returning.
+    unsafe { SetThreadToken(None, Some(raw(&impersonation))) }?;
+    let opened = std::fs::OpenOptions::new()
+        .access_mode(GENERIC_READ.0 | GENERIC_EXECUTE.0)
+        // Directories need backup semantics to be opened at all; without the
+        // privilege this is an ordinary access check.
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0)
+        .open(path);
+    // SAFETY: ends this thread's impersonation.
+    unsafe { RevertToSelf() }?;
+    match opened {
+        Ok(_) => Ok(true),
+        Err(error) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED.0 as i32) => Ok(false),
+        Err(error) => Err(windows::core::Error::new(E_FAIL, error.to_string())),
+    }
+}
+
+/// `packages`: an existing ALL APPLICATION PACKAGES grant already covers an
+/// AppContainer `sid`, so no entry is added.
+fn grant(path: &Path, sid: PSID, writable: bool, packages: bool) -> windows::core::Result<()> {
     let name = wide(path)?;
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
     let mut acl = std::ptr::null_mut();
@@ -147,10 +205,10 @@ fn grant(path: &Path, sid: PSID, writable: bool) -> windows::core::Result<()> {
         } else {
             0
         };
-    if !writable {
-        let mut packages = [0u32; 17];
-        let mut size = size_of_val(&packages) as u32;
-        let package_sid = PSID(packages.as_mut_ptr().cast());
+    if packages {
+        let mut storage = [0u32; 17];
+        let mut size = size_of_val(&storage) as u32;
+        let package_sid = PSID(storage.as_mut_ptr().cast());
         // SAFETY: aligned SID_MAX_SUB_AUTHORITIES-sized buffer and writable size.
         unsafe { CreateWellKnownSid(WinBuiltinAnyPackageSid, None, Some(package_sid), &mut size) }?;
         let trustee = TRUSTEE_W {
