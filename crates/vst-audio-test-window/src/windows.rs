@@ -43,10 +43,12 @@ impl Parent {
         };
         // SAFETY: static class name and callback belong to this executable.
         let _ = unsafe { RegisterClassW(&class) };
+        // Runner desktops keep console windows open over the origin. A topmost
+        // fixture stays the window that screen capture and input actually reach.
         // SAFETY: registered class, bounded test dimensions, no borrowed creation data.
         let window = unsafe {
             CreateWindowExW(
-                WINDOW_EX_STYLE(0),
+                WS_EX_TOPMOST,
                 w!("VstAudioTestParent"),
                 w!("Embedding fixture"),
                 WS_POPUP | WS_VISIBLE | WS_CLIPCHILDREN,
@@ -192,6 +194,35 @@ impl Parent {
             )
         };
         result
+    }
+    /// Describes the top-level window that owns a parent client point on screen.
+    pub fn window_at(&self, x: i32, y: i32) -> String {
+        use windows::Win32::Graphics::Gdi::ClientToScreen;
+        let mut point = POINT { x, y };
+        // SAFETY: live parent and writable client point.
+        let _ = unsafe { ClientToScreen(self.window, &mut point) };
+        // SAFETY: screen point is a value; query does not dereference caller data.
+        let hit = unsafe { WindowFromPoint(point) };
+        // SAFETY: any HWND, including null, is accepted and only queried.
+        let root = unsafe { GetAncestor(hit, GA_ROOT) };
+        let mut pid = 0;
+        // SAFETY: queried HWND and writable process-id output.
+        unsafe { GetWindowThreadProcessId(root, Some(&mut pid)) };
+        let mut class = [0u16; 128];
+        // SAFETY: writable buffer passed with its exact length.
+        let class_length = unsafe { GetClassNameW(root, &mut class) };
+        let mut title = [0u16; 128];
+        // SAFETY: writable buffer passed with its exact length.
+        let title_length = unsafe { GetWindowTextW(root, &mut title) };
+        let text = |buffer: &[u16], length: i32| {
+            String::from_utf16_lossy(&buffer[..length.clamp(0, 128) as usize])
+        };
+        format!(
+            "{root:?} (parent {}) pid {pid} class {:?} title {:?}",
+            root == self.window,
+            text(&class, class_length),
+            text(&title, title_length)
+        )
     }
     fn status(&self) -> windows::core::Result<(bool, u32, u32)> {
         let mut rect = RECT::default();

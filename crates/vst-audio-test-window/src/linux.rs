@@ -144,6 +144,29 @@ impl Parent {
             .map(|id| (id.into(), None))
             .collect()
     }
+    /// Describes the top-level window that owns a parent client point on screen.
+    pub fn window_at(&self, x: i32, y: i32) -> String {
+        let root = self
+            .connection
+            .get_geometry(self.window)
+            .unwrap()
+            .reply()
+            .unwrap()
+            .root;
+        let child = self
+            .connection
+            .translate_coordinates(
+                self.window,
+                root,
+                x.try_into().unwrap(),
+                y.try_into().unwrap(),
+            )
+            .unwrap()
+            .reply()
+            .unwrap()
+            .child;
+        format!("{child:#x} (parent {})", child == self.window)
+    }
     pub fn capture(&self) -> EditorImage {
         let geometry = self
             .connection

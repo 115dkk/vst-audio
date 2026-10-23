@@ -659,9 +659,10 @@ mod editor_input {
                     colors.sort_by_key(|entry| std::cmp::Reverse(entry.1[0]));
                     colors.truncate(6);
                     panic!(
-                        "pixel {point:?}: {actual:?}, expected {expected:?}; capture {}x{}, children {:?}, top colors (count, left, top, right, bottom) {colors:?}",
+                        "pixel {point:?}: {actual:?}, expected {expected:?}; capture {}x{}, window at point {}, children {:?}, top colors (count, left, top, right, bottom) {colors:?}",
                         image.width,
                         image.height,
+                        self.parent.window_at(point.0, point.1),
                         self.parent.children()
                     );
                 }
