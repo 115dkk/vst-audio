@@ -256,7 +256,12 @@ impl ChildProcess {
         let mut info = PROCESS_INFORMATION::default();
         let environment = sandbox.temporary().map(environment).transpose()?;
         let environment = environment.as_ref().map(|block| block.as_ptr().cast());
-        let flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT;
+        // The worker is a console program. Launched from a GUI application, which has
+        // no console, Windows would open a new console window for every instance.
+        let flags = EXTENDED_STARTUPINFO_PRESENT
+            | CREATE_SUSPENDED
+            | CREATE_UNICODE_ENVIRONMENT
+            | CREATE_NO_WINDOW;
         // SAFETY: valid terminated strings/environment and extended startup with
         // optional AppContainer capability SID; child is suspended until job assignment.
         unsafe {

@@ -7,7 +7,7 @@ from this repository. Required CI executes the implementation on Windows x64, Li
 |---|---|
 | VST2 / VST3 | Disposable scan, effects and instruments, state and native bundles; both formats execute numeric audio tests |
 | Architectures | Bounded PE, ELF and Mach-O (including universal) header inspection; `Host::with_worker` registers architecture-specific workers and native slices are preferred. CI runs the native, feature and cross-architecture tests (VST2/VST3 numeric audio, events, state and editors) with a foreign worker on four native runners: Linux x86_64 + i686, Windows x64 + i686, Windows ARM64 + x64 (emulation) and macOS arm64 + x86_64 (Rosetta) |
-| Isolation | One worker per instance; crash/hang A while parent and B keep processing |
+| Isolation | One worker per instance; crash/hang A while parent and B keep processing. Windows creates workers without a console window (`CREATE_NO_WINDOW`), so a GUI application does not open one per instance |
 | Sandbox | Opt-in, off by default, fail-closed setup: Linux Landlock + seccomp, Windows AppContainer (network capabilities only when allowed) + job, macOS Seatbelt. VST2/VST3 native probes for TCP, writes outside the allowed folders and process creation, plus audio, editor and scan, run on Linux, Windows and macOS CI runners for every policy. On Windows a network-allowed worker reaches loopback only after an administrator exempts the `vst-audio.worker.network` profile (`CheckNetIsolation LoopbackExempt`) |
 | Audio | Planar f32/f64, variable callback sizes, preallocated reblocking and explicit fallback; allocator guard covers the callback |
 | Events | Sample offsets and bus indices, MIDI channel messages and owned SysEx (up to 256 bytes); bounded 256-event packets and explicit host overflow |
@@ -165,12 +165,14 @@ and SendInput on Windows into embedded editors; they do not call plugin UI
 functions. Windows requires an interactive desktop: foreground denial, UIPI or
 a target belonging to another process fails explicitly. On the windows-2025
 runner SendInput reached the plugin windows: the EQ drags and SendNote keys
-passed in both formats. A GPU-less runner offers only the GDI OpenGL 1.1, on
-which the DPF editors draw nothing, so the Windows run places a pinned Mesa
-llvmpipe (`opengl32.dll`, `libgallium_wgl.dll`, `GALLIUM_DRIVER=llvmpipe`) beside
-each plugin binary in the external build tree, as Mesa serves Xvfb on Linux. The
-worker loads plugins with `LOAD_WITH_ALTERED_SEARCH_PATH`, so a plugin's imports
-resolve from its own folder before System32 and never from the worker's folder.
+passed in both formats. The Parameters pixel check first failed because each
+worker opened a console window over the editor; workers are now created with
+`CREATE_NO_WINDOW`. For deterministic software rendering on GPU-less runners,
+as Mesa serves Xvfb on Linux, the Windows run places a pinned Mesa llvmpipe
+(`opengl32.dll`, `libgallium_wgl.dll`, `GALLIUM_DRIVER=llvmpipe`) beside each
+plugin binary in the external build tree. The worker loads plugins with
+`LOAD_WITH_ALTERED_SEARCH_PATH`, so a plugin's imports resolve from its own
+folder before System32 and never from the worker's folder.
 macOS reports `known limitation: macOS synthetic editor input` because embedding
 is unsupported and synthetic input needs accessibility authorization. Wayland
 input is outside this test.
