@@ -28,6 +28,10 @@ PINS = {
 # LOAD_WITH_ALTERED_SEARCH_PATH, which resolves their imports from the plugin's own
 # folder before System32 and never from the worker's, so the DLLs go beside each
 # plugin binary in the external build tree.
+# Temporary: the EqualizerAPO-XT release whose engine the comparison will run.
+EAPO = ("https://github.com/115dkk/equalizerapo-xt/releases/download/v2.60.3/EqualizerAPO-XT-x64-sse2-2.60.3-x64-sse2-full.nupkg",
+        "82554fe4c1d92c4f78304972cdd80053078a87d581ef1b56d06b9555011621ae")
+
 MESA = ("https://github.com/pal1000/mesa-dist-win/releases/download/26.2.4/mesa3d-26.2.4-release-msvc.7z",
         "351fc8c8b695878ffb3eaa044b3ead08672a48b1a045e3c3e3975811df0f6695")
 
@@ -175,9 +179,27 @@ def main():
         if sys.platform == "win32":
             # Temporary discovery step for the EqualizerAPO-XT comparison; never fails.
             try:
+                import zipfile
+                url, digest = EAPO
+                package = root / "eapo.nupkg"
+                urllib.request.urlretrieve(url, package)
+                actual = hashlib.sha256(package.read_bytes()).hexdigest()
+                print(f"PROBE package digest {actual}", flush=True)
+                assert actual == digest
+                app = root / "eapo"
+                with zipfile.ZipFile(package) as archive:
+                    for member in archive.infolist():
+                        if member.filename.startswith("lib/app/") and not member.is_dir():
+                            target = app / member.filename[len("lib/app/"):]
+                            assert app in target.resolve().parents
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            target.write_bytes(archive.read(member))
+                # Windows PowerShell must not inherit pwsh's module path.
+                probe_env = {k: v for k, v in os.environ.items() if k.upper() != "PSMODULEPATH"}
                 probe = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
-                    ROOT / "tools/eapo_probe.ps1", "-Root", root / "eapo-probe", "-Vst3", paths["EQ_VST3"],
-                    "-Vst2", paths["EQ_VST2"]], capture_output=True, text=True, timeout=420)
+                    ROOT / "tools/eapo_probe.ps1", "-Root", root / "eapo-probe", "-App", app,
+                    "-Vst3", paths["EQ_VST3"], "-Vst2", paths["EQ_VST2"]],
+                    capture_output=True, text=True, timeout=420, env=probe_env)
                 print(probe.stdout[-200000:], probe.stderr[-20000:], flush=True)
             except Exception as error:
                 print(f"PROBE failed to run: {error}", flush=True)

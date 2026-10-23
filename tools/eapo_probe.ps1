@@ -3,22 +3,13 @@
 # Prints facts only; never fails the job.
 param(
     [Parameter(Mandatory)] [string] $Root,
+    [Parameter(Mandatory)] [string] $App,
     [Parameter(Mandatory)] [string] $Vst3,
     [Parameter(Mandatory)] [string] $Vst2
 )
 $ErrorActionPreference = "Continue"
-$url = "https://github.com/115dkk/equalizerapo-xt/releases/download/v2.60.3/EqualizerAPO-XT-x64-sse2-2.60.3-x64-sse2-full.nupkg"
-$digest = "82554fe4c1d92c4f78304972cdd80053078a87d581ef1b56d06b9555011621ae"
 New-Item -ItemType Directory -Force -Path $Root | Out-Null
-$zip = Join-Path $Root "eapo.zip"
-Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
-$actual = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
-Write-Host "PROBE digest $actual expected $digest"
-if ($actual -ne $digest) { return }
-$pkg = Join-Path $Root "pkg"
-Expand-Archive -LiteralPath $zip -DestinationPath $pkg -Force
-$app = Join-Path $pkg "lib\app"
-Write-Host "PROBE app files: $((Get-ChildItem $app -File | Select-Object -ExpandProperty Name) -join ', ')"
+Write-Host "PROBE app files: $((Get-ChildItem $App -File | Select-Object -ExpandProperty Name) -join ', ')"
 
 Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, System.Windows.Forms
 Add-Type @"
@@ -84,7 +75,7 @@ foreach ($case in @(@{ Name = "vst3"; Path = $Vst3 }, @{ Name = "vst2"; Path = $
     $config = Join-Path $cfg "config.txt"
     Set-Content -LiteralPath $config -Encoding UTF8 -Value "VSTPlugin: Library `"$($case.Path)`""
     Write-Host "PROBE ==== $($case.Name): $($case.Path)"
-    $editor = Start-Process -FilePath (Join-Path $app "Editor.exe") -ArgumentList "`"$config`"" -WorkingDirectory $app -PassThru
+    $editor = Start-Process -FilePath (Join-Path $App "Editor.exe") -ArgumentList "`"$config`"" -WorkingDirectory $App -PassThru
     $deadline = (Get-Date).AddSeconds(40)
     while ((Get-Date) -lt $deadline) {
         $editor.Refresh()
@@ -130,7 +121,7 @@ foreach ($case in @(@{ Name = "vst3"; Path = $Vst3 }, @{ Name = "vst2"; Path = $
     }
 
     $out = Join-Path $Root "out-$($case.Name).wav"
-    $bench = & (Join-Path $app "Benchmark.exe") --config-path $cfg -c 2 -r 48000 -l 2 -o $out --batchsize 512 --nopause -v 2>&1
+    $bench = & (Join-Path $App "Benchmark.exe") --config-path $cfg -c 2 -r 48000 -l 2 -o $out --batchsize 512 --nopause -v 2>&1
     Write-Host "PROBE benchmark exit $LASTEXITCODE"
     $bench | Select-Object -Last 40 | ForEach-Object { Write-Host "  > $_" }
 }
