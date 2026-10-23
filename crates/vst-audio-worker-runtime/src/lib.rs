@@ -3,21 +3,25 @@
 pub mod host;
 mod native;
 mod vst3;
-pub use vst_audio_protocol::{Bus, ClassInfo, PluginError, PluginFormat, layout, state};
+pub use vst_audio_protocol::{
+    Bus, BusInfo, BusKind, ClassInfo, PluginError, PluginFormat, layout, state,
+};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PluginInfo {
     pub name: String,
     pub vendor: String,
     pub latency_frames: u32,
-    pub inputs: Vec<Bus>,
-    pub outputs: Vec<Bus>,
+    pub inputs: Vec<BusInfo>,
+    pub outputs: Vec<BusInfo>,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct PluginEvents {
     pub params_changed: bool,
+    pub parameter_edits: Vec<(u32, u8, f64)>,
     pub latency_changed: Option<u32>,
     pub editor_closed: bool,
+    pub editor_resized: Option<(u32, u32)>,
     pub fault: Option<&'static str>,
 }
 
@@ -66,6 +70,12 @@ pub trait Plugin {
     fn get_state(&mut self) -> Result<Vec<u8>, PluginError>;
     fn set_state(&mut self, blob: &[u8]) -> Result<(), PluginError>;
     fn open_editor(&mut self) -> Result<(), PluginError>;
+    fn open_editor_in(
+        &mut self,
+        _parent: vst_audio_protocol::ParentWindow,
+    ) -> Result<(), PluginError> {
+        Err(PluginError("editor embedding unsupported".into()))
+    }
     fn editor_action(
         &mut self,
         _action: vst_audio_protocol::EditorAction,

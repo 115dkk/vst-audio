@@ -29,16 +29,17 @@ vst-audio-protocol = { path = "crates/vst-audio-protocol", version = "=0.1.1" }
 vst-audio-worker-sys = { path = "crates/vst-audio-worker-sys", version = "=0.1.1" }
 vst-audio-transport-sys = { path = "crates/vst-audio-transport-sys", version = "=0.1.1" }
 vst-audio-worker-runtime = { path = "crates/vst-audio-worker-runtime", version = "=0.1.1" }
-vst3 = "=0.3.0"
+vst3 = "0.3.0"
 thiserror = "2.0.21"
 clap = { version = "4.6.7", features = ["derive"] }
 assert_no_alloc = { version = "1.1.2", default-features = false }
 windows = { version = "0.62", features = [
-    "Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem",
+    "Win32_Foundation", "Win32_Globalization", "Win32_Security", "Win32_Storage_FileSystem",
+    "Win32_Security_Isolation", "Win32_Security_Authorization", "Win32_System_SystemServices",
     "Win32_System_IO", "Win32_System_Memory", "Win32_System_Threading",
     "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_LibraryLoader",
     "Win32_System_Diagnostics_Debug", "Win32_System_SystemInformation",
-    "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_Media_Audio"
+    "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_Media_Audio"
 ] }
 
 [profile.release]

@@ -110,6 +110,12 @@ impl Plugin for Vst3 {
     fn open_editor(&mut self) -> Result<(), PluginError> {
         self.inner.open_editor().map_err(error)
     }
+    fn open_editor_in(
+        &mut self,
+        parent: vst_audio_protocol::ParentWindow,
+    ) -> Result<(), PluginError> {
+        self.inner.open_editor_in(parent).map_err(error)
+    }
     fn editor_action(
         &mut self,
         action: vst_audio_protocol::EditorAction,
@@ -126,8 +132,10 @@ impl Plugin for Vst3 {
         let events = self.inner.take_events();
         PluginEvents {
             params_changed: events.params,
+            parameter_edits: events.parameter_edits,
             latency_changed: events.latency,
             editor_closed: events.closed,
+            editor_resized: events.resized,
             fault: events.fault,
         }
     }

@@ -2,7 +2,7 @@
 //! Owned kernel resources. Handles passed to a child are explicitly selected.
 use std::ffi::{OsStr, OsString};
 use std::os::windows::{
-    ffi::OsStrExt,
+    ffi::{OsStrExt, OsStringExt},
     io::{AsRawHandle, FromRawHandle, OwnedHandle},
 };
 use std::path::Path;
@@ -127,14 +127,18 @@ struct Attributes {
     list: LPPROC_THREAD_ATTRIBUTE_LIST,
 }
 impl Attributes {
-    fn new(handles: &[HANDLE]) -> windows::core::Result<Self> {
+    fn new(
+        handles: &[HANDLE],
+        capabilities: Option<&windows::Win32::Security::SECURITY_CAPABILITIES>,
+    ) -> windows::core::Result<Self> {
+        let count = 1 + u32::from(capabilities.is_some());
         let mut bytes = 0;
         // SAFETY: null list is the documented size-query call; bytes is writable.
-        let _ = unsafe { InitializeProcThreadAttributeList(None, 1, Some(0), &mut bytes) };
+        let _ = unsafe { InitializeProcThreadAttributeList(None, count, Some(0), &mut bytes) };
         let mut storage = vec![0usize; bytes.div_ceil(size_of::<usize>())];
         let list = LPPROC_THREAD_ATTRIBUTE_LIST(storage.as_mut_ptr().cast());
         // SAFETY: aligned backing storage is at least the queried size and remains live.
-        unsafe { InitializeProcThreadAttributeList(Some(list), 1, Some(0), &mut bytes) }?;
+        unsafe { InitializeProcThreadAttributeList(Some(list), count, Some(0), &mut bytes) }?;
         let attributes = Self {
             _storage: storage,
             list,
@@ -151,6 +155,23 @@ impl Attributes {
                 None,
             )
         }?;
+        if let Some(capabilities) = capabilities {
+            // SAFETY: capability struct and its SID remain live through process creation.
+            unsafe {
+                UpdateProcThreadAttribute(
+                    list,
+                    0,
+                    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
+                    Some(
+                        (capabilities as *const windows::Win32::Security::SECURITY_CAPABILITIES)
+                            .cast(),
+                    ),
+                    size_of_val(capabilities),
+                    None,
+                    None,
+                )
+            }?;
+        }
         Ok(attributes)
     }
 }
@@ -164,14 +185,19 @@ impl Drop for Attributes {
 pub fn spawn_handles(
     exe: &Path,
     args: &[OsString],
-    values: &[usize],
+    values: &[u64],
     _parent: OwnedHandle,
+    sandbox: crate::sandbox::SandboxLaunch,
 ) -> windows::core::Result<ChildProcess> {
-    let handles: Vec<HANDLE> = values
+    let handles = values
         .iter()
-        .map(|value| HANDLE(*value as *mut _))
-        .collect();
-    ChildProcess::spawn(exe, args, &handles)
+        .map(|value| {
+            usize::try_from(*value)
+                .map(|value| HANDLE(value as *mut _))
+                .map_err(|_| windows::core::Error::from_hresult(E_INVALIDARG))
+        })
+        .collect::<windows::core::Result<Vec<_>>>()?;
+    ChildProcess::spawn(exe, args, &handles, sandbox)
 }
 
 #[derive(Debug)]
@@ -179,27 +205,38 @@ pub struct ChildProcess {
     job: OwnedHandle,
     process: OwnedHandle,
     pid: u32,
+    _sandbox: crate::sandbox::SandboxLaunch,
 }
 impl ChildProcess {
-    pub fn spawn(exe: &Path, args: &[OsString], inherit: &[HANDLE]) -> windows::core::Result<Self> {
+    pub fn spawn(
+        exe: &Path,
+        args: &[OsString],
+        inherit: &[HANDLE],
+        sandbox: crate::sandbox::SandboxLaunch,
+    ) -> windows::core::Result<Self> {
+        let security = crate::sandbox::platform::LaunchSecurity::new(exe, &sandbox)?;
         let exe = wide(exe.as_os_str())?;
         let mut command = OsString::from("\"vst-audio-worker\"");
         for arg in args {
             command.push(" ");
-            // Only decimal handles and switch names are used by this protocol.
-            let text = arg.to_string_lossy();
-            if text.is_empty() || !text.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-                return Err(windows::core::Error::from_hresult(E_INVALIDARG));
-            }
-            command.push(arg);
+            // Windows CommandLineToArgvW quoting, including trailing backslashes.
+            command.push(quote_argument(arg)?);
         }
         let mut command = wide(&command)?;
-        let attributes = Attributes::new(inherit)?;
+        let attributes = Attributes::new(inherit, security.capabilities.as_ref())?;
         // SAFETY: unnamed job, no inheritable attributes.
         let job = own(unsafe { CreateJobObjectW(None, None) }?);
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         limits.BasicLimitInformation.LimitFlags =
             JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
+        if sandbox
+            .policy
+            .as_ref()
+            .is_some_and(|policy| !policy.processes)
+        {
+            limits.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+            limits.BasicLimitInformation.ActiveProcessLimit = 1;
+        }
         // SAFETY: limits matches the requested information class and byte size.
         unsafe {
             SetInformationJobObject(
@@ -217,7 +254,16 @@ impl ChildProcess {
             lpAttributeList: attributes.list,
         };
         let mut info = PROCESS_INFORMATION::default();
-        // SAFETY: valid terminated strings and extended startup; suspended until job assignment.
+        let environment = sandbox.temporary().map(environment).transpose()?;
+        let environment = environment.as_ref().map(|block| block.as_ptr().cast());
+        // The worker is a console program. Launched from a GUI application, which has
+        // no console, Windows would open a new console window for every instance.
+        let flags = EXTENDED_STARTUPINFO_PRESENT
+            | CREATE_SUSPENDED
+            | CREATE_UNICODE_ENVIRONMENT
+            | CREATE_NO_WINDOW;
+        // SAFETY: valid terminated strings/environment and extended startup with
+        // optional AppContainer capability SID; child is suspended until job assignment.
         unsafe {
             CreateProcessW(
                 PCWSTR(exe.as_ptr()),
@@ -225,8 +271,8 @@ impl ChildProcess {
                 None,
                 None,
                 true,
-                EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED,
-                None,
+                flags,
+                environment,
                 None,
                 &startup.StartupInfo,
                 &mut info,
@@ -238,6 +284,7 @@ impl ChildProcess {
             job,
             process,
             pid: info.dwProcessId,
+            _sandbox: sandbox,
         };
         // SAFETY: child is still suspended and both handles remain owned.
         let assigned = unsafe { AssignProcessToJobObject(raw(&child.job), raw(&child.process)) };
@@ -311,4 +358,63 @@ impl Drop for Mmcss {
 
 pub fn parent_value(parent: &OwnedHandle) -> usize {
     parent.as_raw_handle() as usize
+}
+
+impl Drop for ChildProcess {
+    fn drop(&mut self) {
+        let _ = self.terminate(0);
+        // Bounded: the private temporary directory can only be removed once the
+        // worker has gone, but a process stuck in a driver must not hang the app.
+        // SAFETY: owned process handle stays live until wait completes. This is off the audio thread.
+        unsafe { WaitForSingleObject(self.handle(), 5000) };
+    }
+}
+fn quote_argument(argument: &OsStr) -> windows::core::Result<OsString> {
+    let units: Vec<u16> = argument.encode_wide().collect();
+    if units.contains(&0) {
+        return Err(windows::core::Error::from_hresult(E_INVALIDARG));
+    }
+    let mut result = vec![b'"' as u16];
+    let mut slashes = 0;
+    for unit in units {
+        if unit == b'\\' as u16 {
+            slashes += 1;
+            continue;
+        }
+        result.extend(std::iter::repeat_n(
+            b'\\' as u16,
+            if unit == b'"' as u16 {
+                slashes * 2 + 1
+            } else {
+                slashes
+            },
+        ));
+        result.push(unit);
+        slashes = 0;
+    }
+    result.extend(std::iter::repeat_n(b'\\' as u16, slashes * 2));
+    result.push(b'"' as u16);
+    Ok(OsString::from_wide(&result))
+}
+fn environment(temporary: &Path) -> windows::core::Result<Vec<u16>> {
+    let mut entries: Vec<_> = std::env::vars_os()
+        .filter(|(key, _)| {
+            !["TMPDIR", "TMP", "TEMP"]
+                .iter()
+                .any(|name| key.to_string_lossy().eq_ignore_ascii_case(name))
+        })
+        .collect();
+    entries.extend(
+        ["TMPDIR", "TMP", "TEMP"]
+            .map(|key| (OsString::from(key), temporary.as_os_str().to_owned())),
+    );
+    entries.sort_by_key(|(key, _)| key.to_string_lossy().to_uppercase());
+    let mut result = Vec::new();
+    for (mut key, value) in entries {
+        key.push("=");
+        key.push(value);
+        result.extend(wide(&key)?);
+    }
+    result.push(0);
+    Ok(result)
 }

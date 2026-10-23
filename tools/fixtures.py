@@ -17,35 +17,63 @@ def copy_fresh(source, target):
     shutil.copyfile(source,staged)
     os.replace(staged,target)
 
-def target_directory():
+def target_directory(target=None):
     directory=Path(os.environ.get("CARGO_TARGET_DIR",ROOT/"target"))
-    target=os.environ.get("CARGO_BUILD_TARGET")
+    target=target or os.environ.get("CARGO_BUILD_TARGET")
     return directory/target if target else directory
 
-def prepare():
-    subprocess.run(["cargo", "build", "--locked", "-p", "vst-audio-worker",
-                    "-p", "vst-audio-testplugin", "-p", "vst-audio-test-advanced"], cwd=ROOT, check=True)
-    directory = target_directory() / "debug"
-    suffix = ".exe" if sys.platform == "win32" else ""
+def target_platform(target=None):
+    if target is None:
+        return sys.platform
+    if "windows" in target:
+        return "win32"
+    if "apple-darwin" in target:
+        return "darwin"
+    if "linux" in target:
+        return "linux"
+    raise ValueError(f"unsupported fixture target: {target}")
+
+def bundle_folder(target=None):
+    if target:
+        return {
+            "i686-pc-windows-msvc": "x86-win",
+            "x86_64-pc-windows-msvc": "x86_64-win",
+            "aarch64-pc-windows-msvc": "arm64-win",
+            "i686-unknown-linux-gnu": "i386-linux",
+            "x86_64-unknown-linux-gnu": "x86_64-linux",
+            "aarch64-unknown-linux-gnu": "aarch64-linux",
+        }[target]
+    if sys.platform == "win32":
+        return "x86_64-win"
+    arch = "aarch64" if platform.machine() in ("aarch64", "arm64") else "x86_64"
+    return f"{arch}-linux"
+
+def prepare(target=None):
+    command = ["cargo", "build", "--locked"]
+    if target:
+        command += ["--target", target]
+    subprocess.run(command + ["-p", "vst-audio-worker", "-p", "vst-audio-testplugin",
+                             "-p", "vst-audio-test-advanced"], cwd=ROOT, check=True)
+    directory = target_directory(target) / "debug"
+    os_platform = target_platform(target)
+    suffix = ".exe" if os_platform == "win32" else ""
     source = directory / {
         "win32": "vst_audio_testplugin.dll",
         "darwin": "libvst_audio_testplugin.dylib",
-    }.get(sys.platform, "libvst_audio_testplugin.so")
+    }.get(os_platform, "libvst_audio_testplugin.so")
     worker = directory / ("vst-audio-worker" + suffix)
     if not source.is_file() or not worker.is_file():
         raise RuntimeError("native worker or fixture missing")
     bundle = directory / "native-fixtures" / "Matrix.vst3"
-    if sys.platform == "darwin":
-        target = bundle / "Contents" / "MacOS" / "Matrix"
-    elif sys.platform == "win32":
-        target = bundle / "Contents" / "x86_64-win" / "Matrix.vst3"
+    if os_platform == "darwin":
+        binary = bundle / "Contents" / "MacOS" / "Matrix"
     else:
-        arch = "aarch64" if platform.machine() in ("aarch64", "arm64") else "x86_64"
-        target = bundle / "Contents" / f"{arch}-linux" / "Matrix.so"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    copy_fresh(source, target)
+        name = "Matrix.vst3" if os_platform == "win32" else "Matrix.so"
+        binary = bundle / "Contents" / bundle_folder(target) / name
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    copy_fresh(source, binary)
     vst2 = source
-    if sys.platform == "darwin":
+    if os_platform == "darwin":
         info = {
             "CFBundleExecutable": "Matrix", "CFBundleIdentifier": "org.vst-audio.fixture",
             "CFBundlePackageType": "BNDL", "CFBundleVersion": "1",
@@ -60,18 +88,18 @@ def prepare():
         subprocess.run(["codesign", "--force", "--sign", "-", str(vst2)], check=True)
     advanced_source=directory / source.name.replace("testplugin","test_advanced")
     advanced_bundle=directory / "native-fixtures" / "Advanced.vst3"
-    advanced_target=advanced_bundle / target.relative_to(bundle)
+    advanced_target=advanced_bundle / binary.relative_to(bundle)
     # Platform executable names must match their own bundle names.
     advanced_target=advanced_target.with_name(advanced_target.name.replace("Matrix","Advanced"))
     advanced_target.parent.mkdir(parents=True,exist_ok=True)
     copy_fresh(advanced_source,advanced_target)
-    if sys.platform=="darwin":
+    if os_platform=="darwin":
         advanced_info=dict(info,CFBundleExecutable="Advanced",CFBundleIdentifier="org.vst-audio.advanced")
         (advanced_bundle/"Contents"/"Info.plist").write_bytes(plistlib.dumps(advanced_info))
         subprocess.run(["codesign","--force","--sign","-",str(advanced_bundle)],check=True)
     return worker, vst2, bundle
 
-def advanced_paths():
-    directory=target_directory()/"debug"
-    source=directory/{"win32":"vst_audio_test_advanced.dll","darwin":"libvst_audio_test_advanced.dylib"}.get(sys.platform,"libvst_audio_test_advanced.so")
+def advanced_paths(target=None):
+    directory=target_directory(target)/"debug"
+    source=directory/{"win32":"vst_audio_test_advanced.dll","darwin":"libvst_audio_test_advanced.dylib"}.get(target_platform(target),"libvst_audio_test_advanced.so")
     return source,directory/"native-fixtures"/"Advanced.vst3"

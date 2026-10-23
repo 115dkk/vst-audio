@@ -24,7 +24,7 @@ jobs:
       matrix:
         os: [windows-2025, ubuntu-24.04, macos-15, macos-15-intel]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 25
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -37,9 +37,11 @@ jobs:
           rustc -vV
           echo "ImageOS=$ImageOS ImageVersion=$ImageVersion"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
-      - name: Linux display server
+      - name: Linux display servers
         if: runner.os == 'Linux'
-        run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update -qq && sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y xvfb xauth
+        # weston and xwayland run the native Wayland editor tests under a
+        # headless compositor, with and without an X server for Auto fallback.
+        run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update -qq && sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y xvfb xauth weston xwayland
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo test --locked --workspace
@@ -54,6 +56,9 @@ jobs:
       - name: Native worker and editor (Linux X11)
         if: runner.os == 'Linux'
         run: xvfb-run -a python3 tools/native_tests.py
+      - name: Native editor (Linux Wayland)
+        if: runner.os == 'Linux'
+        run: python3 tools/wayland_tests.py
       - name: Fresh consumer of packaged crates and worker
         run: python tools/package_check.py
       - name: Release worker archive and execution (Windows, macOS)
@@ -123,6 +128,60 @@ jobs:
           path: test-results/
           if-no-files-found: warn
 
+  # A host-architecture test process drives a worker and fixtures built for
+  # another architecture: 32-bit plugins on 64-bit Windows (WoW64) and Linux
+  # (multilib), x86-64 plugins on Apple Silicon (Rosetta) and on ARM64 Windows
+  # (emulation).
+  cross:
+    name: cross-architecture worker (${{ matrix.os }}, ${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2025
+            target: i686-pc-windows-msvc
+          - os: ubuntu-24.04
+            target: i686-unknown-linux-gnu
+          - os: macos-15
+            target: x86_64-apple-darwin
+          - os: windows-11-arm
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Toolchain and the worker's target
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          rustup toolchain install
+          rustup target add "$TARGET"
+          rustup show
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          shared-key: cross-${{ matrix.target }}
+      - name: Linux display server and 32-bit C runtime
+        if: runner.os == 'Linux'
+        run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update -qq && sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y xvfb xauth gcc-multilib
+      - name: Rosetta
+        if: runner.os == 'macOS'
+        run: arch -x86_64 /usr/bin/true 2>/dev/null || sudo softwareupdate --install-rosetta --agree-to-license
+      - name: Cross-architecture worker and fixtures (Windows, macOS)
+        if: runner.os != 'Linux'
+        run: python tools/cross_arch_tests.py ${{ matrix.target }}
+      - name: Cross-architecture worker and fixtures (Linux X11)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a python3 tools/cross_arch_tests.py ${{ matrix.target }}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: failure()
+        with:
+          name: cross-diagnostics-${{ matrix.os }}-${{ matrix.target }}
+          path: test-results/
+          if-no-files-found: ignore
+
   independent:
     name: independent plugins (${{ matrix.os }})
     strategy:
@@ -130,7 +189,7 @@ jobs:
       matrix:
         os: [windows-2025, ubuntu-24.04, macos-15, macos-15-intel]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 25
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -141,9 +200,15 @@ jobs:
         with:
           shared-key: independent
       - if: runner.os == 'Linux'
-        run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update -qq && sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y cmake build-essential pkg-config libx11-dev
-      - name: Build pinned upstreams and assert MIDI, DSP and negotiation
+        # DPF editors need X11 and OpenGL to build; Xvfb with Mesa runs them
+        # and its XTEST extension delivers the synthetic mouse input.
+        run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update -qq && sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y cmake build-essential pkg-config libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxinerama-dev libgl1-mesa-dev libglu1-mesa-dev libgl1-mesa-dri xvfb xauth
+      - name: Build pinned upstreams; assert MIDI, DSP, negotiation and real editor input (Windows, macOS)
+        if: runner.os != 'Linux'
         run: python tools/third_party.py
+      - name: Build pinned upstreams; assert MIDI, DSP, negotiation and real editor input (Linux X11)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a -s "-screen 0 1280x800x24" python3 tools/third_party.py
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
@@ -152,6 +217,7 @@ jobs:
           path: |
             test-results/third-party/summary.json
             test-results/third-party/checks.log
+            test-results/third-party/mutation.log
           if-no-files-found: error
 
   extended:

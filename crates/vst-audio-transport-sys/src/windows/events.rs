@@ -27,7 +27,10 @@ impl Event {
         let handle = unsafe { OwnedHandle::from_raw_handle(handle.0) };
         Ok(Self { handle, peer: None })
     }
-    pub fn open(value: usize) -> windows::core::Result<Self> {
+    pub fn open(value: u64) -> windows::core::Result<Self> {
+        let value = usize::try_from(value).map_err(|_| {
+            windows::core::Error::from_hresult(windows::Win32::Foundation::E_INVALIDARG)
+        })?;
         Ok(Self {
             handle: crate::runtime::duplicate_value(value, false)?,
             peer: None,
@@ -37,8 +40,8 @@ impl Event {
         self.peer = Some(peer);
         self
     }
-    pub fn handle_value(&self) -> usize {
-        self.handle.as_raw_handle() as usize
+    pub fn handle_value(&self) -> u64 {
+        self.handle.as_raw_handle() as usize as u64
     }
 }
 impl Signal for Event {

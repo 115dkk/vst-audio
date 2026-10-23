@@ -25,6 +25,20 @@ target dependency graph and excludes dev dependencies. If a crate omitted its
 license text, the packager retrieves it from the exact Git commit recorded in
 that crate's `.cargo_vcs_info.json`; the source URL and hash are recorded.
 
+## Architecture-specific workers
+
+Build each additional worker with `cargo build --locked --release --target
+<Rust target> -p vst-audio-worker` and ship it beside the native worker. Executable
+names are arbitrary: pass the native executable to `Host::new`, then register
+additional paths with `Host::with_worker(Architecture::X86, worker_path)` (or
+`X86_64` / `Aarch64`). Selection reads plugin headers and prefers a native slice;
+recovery reuses the originally selected executable. Registration does not install
+OS compatibility support. Linux x86 workers need 32-bit runtime libraries;
+macOS x86_64 workers on Apple Silicon require Rosetta. Build a thin executable
+for each registered architecture so the OS launches the intended architecture.
+Package each macOS worker in its own helper bundle and sign every helper before
+signing the containing application; the signing requirements below apply to each.
+
 ## macOS signing
 
 CI bundles use an ad-hoc hardened-runtime signature. This validates the helper

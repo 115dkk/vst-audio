@@ -10,7 +10,9 @@ use std::time::Duration;
 pub mod editor;
 pub mod layout;
 pub mod processing;
-pub use editor::{EditorAction, EditorImage, EditorReply, EditorStatus};
+pub use editor::{
+    EditorAction, EditorImage, EditorPlatform, EditorReply, EditorStatus, ParentWindow,
+};
 pub use processing::{BusConfiguration, Capabilities, ProcessingSetup, SampleFormat};
 pub mod state;
 #[derive(Clone, Debug, thiserror::Error)]
@@ -18,7 +20,7 @@ pub mod state;
 pub struct PluginError(pub String);
 
 pub const MAGIC: [u8; 4] = *b"SSRP";
-pub const PROTOCOL_MAJOR: u16 = 3;
+pub const PROTOCOL_MAJOR: u16 = 4;
 pub const PROTOCOL_MINOR: u16 = 0;
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 pub const MAX_STATE_BYTES: usize = 64 * 1024 * 1024;
@@ -38,6 +40,34 @@ pub enum PluginFormat {
 pub struct Bus {
     pub channels: u16,
     pub arrangement: u64,
+}
+
+/// What a declared audio bus is for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BusKind {
+    Main,
+    /// Sidechain inputs and auxiliary outputs.
+    Aux,
+}
+
+/// A bus as the plugin declares it, before any is activated.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BusInfo {
+    pub layout: Bus,
+    pub kind: BusKind,
+    /// The plugin's own name for the bus; may be empty.
+    pub name: String,
+    /// The plugin asks for this bus to be active unless the host decides otherwise.
+    pub default_active: bool,
+}
+
+impl BusInfo {
+    pub fn configuration(&self, active: bool) -> BusConfiguration {
+        BusConfiguration {
+            layout: self.layout.clone(),
+            active,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -61,8 +91,19 @@ pub struct Parameter {
     pub hidden: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EditPhase {
+    Begin,
+    Perform,
+    End,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Message {
+    /// Sent before Hello only when an OS sandbox was requested and installed.
+    Sandboxed {
+        mechanism: String,
+    },
     Hello {
         magic: [u8; 4],
         major: u16,
@@ -91,6 +132,9 @@ pub enum Message {
     },
     GetState,
     OpenEditor,
+    OpenEditorIn {
+        parent: ParentWindow,
+    },
     CloseEditor,
     ListParameters {
         start: u32,
@@ -116,8 +160,8 @@ pub enum Message {
         name: String,
         vendor: String,
         latency_frames: u32,
-        inputs: Vec<Bus>,
-        outputs: Vec<Bus>,
+        inputs: Vec<BusInfo>,
+        outputs: Vec<BusInfo>,
     },
     Classes {
         entries: Vec<ClassInfo>,
@@ -138,6 +182,15 @@ pub enum Message {
     Ack,
     /// The editor window was closed by the user.
     EditorClosed,
+    EditorResized {
+        width: u32,
+        height: u32,
+    },
+    ParameterEdit {
+        id: u32,
+        phase: EditPhase,
+        value: f64,
+    },
 }
 
 impl Message {
@@ -149,8 +202,10 @@ impl Message {
         }
     }
 
-    fn kind(&self) -> u16 {
+    /// The wire kind number, for diagnostics.
+    pub fn kind(&self) -> u16 {
         match self {
+            Self::Sandboxed { .. } => 29,
             Self::Hello { .. } => 1,
             Self::Load { .. } => 2,
             Self::Configure { .. } => 3,
@@ -164,6 +219,7 @@ impl Message {
             Self::SetState { .. } => 5,
             Self::GetState => 6,
             Self::OpenEditor => 7,
+            Self::OpenEditorIn { .. } => 30,
             Self::CloseEditor => 18,
             Self::ListParameters { .. } => 19,
             Self::Parameters { .. } => 20,
@@ -179,6 +235,8 @@ impl Message {
             Self::Fault { .. } => 15,
             Self::Ack => 16,
             Self::EditorClosed => 17,
+            Self::EditorResized { .. } => 31,
+            Self::ParameterEdit { .. } => 32,
         }
     }
 }
@@ -347,6 +405,7 @@ fn decode_parts(meta: &[u8], body: &[u8]) -> Result<DecodedFrame, CodecError> {
 
 fn encode_message(message: &Message, out: &mut Vec<u8>) -> Result<(), CodecError> {
     match message {
+        Message::Sandboxed { mechanism } => put_string(out, mechanism)?,
         Message::Hello {
             magic,
             major,
@@ -400,8 +459,8 @@ fn encode_message(message: &Message, out: &mut Vec<u8>) -> Result<(), CodecError
             put_string(out, name)?;
             put_string(out, vendor)?;
             put_u32(out, *latency_frames);
-            put_buses(out, inputs)?;
-            put_buses(out, outputs)?;
+            put_bus_infos(out, inputs)?;
+            put_bus_infos(out, outputs)?;
         }
         Message::Classes { entries } => {
             put_u16(
@@ -416,6 +475,13 @@ fn encode_message(message: &Message, out: &mut Vec<u8>) -> Result<(), CodecError
             }
         }
         Message::LatencyChanged { frames } => put_u32(out, *frames),
+        Message::EditorResized { width, height } => {
+            if !(1..=8192).contains(width) || !(1..=8192).contains(height) {
+                return Err(CodecError::InvalidValue);
+            }
+            put_u32(out, *width);
+            put_u32(out, *height);
+        }
         Message::Editor(action) => match action {
             EditorAction::Show => out.push(0),
             EditorAction::Hide => out.push(1),
@@ -432,8 +498,18 @@ fn encode_message(message: &Message, out: &mut Vec<u8>) -> Result<(), CodecError
             EditorAction::Inspect => out.push(5),
             EditorAction::Capture => out.push(6),
         },
+        Message::OpenEditorIn { parent } => {
+            let (tag, handle) = match parent {
+                ParentWindow::Win32 { hwnd } => (0, hwnd),
+                ParentWindow::X11 { window } => (1, window),
+            };
+            out.push(tag);
+            put_u64(out, *handle);
+        }
         Message::EditorStatus(status) => {
+            out.push(status.platform as u8);
             out.push(u8::from(status.visible));
+            out.push(u8::from(status.embedded));
             put_u32(out, status.width);
             put_u32(out, status.height);
             put_u32(out, status.scale.to_bits());
@@ -485,6 +561,18 @@ fn encode_message(message: &Message, out: &mut Vec<u8>) -> Result<(), CodecError
                 return Err(CodecError::InvalidValue);
             }
             put_u32(out, *id);
+            put_u64(out, value.to_bits());
+        }
+        Message::ParameterEdit { id, phase, value } => {
+            if !value.is_finite() || !(0.0..=1.0).contains(value) {
+                return Err(CodecError::InvalidValue);
+            }
+            put_u32(out, *id);
+            out.push(match phase {
+                EditPhase::Begin => 0,
+                EditPhase::Perform => 1,
+                EditPhase::End => 2,
+            });
             put_u64(out, value.to_bits());
         }
         Message::Parameters { total, entries } => {
@@ -543,6 +631,9 @@ fn decode_message(kind: u16, body: &[u8]) -> Result<Option<Message>, CodecError>
                 minor,
             }
         }
+        29 => Message::Sandboxed {
+            mechanism: cursor.string()?,
+        },
         2 => {
             let path = cursor.string()?;
             let format = match cursor.u16()? {
@@ -581,8 +672,8 @@ fn decode_message(kind: u16, body: &[u8]) -> Result<Option<Message>, CodecError>
             name: cursor.string()?,
             vendor: cursor.string()?,
             latency_frames: cursor.u32()?,
-            inputs: cursor.buses()?,
-            outputs: cursor.buses()?,
+            inputs: cursor.bus_infos()?,
+            outputs: cursor.bus_infos()?,
         },
         11 => {
             let count = cursor.u16()? as usize;
@@ -610,6 +701,14 @@ fn decode_message(kind: u16, body: &[u8]) -> Result<Option<Message>, CodecError>
         },
         16 => Message::Ack,
         17 => Message::EditorClosed,
+        31 => {
+            let width = cursor.u32()?;
+            let height = cursor.u32()?;
+            if !(1..=8192).contains(&width) || !(1..=8192).contains(&height) {
+                return Err(CodecError::InvalidValue);
+            }
+            Message::EditorResized { width, height }
+        }
         18 => Message::CloseEditor,
         26 => Message::Editor(match cursor.u8()? {
             0 => EditorAction::Show,
@@ -624,8 +723,27 @@ fn decode_message(kind: u16, body: &[u8]) -> Result<Option<Message>, CodecError>
             6 => EditorAction::Capture,
             _ => return Err(CodecError::InvalidValue),
         }),
+        30 => Message::OpenEditorIn {
+            parent: match cursor.u8()? {
+                0 => ParentWindow::Win32 {
+                    hwnd: cursor.u64()?,
+                },
+                1 => ParentWindow::X11 {
+                    window: cursor.u64()?,
+                },
+                _ => return Err(CodecError::InvalidValue),
+            },
+        },
         27 => Message::EditorStatus(EditorStatus {
+            platform: match cursor.u8()? {
+                0 => EditorPlatform::Win32,
+                1 => EditorPlatform::Cocoa,
+                2 => EditorPlatform::X11,
+                3 => EditorPlatform::Wayland,
+                _ => return Err(CodecError::InvalidValue),
+            },
             visible: cursor.boolean()?,
+            embedded: cursor.boolean()?,
             width: cursor.u32()?,
             height: cursor.u32()?,
             scale: f32::from_bits(cursor.u32()?),
@@ -757,6 +875,16 @@ fn decode_message(kind: u16, body: &[u8]) -> Result<Option<Message>, CodecError>
             code: cursor.u32()?,
             text: cursor.string()?,
         },
+        32 => Message::ParameterEdit {
+            id: cursor.u32()?,
+            phase: match cursor.u8()? {
+                0 => EditPhase::Begin,
+                1 => EditPhase::Perform,
+                2 => EditPhase::End,
+                _ => return Err(CodecError::InvalidValue),
+            },
+            value: cursor.normalized()?,
+        },
         _ => return Ok(None),
     };
     if !matches!(kind, 5 | 13) && cursor.remaining() != 0 {
@@ -784,14 +912,20 @@ fn put_string(out: &mut Vec<u8>, value: &str) -> Result<(), CodecError> {
     Ok(())
 }
 
-fn put_buses(out: &mut Vec<u8>, buses: &[Bus]) -> Result<(), CodecError> {
+fn put_bus_infos(out: &mut Vec<u8>, buses: &[BusInfo]) -> Result<(), CodecError> {
     put_u16(
         out,
         u16::try_from(buses.len()).map_err(|_| CodecError::InvalidValue)?,
     );
     for bus in buses {
-        put_u16(out, bus.channels);
-        put_u64(out, bus.arrangement);
+        put_u16(out, bus.layout.channels);
+        put_u64(out, bus.layout.arrangement);
+        out.push(match bus.kind {
+            BusKind::Main => 0,
+            BusKind::Aux => 1,
+        });
+        out.push(u8::from(bus.default_active));
+        put_string(out, &bus.name)?;
     }
     Ok(())
 }
@@ -857,13 +991,28 @@ impl<'a> Cursor<'a> {
         }
         String::from_utf8(self.take(length)?.to_vec()).map_err(|_| CodecError::InvalidUtf8)
     }
-    fn buses(&mut self) -> Result<Vec<Bus>, CodecError> {
+    fn bus_infos(&mut self) -> Result<Vec<BusInfo>, CodecError> {
         let count = self.u16()? as usize;
         let mut buses = Vec::with_capacity(count);
         for _ in 0..count {
-            buses.push(Bus {
+            let layout = Bus {
                 channels: self.u16()?,
                 arrangement: self.u64()?,
+            };
+            let kind = match self.u8()? {
+                0 => BusKind::Main,
+                1 => BusKind::Aux,
+                _ => return Err(CodecError::InvalidValue),
+            };
+            let flags = self.u8()?;
+            if flags & !1 != 0 {
+                return Err(CodecError::InvalidValue);
+            }
+            buses.push(BusInfo {
+                layout,
+                kind,
+                name: self.string()?,
+                default_active: flags & 1 != 0,
             });
         }
         Ok(buses)

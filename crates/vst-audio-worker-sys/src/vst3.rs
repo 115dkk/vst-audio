@@ -9,7 +9,7 @@ use crate::{
     editor::EditorWindow,
     library::Library,
     plugin::PluginError,
-    vst3_support::{Changes, Edits, Frame, Handler, Host, Stream},
+    vst3_support::{Changes, Edits, Frame, Handler, Host, NotificationGuard, Stream},
 };
 use std::{
     ffi::{c_char, c_void},
@@ -53,14 +53,16 @@ pub struct Info {
     pub inputs: u16,
     pub outputs: u16,
     pub latency: u32,
-    pub input_buses: Vec<vst_audio_protocol::Bus>,
-    pub output_buses: Vec<vst_audio_protocol::Bus>,
+    pub input_buses: Vec<vst_audio_protocol::BusInfo>,
+    pub output_buses: Vec<vst_audio_protocol::BusInfo>,
 }
 #[derive(Debug, Default)]
 pub struct Events {
     pub params: bool,
+    pub parameter_edits: Vec<(u32, u8, f64)>,
     pub latency: Option<u32>,
     pub closed: bool,
+    pub resized: Option<(u32, u32)>,
     pub fault: Option<&'static str>,
 }
 struct ModuleLibrary {
@@ -85,6 +87,8 @@ pub struct Vst3Module {
     host: ComPtr<FUnknown>,
     #[cfg(target_os = "linux")]
     run_loop: Rc<crate::linux_runloop::RunLoop>,
+    #[cfg(target_os = "linux")]
+    wayland: Rc<crate::wayland_editor::WaylandHost>,
     library: Arc<ModuleLibrary>,
 }
 impl std::fmt::Debug for Vst3Module {
@@ -107,8 +111,12 @@ fn binary(path: &Path) -> Result<PathBuf, PluginError> {
             .ok_or_else(|| PluginError("invalid VST3 bundle".into()))?;
         #[cfg(all(windows, target_arch = "aarch64"))]
         let architectures = ["arm64-win", "arm64ec-win"];
-        #[cfg(all(windows, not(target_arch = "aarch64")))]
+        #[cfg(all(windows, target_arch = "x86_64"))]
         let architectures = ["x86_64-win"];
+        #[cfg(all(windows, target_arch = "x86"))]
+        let architectures = ["x86-win"];
+        #[cfg(all(target_os = "linux", target_arch = "x86"))]
+        let architectures = ["i386-linux"];
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         let architectures = ["x86_64-linux"];
         #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
@@ -183,9 +191,9 @@ impl Vst3Module {
         let host_object = Host::new();
         #[cfg(target_os = "linux")]
         let run_loop = host_object.run_loop.clone();
-        let host = ComWrapper::new(host_object)
-            .to_com_ptr::<FUnknown>()
-            .expect("host interface");
+        #[cfg(target_os = "linux")]
+        let wayland = host_object.wayland.clone();
+        let host = host_object.wrap();
         if let Some(factory3) = factory.cast::<IPluginFactory3>() {
             // SAFETY: main thread, live factory and retained host context.
             let _ = unsafe { factory3.setHostContext(host.as_ptr()) };
@@ -195,6 +203,8 @@ impl Vst3Module {
             host,
             #[cfg(target_os = "linux")]
             run_loop,
+            #[cfg(target_os = "linux")]
+            wayland,
             library,
         })
     }
@@ -287,6 +297,8 @@ impl Shared {
 }
 struct Editor {
     scale: f32,
+    #[cfg(target_os = "linux")]
+    output_scale: f32,
     view: ComPtr<IPlugView>,
     _frame: ComPtr<IPlugFrame>,
     window: Rc<EditorWindow>,
@@ -299,6 +311,11 @@ impl Drop for Editor {
         let _ = unsafe { self.view.setFrame(std::ptr::null_mut()) };
     }
 }
+#[cfg(target_os = "linux")]
+struct HiddenWaylandEditor {
+    status: vst_audio_protocol::EditorStatus,
+    closed: std::cell::Cell<bool>,
+}
 pub struct Vst3Plugin {
     controller: Option<ComPtr<IEditController>>,
     separate: bool,
@@ -306,6 +323,8 @@ pub struct Vst3Plugin {
     controller_initialized: bool,
     connection: Option<(ComPtr<IConnectionPoint>, ComPtr<IConnectionPoint>)>,
     editor: Option<Editor>,
+    #[cfg(target_os = "linux")]
+    hidden_wayland: Option<HiddenWaylandEditor>,
     handler: ComPtr<IComponentHandler>,
     shared: Arc<Shared>,
     // Child interfaces must be released before the component (DPF enforces this).
@@ -313,6 +332,7 @@ pub struct Vst3Plugin {
     info: Info,
     module: Vst3Module,
     closed_editor: bool,
+    editor_size: Option<(u32, u32)>,
     processor_taken: bool,
     max_frames: usize,
     setup: Option<vst_audio_protocol::ProcessingSetup>,
@@ -359,6 +379,8 @@ impl Vst3Plugin {
             controller_initialized: false,
             connection: None,
             editor: None,
+            #[cfg(target_os = "linux")]
+            hidden_wayland: None,
             handler,
             shared,
             info: Info {
@@ -373,6 +395,7 @@ impl Vst3Plugin {
             },
             module,
             closed_editor: false,
+            editor_size: None,
             processor_taken: false,
             max_frames: 0,
             setup: None,
@@ -460,7 +483,7 @@ impl Vst3Plugin {
         plugin.info.latency = unsafe { plugin.shared.processor.getLatencySamples() };
         Ok(plugin)
     }
-    fn buses(&self, direction: i32) -> Result<Vec<vst_audio_protocol::Bus>, PluginError> {
+    fn buses(&self, direction: i32) -> Result<Vec<vst_audio_protocol::BusInfo>, PluginError> {
         // SAFETY: initialized component queried on its owning thread.
         let count = unsafe { self.component.getBusCount(0, direction) };
         if !(0..=32).contains(&count) {
@@ -498,9 +521,33 @@ impl Vst3Plugin {
                     "bus arrangement disagrees with channel count".into(),
                 ));
             }
-            buses.push(vst_audio_protocol::Bus {
-                channels: info.channelCount as u16,
-                arrangement,
+            let mut name = String::from_utf16_lossy(
+                &info.name[..info
+                    .name
+                    .iter()
+                    .position(|unit| *unit == 0)
+                    .unwrap_or(info.name.len())],
+            );
+            if name.len() > 128 {
+                let mut end = 128;
+                while !name.is_char_boundary(end) {
+                    end -= 1;
+                }
+                name.truncate(end);
+            }
+            buses.push(vst_audio_protocol::BusInfo {
+                layout: vst_audio_protocol::Bus {
+                    channels: info.channelCount as u16,
+                    arrangement,
+                },
+                kind: if info.busType == BusTypes_::kMain as i32 {
+                    vst_audio_protocol::BusKind::Main
+                } else {
+                    vst_audio_protocol::BusKind::Aux
+                },
+                name,
+                default_active: (info.flags as i64) & (BusInfo_::BusFlags_::kDefaultActive as i64)
+                    != 0,
             });
         }
         Ok(buses)
@@ -508,10 +555,28 @@ impl Vst3Plugin {
     fn refresh_buses(&mut self) -> Result<(), PluginError> {
         self.info.input_buses = self.buses(0)?;
         self.info.output_buses = self.buses(1)?;
-        self.info.inputs = self.info.input_buses.iter().map(|b| b.channels).sum();
-        self.info.outputs = self.info.output_buses.iter().map(|b| b.channels).sum();
-        self.info.input = self.info.input_buses.first().map_or(0, |b| b.arrangement);
-        self.info.output = self.info.output_buses.first().map_or(0, |b| b.arrangement);
+        self.info.inputs = self
+            .info
+            .input_buses
+            .iter()
+            .map(|b| b.layout.channels)
+            .sum();
+        self.info.outputs = self
+            .info
+            .output_buses
+            .iter()
+            .map(|b| b.layout.channels)
+            .sum();
+        self.info.input = self
+            .info
+            .input_buses
+            .first()
+            .map_or(0, |b| b.layout.arrangement);
+        self.info.output = self
+            .info
+            .output_buses
+            .first()
+            .map_or(0, |b| b.layout.arrangement);
         Ok(())
     }
     pub fn capabilities(&self) -> vst_audio_protocol::Capabilities {
@@ -539,15 +604,13 @@ impl Vst3Plugin {
                 .info
                 .input_buses
                 .iter()
-                .cloned()
-                .map(Into::into)
+                .map(|bus| bus.configuration(true))
                 .collect(),
             outputs: self
                 .info
                 .output_buses
                 .iter()
-                .cloned()
-                .map(Into::into)
+                .map(|bus| bus.configuration(true))
                 .collect(),
         })
     }
@@ -590,9 +653,9 @@ impl Vst3Plugin {
             .zip(&self.info.input_buses)
             .chain(configuration.outputs.iter().zip(&self.info.output_buses))
         {
-            if requested.layout.channels != actual.channels
+            if requested.layout.channels != actual.layout.channels
                 || (requested.layout.arrangement != 0
-                    && requested.layout.arrangement != actual.arrangement)
+                    && requested.layout.arrangement != actual.layout.arrangement)
             {
                 return Err(PluginError("plugin rejected bus arrangement".into()));
             }
@@ -855,11 +918,13 @@ impl Vst3Plugin {
             .controller
             .as_ref()
             .ok_or_else(|| PluginError("no controller".into()))?;
+        let _notifications = NotificationGuard::enter();
         check(
             // SAFETY: main-thread live controller, validated ID and normalized value.
             unsafe { controller.setParamNormalized(id, value) },
             "setParamNormalized",
         )?;
+        self.shared.edits.forget_deferred(id);
         if !self.shared.edits.push(id, value) {
             return Err(PluginError("parameter queue full".into()));
         }
@@ -887,15 +952,21 @@ impl Vst3Plugin {
                 check(result, "controller getState")?;
             }
         }
-        let result = (
-            component.0.borrow().snapshot(),
-            controller.0.borrow().snapshot(),
-        );
-        Ok(result)
+        let snapshot = |stream: &Stream| -> Result<Vec<u8>, PluginError> {
+            stream
+                .0
+                .try_lock()
+                .map_err(|_| PluginError("plugin state stream is still in use".into()))?
+                .try_snapshot()
+                .map_err(|_| PluginError("out of memory for plugin state".into()))
+        };
+        Ok((snapshot(&component)?, snapshot(&controller)?))
     }
     pub fn set_state(&mut self, component: &[u8], controller: &[u8]) -> Result<(), PluginError> {
         let _control = self.shared.control();
-        let stream = Stream::new(component.to_vec());
+        let _notifications = NotificationGuard::enter();
+        let stream = Stream::try_from_slice(component)
+            .map_err(|_| PluginError("out of memory for plugin state".into()))?;
         let pointer = stream.to_com_ptr::<IBStream>().expect("stream interface");
         check(
             // SAFETY: main thread, admitted processing excluded, stream owns component bytes.
@@ -903,14 +974,16 @@ impl Vst3Plugin {
             "component setState",
         )?;
         if let Some(editor) = &self.controller {
-            let stream = Stream::new(component.to_vec());
+            let stream = Stream::try_from_slice(component)
+                .map_err(|_| PluginError("out of memory for plugin state".into()))?;
             let pointer = stream.to_com_ptr::<IBStream>().expect("stream interface");
             // SAFETY: main thread; fresh stream rewound to start of component state.
             let result = unsafe { editor.setComponentState(pointer.as_ptr()) };
             if result != kNotImplemented {
                 check(result, "setComponentState")?;
             }
-            let stream = Stream::new(controller.to_vec());
+            let stream = Stream::try_from_slice(controller)
+                .map_err(|_| PluginError("out of memory for plugin state".into()))?;
             let pointer = stream.to_com_ptr::<IBStream>().expect("stream interface");
             // SAFETY: controller UI state restored after the component state, on main thread.
             let result = unsafe { editor.setState(pointer.as_ptr()) };
@@ -921,9 +994,53 @@ impl Vst3Plugin {
         Ok(())
     }
     pub fn open_editor(&mut self) -> Result<(), PluginError> {
-        if self.editor.is_some() {
+        self.open_editor_at(None)
+    }
+    pub fn open_editor_in(
+        &mut self,
+        parent: vst_audio_protocol::ParentWindow,
+    ) -> Result<(), PluginError> {
+        self.open_editor_at(Some(parent))
+    }
+    fn open_editor_at(
+        &mut self,
+        parent: Option<vst_audio_protocol::ParentWindow>,
+    ) -> Result<(), PluginError> {
+        #[cfg(target_os = "linux")]
+        if self.hidden_wayland.is_some() {
+            if parent.is_none() {
+                return Ok(());
+            }
+            self.hidden_wayland = None;
+        }
+        if self
+            .editor
+            .as_ref()
+            .is_some_and(|editor| editor.window.parent() == parent)
+        {
             return Ok(());
         }
+        self.editor = None;
+        let mut attempted_wayland = false;
+        let result = self.attach_editor(parent, false, &mut attempted_wayland, None);
+        #[cfg(target_os = "linux")]
+        if result.is_err() && attempted_wayland {
+            self.module.wayland.reset();
+            if crate::linux_editor::policy() == crate::linux_editor::Policy::Auto
+                && crate::linux_editor::x11_available()
+            {
+                return self.attach_editor(parent, true, &mut attempted_wayland, None);
+            }
+        }
+        result
+    }
+    fn attach_editor(
+        &mut self,
+        parent: Option<vst_audio_protocol::ParentWindow>,
+        _force_x11: bool,
+        _attempted_wayland: &mut bool,
+        _restore: Option<&vst_audio_protocol::EditorStatus>,
+    ) -> Result<(), PluginError> {
         let controller = self
             .controller
             .as_ref()
@@ -933,9 +1050,37 @@ impl Vst3Plugin {
         // SAFETY: createView transfers an owned interface reference, nullable for no editor.
         let view = unsafe { ComPtr::from_raw(pointer) }
             .ok_or_else(|| PluginError("no VST 3 editor".into()))?;
+        let platform = crate::editor_platform();
+        #[cfg(target_os = "linux")]
+        let platform = {
+            use crate::linux_editor::{Policy, policy, wayland_allowed};
+            let native = !_force_x11 && parent.is_none() && wayland_allowed();
+            // SAFETY: retained main-thread view, static SDK platform identifier.
+            let supported = native
+                && unsafe { view.isPlatformTypeSupported(kPlatformTypeWaylandSurfaceID) }
+                    == kResultTrue;
+            if native && policy() == Policy::Wayland && !supported {
+                return Err(PluginError(
+                    "the plugin does not support Wayland editors".into(),
+                ));
+            }
+            let connected = supported && self.module.wayland.connection().is_ok();
+            if native && policy() == Policy::Wayland && !connected {
+                return Err(PluginError("no Wayland session is available".into()));
+            }
+            if _restore.is_some() && !connected {
+                return Err(PluginError("cannot recreate Wayland editor".into()));
+            }
+            if connected {
+                *_attempted_wayland = true;
+                c"WaylandSurfaceID"
+            } else {
+                platform
+            }
+        };
         check(
-            // SAFETY: live view, SDK Windows platform string, on main thread.
-            unsafe { view.isPlatformTypeSupported(crate::editor_platform().as_ptr()) },
+            // SAFETY: live view and static platform string, queried on main thread.
+            unsafe { view.isPlatformTypeSupported(platform.as_ptr()) },
             "native editor support",
         )?;
         let mut size = ViewRect {
@@ -946,6 +1091,21 @@ impl Vst3Plugin {
         };
         // SAFETY: writable view rectangle, queried before attachment.
         check(unsafe { view.getSize(&mut size) }, "getSize")?;
+        if let Some(status) = _restore {
+            size = ViewRect {
+                left: 0,
+                top: 0,
+                right: status.width as i32,
+                bottom: status.height as i32,
+            };
+            if status.resize_supported {
+                check(
+                    // SAFETY: fresh main-thread view and writable saved-size rectangle.
+                    unsafe { view.checkSizeConstraint(&mut size) },
+                    "checkSizeConstraint",
+                )?;
+            }
+        }
         let width = size
             .right
             .checked_sub(size.left)
@@ -956,10 +1116,30 @@ impl Vst3Plugin {
             .checked_sub(size.top)
             .filter(|v| (1..=8192).contains(v))
             .ok_or_else(|| PluginError("invalid editor height".into()))?;
-        let window = Rc::new(
-            EditorWindow::open(&self.info.class.name, width, height)
+        let window = Rc::new(match parent {
+            Some(parent) => EditorWindow::open_embedded(parent, width, height)
                 .map_err(|e| PluginError(e.to_string()))?,
-        );
+            None => {
+                #[cfg(target_os = "linux")]
+                if platform == c"WaylandSurfaceID" {
+                    // SAFETY: retained UI-thread view, queried before attachment.
+                    let resizable = unsafe { view.canResize() } == kResultTrue;
+                    EditorWindow::open_wayland(
+                        self.module.wayland.clone(),
+                        &self.info.class.name,
+                        width,
+                        height,
+                        resizable,
+                    )
+                } else {
+                    EditorWindow::open(&self.info.class.name, width, height)
+                }
+                #[cfg(not(target_os = "linux"))]
+                EditorWindow::open(&self.info.class.name, width, height)
+            }
+            .map_err(|e| PluginError(e.to_string()))?,
+        });
+        self.editor_size = Some((width as u32, height as u32));
         let frame = ComWrapper::new(Frame {
             window: window.clone(),
             #[cfg(target_os = "linux")]
@@ -968,25 +1148,52 @@ impl Vst3Plugin {
         .to_com_ptr::<IPlugFrame>()
         .expect("frame interface");
         // SAFETY: retained frame and main-thread view; frame owns the window lifetime.
-        check(unsafe { view.setFrame(frame.as_ptr()) }, "setFrame")?;
-        // SAFETY: live host-owned HWND, platform type matches support query.
-        let result = unsafe {
-            view.attached(
-                window.handle_value() as *mut c_void,
-                crate::editor_platform().as_ptr(),
-            )
-        };
+        let result = unsafe { view.setFrame(frame.as_ptr()) };
         if result != kResultOk {
+            // SAFETY: undo any partial frame retention before dropping the failed view.
+            let _ = unsafe { view.setFrame(std::ptr::null_mut()) };
+            check(result, "setFrame")?;
+        }
+        #[allow(unused_mut)]
+        let mut applied_scale = 1.0;
+        #[cfg(target_os = "linux")]
+        if let (Some(window), Some(scale)) = (
+            window.wayland(),
+            view.cast::<IPlugViewContentScaleSupport>(),
+        ) {
+            let requested = _restore.map_or(window.scale(), |status| status.scale);
+            // SAFETY: live UI-thread interface, bounded compositor or previously accepted scale.
+            if unsafe { scale.setContentScaleFactor(requested) } == kResultOk {
+                applied_scale = requested;
+            }
+        }
+        // SAFETY: live host-owned native parent, platform type matches support query.
+        let result =
+            unsafe { view.attached(window.handle_value() as *mut c_void, platform.as_ptr()) };
+        if result != kResultOk {
+            // SAFETY: clean up even a partially attached view before releasing the parent.
+            let _ = unsafe { view.removed() };
             // SAFETY: release installed frame before returning attachment error.
             let _ = unsafe { view.setFrame(std::ptr::null_mut()) };
             check(result, "attached")?;
         }
-        self.editor = Some(Editor {
-            scale: 1.0,
+        let editor = Editor {
+            scale: applied_scale,
+            #[cfg(target_os = "linux")]
+            output_scale: window.wayland().map_or(1.0, |w| w.scale()),
             view,
             _frame: frame,
             window,
-        });
+        };
+        if _restore.is_some() {
+            // SAFETY: attached fresh view, validated saved-size rectangle on the UI thread.
+            check(unsafe { editor.view.onSize(&mut size) }, "onSize")?;
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(wayland) = editor.window.wayland() {
+            wayland.commit().map_err(|e| PluginError(e.to_string()))?;
+        }
+        self.editor = Some(editor);
         Ok(())
     }
     pub fn editor_action(
@@ -994,6 +1201,63 @@ impl Vst3Plugin {
         action: vst_audio_protocol::EditorAction,
     ) -> Result<vst_audio_protocol::EditorReply, PluginError> {
         use vst_audio_protocol::{EditorAction as A, EditorReply, EditorStatus};
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(hidden) = self.hidden_wayland.as_mut() {
+                match action {
+                    A::Show => {
+                        let saved = self.hidden_wayland.take().expect("hidden editor").status;
+                        if let Err(error) =
+                            self.attach_editor(None, false, &mut false, Some(&saved))
+                        {
+                            self.closed_editor = true;
+                            return Err(error);
+                        }
+                        return self.editor_action(A::Inspect);
+                    }
+                    A::Resize { width, height } => {
+                        if !hidden.status.resize_supported
+                            || !(1..=8192).contains(&width)
+                            || !(1..=8192).contains(&height)
+                        {
+                            return Err(PluginError("editor resize unsupported or invalid".into()));
+                        }
+                        hidden.status.width = width;
+                        hidden.status.height = height;
+                    }
+                    A::Capture => {
+                        return Err(PluginError(
+                            "editor capture is not available for Wayland editors".into(),
+                        ));
+                    }
+                    A::Scale(_) => {
+                        return Err(PluginError(
+                            "editor scaling unavailable while hidden".into(),
+                        ));
+                    }
+                    A::Hide | A::Focus | A::Inspect => {}
+                }
+                return Ok(EditorReply::Status(hidden.status.clone()));
+            }
+            if matches!(action, A::Hide)
+                && self
+                    .editor
+                    .as_ref()
+                    .is_some_and(|e| e.window.wayland().is_some())
+            {
+                let EditorReply::Status(mut status) = self.editor_action(A::Inspect)? else {
+                    unreachable!("Inspect returns status")
+                };
+                status.visible = false;
+                // Drop calls removed and releases the view/frame before the parent objects.
+                self.editor = None;
+                self.hidden_wayland = Some(HiddenWaylandEditor {
+                    status: status.clone(),
+                    closed: std::cell::Cell::new(false),
+                });
+                return Ok(EditorReply::Status(status));
+            }
+        }
         let editor = self
             .editor
             .as_mut()
@@ -1041,12 +1305,13 @@ impl Vst3Plugin {
                     .checked_sub(rect.top)
                     .filter(|v| (1..=8192).contains(v))
                     .ok_or_else(|| PluginError("invalid constrained height".into()))?;
-                // SAFETY: live view with validated writable rectangle on main thread.
-                check(unsafe { editor.view.onSize(&mut rect) }, "onSize")?;
                 editor
                     .window
                     .resize(width, height)
                     .map_err(|e| PluginError(e.to_string()))?;
+                // SAFETY: live view with validated rectangle on main thread; a reentrant
+                // resizeView now takes precedence over the initial host request.
+                check(unsafe { editor.view.onSize(&mut rect) }, "onSize")?;
             }
             A::Scale(scale) => {
                 if !scale.is_finite() || !(0.5..=4.0).contains(&scale) {
@@ -1076,7 +1341,12 @@ impl Vst3Plugin {
             .status()
             .map_err(|e| PluginError(e.to_string()))?;
         Ok(EditorReply::Status(EditorStatus {
+            #[cfg(target_os = "linux")]
+            platform: editor.window.platform(),
+            #[cfg(not(target_os = "linux"))]
+            platform: crate::native_editor_platform(),
             visible,
+            embedded: editor.window.parent().is_some(),
             width,
             height,
             scale: editor.scale,
@@ -1084,18 +1354,38 @@ impl Vst3Plugin {
             scale_supported: scale_interface.is_some(),
         }))
     }
-    pub fn request_editor_close(&self) -> Result<(), PluginError> {
-        if let Some(editor) = &self.editor {
-            editor
-                .window
-                .request_close()
-                .map_err(|e| PluginError(e.to_string()))?;
+    pub fn request_editor_close(&mut self) -> Result<(), PluginError> {
+        #[cfg(target_os = "linux")]
+        if self.hidden_wayland.take().is_some() {
+            self.closed_editor = true;
+        }
+        if self.editor.take().is_some() {
+            self.closed_editor = true;
         }
         Ok(())
     }
     pub fn idle(&mut self) {
         #[cfg(target_os = "linux")]
-        self.module.run_loop.poll();
+        {
+            if self.hidden_wayland.as_ref().is_some_and(|e| e.closed.get()) {
+                self.hidden_wayland = None;
+                self.closed_editor = true;
+            }
+            self.module.run_loop.poll();
+            if self.module.wayland.pump(&self.module.run_loop).is_err() {
+                if self
+                    .editor
+                    .as_ref()
+                    .is_some_and(|e| e.window.wayland().is_some())
+                    || self.hidden_wayland.is_some()
+                {
+                    self.editor = None;
+                    self.hidden_wayland = None;
+                    self.closed_editor = true;
+                }
+                self.module.wayland.reset();
+            }
+        }
         if self
             .editor
             .as_ref()
@@ -1104,8 +1394,51 @@ impl Vst3Plugin {
             self.editor = None;
             self.closed_editor = true;
         }
+        #[cfg(target_os = "linux")]
+        if let Some(editor) = self.editor.as_mut()
+            && let Some(window) = editor.window.wayland()
+        {
+            if let Some((width, height)) = window.take_size() {
+                // SAFETY: retained main-thread view; compositor dimensions are negotiated before use.
+                if unsafe { editor.view.canResize() } == kResultTrue {
+                    let mut rect = ViewRect {
+                        left: 0,
+                        top: 0,
+                        right: width,
+                        bottom: height,
+                    };
+                    // SAFETY: live view and writable stack rectangle.
+                    let constrained = unsafe { editor.view.checkSizeConstraint(&mut rect) };
+                    if constrained == kResultOk
+                        && let Some(width) = rect
+                            .right
+                            .checked_sub(rect.left)
+                            .filter(|v| (1..=8192).contains(v))
+                        && let Some(height) = rect
+                            .bottom
+                            .checked_sub(rect.top)
+                            .filter(|v| (1..=8192).contains(v))
+                    {
+                        let _ = window.resize(width, height);
+                        // SAFETY: constrained rectangle remains live during the UI callback.
+                        let _ = unsafe { editor.view.onSize(&mut rect) };
+                    }
+                }
+            }
+            if editor.output_scale != window.scale() {
+                // Offer each new output scale once; a refusal keeps the accepted scale.
+                editor.output_scale = window.scale();
+                if let Some(scale) = editor.view.cast::<IPlugViewContentScaleSupport>()
+                    // SAFETY: retained main-thread scale interface and bounded compositor scale.
+                    && unsafe { scale.setContentScaleFactor(window.scale()) } == kResultOk
+                {
+                    editor.scale = window.scale();
+                }
+            }
+        }
     }
     pub fn take_events(&mut self) -> Events {
+        self.shared.edits.flush_deferred();
         let flags = self.shared.edits.flags.swap(0, Ordering::AcqRel);
         let latency = if flags & 2 != 0 {
             // SAFETY: SDK latency notification handled on main thread, live processor.
@@ -1114,14 +1447,29 @@ impl Vst3Plugin {
         } else {
             None
         };
+        let size = self
+            .editor
+            .as_ref()
+            .and_then(|editor| editor.window.status().ok())
+            .map(|(_, w, h)| (w, h));
+        let resized = if self.editor_size.is_some() && size != self.editor_size {
+            size
+        } else {
+            None
+        };
+        self.editor_size = size;
+        let mut parameter_edits = Vec::new();
+        while let Some(edit) = self.shared.edits.pop_notification() {
+            parameter_edits.push(edit);
+        }
         Events {
-            params: flags & 1 != 0,
+            resized,
+            params: flags & 1 != 0 || self.shared.edits.take_overflow(),
+            parameter_edits,
             latency,
             closed: std::mem::take(&mut self.closed_editor),
             fault: if flags & 4 != 0 {
                 Some("bus layout changed")
-            } else if flags & 8 != 0 {
-                Some("parameter queue overflow")
             } else if flags & 16 != 0 {
                 Some("VST 3 audio processing failed")
             } else {

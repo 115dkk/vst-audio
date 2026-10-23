@@ -4,7 +4,15 @@ use vst_audio::*;
 #[global_allocator]
 static ALLOC: assert_no_alloc::AllocDisabler = assert_no_alloc::AllocDisabler;
 fn host() -> Host {
-    Host::new(PathBuf::from(std::env::var_os("VST_AUDIO_WORKER").unwrap()))
+    let worker = PathBuf::from(std::env::var_os("VST_AUDIO_WORKER").unwrap());
+    let host = Host::new(&worker);
+    if std::env::var_os("VST_AUDIO_CROSS_ARCH").is_some() {
+        let architectures = plugin_architectures(&worker, PluginFormat::Vst2).unwrap();
+        assert_eq!(architectures.len(), 1);
+        host.with_worker(architectures[0], worker)
+    } else {
+        host
+    }
 }
 
 #[test]
@@ -299,6 +307,76 @@ fn sidechains_and_auxiliary_buses_preserve_native_order() {
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[test]
+#[ignore = "native fixtures required"]
+fn bus_selection_after_load_leaves_the_sidechain_and_auxiliary_output_inactive() {
+    let host = host();
+    let mut plugin = plugin(PluginFormat::Vst3);
+    let classes = host.scan(&plugin).unwrap();
+    plugin.class_id = Some(
+        classes
+            .iter()
+            .find(|class| class.name == "Test sidechain")
+            .unwrap()
+            .id,
+    );
+    let configuration = Configuration {
+        sample_format: SampleFormat::F64,
+        buses: Some(BusSelector::main_only()),
+        ..Default::default()
+    };
+    let mut instance = host.spawn(&plugin, &configuration, None).unwrap();
+    let mut audio = instance.take_audio().unwrap();
+    assert_eq!(audio.layout().inputs.len(), 2);
+    assert!(!audio.layout().inputs[1].active);
+    assert!(!audio.layout().outputs[1].active);
+    assert_eq!(audio.geometry().input_channels, 2);
+    assert_eq!(audio.geometry().output_channels, 2);
+    let left = [0.123456789012345; 128];
+    let right = [0.75; 128];
+    let mut a = [0.0; 128];
+    let mut b = [0.0; 128];
+    for block in 0..4 {
+        let status = audio.process_f64(&[&left, &right], &mut [&mut a, &mut b]);
+        if block >= 2 {
+            assert_eq!(status, AudioStatus::Processed);
+            assert_eq!(a, left);
+            assert_eq!(b, right);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let started = PluginProcess::start_configured(
+        PathBuf::from(std::env::var_os("VST_AUDIO_WORKER").unwrap()).as_path(),
+        &plugin.path,
+        plugin.format,
+        plugin.class_id,
+        &ProcessingOptions {
+            sample_format: SampleFormat::F64,
+            buses: Some(BusSelector::main_only()),
+            ..Default::default()
+        },
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        started
+            .declared_inputs
+            .iter()
+            .map(|bus| bus.kind)
+            .collect::<Vec<_>>(),
+        [BusKind::Main, BusKind::Aux]
+    );
+    assert_eq!(
+        started
+            .declared_inputs
+            .iter()
+            .map(|bus| bus.name.as_str())
+            .collect::<Vec<_>>(),
+        ["Main", "Sidechain"]
+    );
 }
 
 #[test]

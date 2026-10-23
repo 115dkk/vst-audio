@@ -40,8 +40,8 @@ struct Vst2 {
     info: PluginInfo,
 }
 impl Vst2 {
-    fn load(path: &Path) -> Result<Self, PluginError> {
-        let inner = Vst2Plugin::load(path).map_err(plugin_error)?;
+    fn load(path: &Path, class: Option<[u8; 16]>) -> Result<Self, PluginError> {
+        let inner = Vst2Plugin::load_class(path, class).map_err(plugin_error)?;
         let info = inner.info();
         let arrangement = |types: Option<Vec<i32>>, count| -> Result<u64, PluginError> {
             Ok(types
@@ -51,18 +51,36 @@ impl Vst2 {
                 )
                 .unwrap_or(0))
         };
+        let input_arrangement = arrangement(info.input_types, info.inputs)?;
+        let output_arrangement = arrangement(info.output_types, info.outputs)?;
         let info = PluginInfo {
             name: info.name,
             vendor: info.vendor,
             latency_frames: info.latency,
-            inputs: vec![Bus {
-                channels: info.inputs,
-                arrangement: arrangement(info.input_types, info.inputs)?,
-            }],
-            outputs: vec![Bus {
-                channels: info.outputs,
-                arrangement: arrangement(info.output_types, info.outputs)?,
-            }],
+            inputs: (info.inputs != 0)
+                .then(|| vst_audio_protocol::BusInfo {
+                    layout: Bus {
+                        channels: info.inputs,
+                        arrangement: input_arrangement,
+                    },
+                    kind: vst_audio_protocol::BusKind::Main,
+                    name: String::new(),
+                    default_active: true,
+                })
+                .into_iter()
+                .collect(),
+            outputs: (info.outputs != 0)
+                .then(|| vst_audio_protocol::BusInfo {
+                    layout: Bus {
+                        channels: info.outputs,
+                        arrangement: output_arrangement,
+                    },
+                    kind: vst_audio_protocol::BusKind::Main,
+                    name: String::new(),
+                    default_active: true,
+                })
+                .into_iter()
+                .collect(),
         };
         Ok(Self {
             inner,
@@ -100,7 +118,9 @@ impl Processor for Vst2ProcessorAdapter {
 struct Vst2ProcessorAdapter(Vst2Processor);
 impl Plugin for Vst2 {
     fn info(&self) -> PluginInfo {
-        self.info.clone()
+        let mut info = self.info.clone();
+        info.latency_frames = self.inner.info().latency;
+        info
     }
     fn configure(
         &mut self,
@@ -129,6 +149,26 @@ impl Plugin for Vst2 {
             return Err(PluginError(
                 "VST2 exposes one active audio port per direction".into(),
             ));
+        }
+        let unchanged = |requested: &[vst_audio_protocol::BusConfiguration],
+                         declared: &[vst_audio_protocol::BusInfo]| {
+            requested.len() == declared.len()
+                && requested
+                    .iter()
+                    .zip(declared)
+                    .all(|(a, b)| a.layout == b.layout)
+        };
+        // The application sends the declaration back even when no layout was selected.
+        // Keeping that default is not a request to change the plugin's arrangement.
+        if !unchanged(&setup.inputs, &self.info.inputs)
+            || !unchanged(&setup.outputs, &self.info.outputs)
+        {
+            self.inner
+                .negotiate_layouts(
+                    setup.inputs.first().map_or(0, |b| b.layout.arrangement),
+                    setup.outputs.first().map_or(0, |b| b.layout.arrangement),
+                )
+                .map_err(plugin_error)?;
         }
         self.inner
             .configure_precision(
@@ -180,6 +220,12 @@ impl Plugin for Vst2 {
     fn open_editor(&mut self) -> Result<(), PluginError> {
         self.inner.open_editor().map_err(plugin_error)
     }
+    fn open_editor_in(
+        &mut self,
+        parent: vst_audio_protocol::ParentWindow,
+    ) -> Result<(), PluginError> {
+        self.inner.open_editor_in(parent).map_err(plugin_error)
+    }
     fn editor_action(
         &mut self,
         action: vst_audio_protocol::EditorAction,
@@ -197,15 +243,24 @@ impl Plugin for Vst2 {
         self.info.latency_frames = self.inner.info().latency;
         PluginEvents {
             params_changed: events.params,
+            parameter_edits: events.parameter_edits,
             latency_changed: events.latency.then_some(self.info.latency_frames),
             editor_closed: events.closed,
-            fault: None,
+            editor_resized: events.resized,
+            fault: events
+                .fault
+                .then_some("plugin changed its channel or parameter count; restart required"),
         }
     }
 }
 
 pub fn host_main(args: Args) -> Result<(), StartError> {
     runtime::suppress_error_dialogs();
+    #[cfg(target_os = "linux")]
+    vst_audio_worker_sys::linux_editor::configure(
+        &args.linux_editor,
+        !args.sandbox || args.sandbox_processes,
+    );
     let trace = std::env::var_os("VST_AUDIO_TRACE").is_some();
     if trace {
         eprintln!("worker {} starting", std::process::id());
@@ -217,6 +272,52 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
     }
     let input = runtime::inherited_file(args.control_in).map_err(error)?;
     let mut output = runtime::inherited_file(args.control_out).map_err(error)?;
+    let parent = Arc::new(runtime::duplicate_value(args.parent, false).map_err(error)?);
+    let region = Arc::new(SharedRegion::open(args.region, args.region_bytes).map_err(error)?);
+    let work = Arc::new(
+        Event::open(args.work)
+            .map_err(error)?
+            .with_peer(parent.try_clone().map_err(error)?),
+    );
+    let done = Arc::new(Event::open(args.done).map_err(error)?);
+    let ready = Arc::new(Event::open(args.ready).map_err(error)?);
+    if args.sandbox {
+        let policy = vst_audio_transport_sys::sandbox::SandboxPolicy {
+            network: args.sandbox_network,
+            processes: args.sandbox_processes,
+            writable: args.sandbox_writable.clone(),
+        };
+        let report = vst_audio_transport_sys::sandbox::apply_worker(&policy, &std::env::temp_dir());
+        let message = match report {
+            Ok(report) => Message::Sandboxed {
+                mechanism: report.mechanism,
+            },
+            Err(reason) => {
+                write_frame(
+                    &mut output,
+                    &Frame {
+                        flags: 0,
+                        request: 0,
+                        message: Message::Fault {
+                            code: 1,
+                            text: format!("sandbox setup failed: {reason}"),
+                        },
+                    },
+                )
+                .map_err(error)?;
+                return Err(error(reason));
+            }
+        };
+        write_frame(
+            &mut output,
+            &Frame {
+                flags: 0,
+                request: 0,
+                message,
+            },
+        )
+        .map_err(error)?;
+    }
     // Main-thread writes are acceptable in the disposable host. The app's reader
     // drains continuously; app-side writes use a dedicated thread.
     write_frame(
@@ -242,7 +343,6 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
             }
         }
     });
-    let parent = Arc::new(runtime::duplicate_value(args.parent, false).map_err(error)?);
     // Independent of the plugin's main/audio threads: even a hung foreign
     // call must not leave a worker behind after the application exits.
     let parent_watch = parent.clone();
@@ -254,14 +354,6 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
             thread::sleep(Duration::from_millis(50));
         }
     });
-    let region = Arc::new(SharedRegion::open(args.region, args.region_bytes).map_err(error)?);
-    let work = Arc::new(
-        Event::open(args.work)
-            .map_err(error)?
-            .with_peer(parent.try_clone().map_err(error)?),
-    );
-    let done = Arc::new(Event::open(args.done).map_err(error)?);
-    let ready = Arc::new(Event::open(args.ready).map_err(error)?);
     let stop = Arc::new(AtomicBool::new(false));
     let mut audio = None;
     let mut plugin: Option<Box<dyn Plugin>> = None;
@@ -284,6 +376,7 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
                         );
                     }
                     let request = frame.request;
+                    let kind = frame.message.kind();
                     let shutdown = matches!(frame.message, Message::Shutdown);
                     let recoverable = matches!(
                         &frame.message,
@@ -291,6 +384,7 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
                             | Message::ListParameters { .. }
                             | Message::SetParameter { .. }
                             | Message::OpenEditor
+                            | Message::OpenEditorIn { .. }
                             | Message::CloseEditor
                     );
                     let message = match frame.message {
@@ -343,15 +437,9 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
                                     .collect();
                                 return Ok(Message::Classes { entries });
                             }
-                            let scanned = Vst2::load(Path::new(&path)).map_err(error)?;
-                            let info = scanned.info();
+                            let scanned = Vst2Plugin::load(Path::new(&path)).map_err(error)?;
                             Ok(Message::Classes {
-                                entries: vec![ClassInfo {
-                                    id: [0; 16],
-                                    name: info.name,
-                                    vendor: info.vendor,
-                                    category: "Audio Module".into(),
-                                }],
+                                entries: scanned.classes().map_err(error)?,
                             })
                         }
                         Message::Load {
@@ -361,7 +449,7 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
                         } if plugin.is_none() => {
                             let loaded: Box<dyn Plugin> = match format {
                                 PluginFormat::Vst2 => {
-                                    Box::new(Vst2::load(Path::new(&path)).map_err(error)?)
+                                    Box::new(Vst2::load(Path::new(&path), class_id).map_err(error)?)
                                 }
                                 PluginFormat::Vst3 => Box::new(
                                     crate::vst3::Vst3::load(Path::new(&path), class_id)
@@ -509,6 +597,27 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
                                 .map_err(error)?;
                             Ok(Message::Ack)
                         }
+                        Message::OpenEditorIn { parent } => {
+                            let plugin = plugin
+                                .as_mut()
+                                .ok_or_else(|| StartError("Load required".into()))?;
+                            plugin.open_editor_in(parent).map_err(|failure| {
+                                // Windows may refuse a Low-integrity child of a higher
+                                // parent; the native error stays in diagnostics.
+                                #[cfg(windows)]
+                                if args.sandbox
+                                    && failure.0.starts_with("embedded window creation failed:")
+                                {
+                                    eprintln!("sandboxed editor: {failure}");
+                                    return StartError(
+                                        "parent window is not accessible from the sandboxed worker"
+                                            .into(),
+                                    );
+                                }
+                                error(failure)
+                            })?;
+                            Ok(Message::Ack)
+                        }
                         Message::CloseEditor => {
                             plugin
                                 .as_mut()
@@ -547,7 +656,7 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
                         } else {
                             Message::Fault {
                                 code: 1,
-                                text: error.to_string(),
+                                text: format!("{error} (request kind {kind})"),
                             }
                         }
                     });
@@ -605,11 +714,48 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
                     failed = true;
                     break;
                 }
+                let mut pending_perform: Option<(u32, f64)> = None;
+                for (id, phase, value) in events.parameter_edits {
+                    if phase == 1 && pending_perform.is_some_and(|(pending, _)| pending == id) {
+                        pending_perform = Some((id, value));
+                        continue;
+                    }
+                    if let Some((id, value)) = pending_perform.take() {
+                        send(Message::ParameterEdit {
+                            id,
+                            phase: vst_audio_protocol::EditPhase::Perform,
+                            value,
+                        })?;
+                    }
+                    if phase == 1 {
+                        pending_perform = Some((id, value));
+                    } else {
+                        send(Message::ParameterEdit {
+                            id,
+                            phase: if phase == 0 {
+                                vst_audio_protocol::EditPhase::Begin
+                            } else {
+                                vst_audio_protocol::EditPhase::End
+                            },
+                            value,
+                        })?;
+                    }
+                }
+                if let Some((id, value)) = pending_perform {
+                    send(Message::ParameterEdit {
+                        id,
+                        phase: vst_audio_protocol::EditPhase::Perform,
+                        value,
+                    })?;
+                }
                 if events.params_changed {
                     send(Message::ParamsChanged)?;
                 }
                 if let Some(frames) = events.latency_changed {
                     send(Message::LatencyChanged { frames })?;
+                }
+                if let Some((width, height)) = events.editor_resized {
+                    send(Message::EditorResized { width, height })?;
                 }
                 if events.editor_closed {
                     send(Message::EditorClosed)?;

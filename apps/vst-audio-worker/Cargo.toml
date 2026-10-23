@@ -14,3 +14,5 @@ workspace = true
 
 [dependencies]
 vst-audio-worker-runtime.workspace = true
+# Direct dependency permits explicit CLI selection of the test-only mutation.
+vst-audio-worker-sys.workspace = true

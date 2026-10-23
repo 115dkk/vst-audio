@@ -47,6 +47,8 @@ impl Library {
                 path.display()
             )));
         }
+        #[cfg(target_os = "linux")]
+        install_x11_error_handler();
         Ok(Self {
             handle,
             #[cfg(target_os = "macos")]
@@ -73,6 +75,53 @@ impl Library {
         })
     }
 }
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct XErrorEvent {
+    _type: i32,
+    _display: *mut c_void,
+    _resource_id: libc::c_ulong,
+    _serial: libc::c_ulong,
+    error_code: u8,
+    request_code: u8,
+    minor_code: u8,
+}
+
+#[cfg(target_os = "linux")]
+unsafe extern "C" fn x11_error_handler(_display: *mut c_void, error: *mut XErrorEvent) -> i32 {
+    if !error.is_null() {
+        // SAFETY: Xlib invokes the handler synchronously with a readable XErrorEvent.
+        let error = unsafe { &*error };
+        eprintln!(
+            "X11 protocol error: code={} request={}.{} resource={:#x}",
+            error.error_code, error.request_code, error.minor_code, error._resource_id
+        );
+    }
+    0
+}
+
+#[cfg(target_os = "linux")]
+fn install_x11_error_handler() {
+    // SAFETY: RTLD_NOLOAD only looks up an existing process handle and does not load libX11.
+    let x11 = unsafe { libc::dlopen(c"libX11.so.6".as_ptr(), libc::RTLD_NOW | libc::RTLD_NOLOAD) };
+    if x11.is_null() {
+        return;
+    }
+    // SAFETY: retained NOLOAD handle and terminated symbol name.
+    let symbol = unsafe { libc::dlsym(x11, c"XSetErrorHandler".as_ptr()) };
+    if !symbol.is_null() {
+        type SetErrorHandler = unsafe extern "C" fn(
+            Option<unsafe extern "C" fn(*mut c_void, *mut XErrorEvent) -> i32>,
+        ) -> *mut c_void;
+        // SAFETY: dlsym returned XSetErrorHandler from the already-loaded libX11.
+        let set_handler: SetErrorHandler = unsafe { std::mem::transmute(symbol) };
+        // SAFETY: handler has Xlib's required calling convention and static lifetime.
+        unsafe { set_handler(Some(x11_error_handler)) };
+    }
+    // SAFETY: balance the RTLD_NOLOAD reference; libX11 remains loaded by its original owner.
+    unsafe { libc::dlclose(x11) };
+}
+
 impl Drop for Library {
     fn drop(&mut self) {
         #[cfg(target_os = "macos")]

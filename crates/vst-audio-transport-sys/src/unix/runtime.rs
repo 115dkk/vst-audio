@@ -234,7 +234,7 @@ fn cstring(bytes: &[u8], field: &str) -> io::Result<CString> {
 }
 
 #[cfg(target_os = "macos")]
-fn selected_descriptors(values: &[usize]) -> Vec<libc::c_int> {
+fn selected_descriptors(values: &[u64]) -> Vec<libc::c_int> {
     let mut descriptors = Vec::new();
     for value in values {
         // Event tokens carry their read/write descriptors in two 32-bit halves.
@@ -250,8 +250,9 @@ fn selected_descriptors(values: &[usize]) -> Vec<libc::c_int> {
 fn spawn_handles_macos(
     exe: &Path,
     args: &[OsString],
-    values: &[usize],
+    values: &[u64],
     parent: ParentHandle,
+    sandbox: crate::sandbox::SandboxLaunch,
 ) -> io::Result<ChildProcess> {
     let mut argv_strings = Vec::with_capacity(args.len() + 1);
     argv_strings.push(cstring(exe.as_os_str().as_bytes(), "executable path")?);
@@ -265,7 +266,15 @@ fn spawn_handles_macos(
     argv.push(ptr::null_mut());
 
     let mut environment_strings = Vec::new();
-    for (key, value) in std::env::vars_os() {
+    let temporary = sandbox.temporary();
+    for (key, value) in std::env::vars_os()
+        .filter(|(key, _)| {
+            temporary.is_none() || !["TMPDIR", "TMP", "TEMP"].iter().any(|name| key == name)
+        })
+        .chain(temporary.into_iter().flat_map(|path| {
+            ["TMPDIR", "TMP", "TEMP"].map(|key| (OsString::from(key), path.as_os_str().to_owned()))
+        }))
+    {
         let mut entry = key.as_bytes().to_vec();
         entry.push(b'=');
         entry.extend_from_slice(value.as_bytes());
@@ -354,6 +363,7 @@ fn spawn_handles_macos(
             exit_code: None,
         }),
         _parent: parent,
+        _sandbox: sandbox,
     })
 }
 
@@ -421,17 +431,19 @@ pub struct ChildProcess {
     // Only the parent retains the write end: death closes it even while a
     // plugin's main thread is blocked inside foreign code.
     _parent: ParentHandle,
+    _sandbox: crate::sandbox::SandboxLaunch,
 }
 
 pub fn spawn_handles(
     exe: &Path,
     args: &[OsString],
-    values: &[usize],
+    values: &[u64],
     parent: ParentHandle,
+    sandbox: crate::sandbox::SandboxLaunch,
 ) -> io::Result<ChildProcess> {
     #[cfg(target_os = "macos")]
     {
-        spawn_handles_macos(exe, args, values, parent)
+        spawn_handles_macos(exe, args, values, parent, sandbox)
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -444,6 +456,11 @@ pub fn spawn_handles(
             }
         }
         let mut command = Command::new(exe);
+        if let Some(temporary) = sandbox.temporary() {
+            for key in ["TMPDIR", "TMP", "TEMP"] {
+                command.env(key, temporary);
+            }
+        }
         command
             .args(args)
             .stdin(Stdio::null())
@@ -468,6 +485,7 @@ pub fn spawn_handles(
         Ok(ChildProcess {
             child: Mutex::new(child),
             _parent: parent,
+            _sandbox: sandbox,
         })
     }
 }

@@ -1,5 +1,9 @@
-//! Worker-owned X11 top-level window. No application GUI framework is involved.
-use std::{cell::Cell, io};
+//! Worker-owned X11 floating or embedded window. No application GUI framework is involved.
+use std::{
+    cell::{Cell, RefCell},
+    io,
+    sync::Arc,
+};
 use x11rb::{
     COPY_DEPTH_FROM_PARENT,
     connection::Connection,
@@ -10,18 +14,47 @@ use x11rb::{
 
 #[derive(Debug)]
 pub struct EditorWindow {
-    connection: RustConnection,
+    connection: Arc<RustConnection>,
     window: u32,
     delete: u32,
     protocols: u32,
     closed: Cell<bool>,
+    configured: Cell<bool>,
+    parent: Option<vst_audio_protocol::ParentWindow>,
 }
 fn error(e: impl std::fmt::Display) -> io::Error {
     io::Error::other(e.to_string())
 }
+thread_local! {
+    // Every editor window of this worker shares one connection. With one
+    // connection per window, closing a window freed its resource-ID range and
+    // the next window could take the ID of a top level the window manager was
+    // still managing; weston's XWM then reparented a new embedded editor into
+    // the stale frame of the floating editor it replaced.
+    static SHARED: RefCell<Option<(Arc<RustConnection>, usize)>> = const { RefCell::new(None) };
+}
+fn shared() -> io::Result<(Arc<RustConnection>, usize)> {
+    SHARED.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if let Some((connection, screen)) = slot.as_ref()
+            && connection
+                .get_input_focus()
+                .ok()
+                .and_then(|cookie| cookie.reply().ok())
+                .is_some()
+        {
+            return Ok((connection.clone(), *screen));
+        }
+        // A broken connection took its windows with it; start a new one.
+        let (connection, screen) = x11rb::connect(None).map_err(error)?;
+        let connection = Arc::new(connection);
+        *slot = Some((connection.clone(), screen));
+        Ok((connection, screen))
+    })
+}
 impl EditorWindow {
     pub fn open(title: &str, width: i32, height: i32) -> io::Result<Self> {
-        let (connection, screen) = x11rb::connect(None).map_err(error)?;
+        let (connection, screen) = shared()?;
         let screen = &connection.setup().roots[screen];
         let window = connection.generate_id().map_err(error)?;
         connection
@@ -73,31 +106,136 @@ impl EditorWindow {
             .map_err(error)?;
         connection.map_window(window).map_err(error)?;
         connection.flush().map_err(error)?;
-        Ok(Self {
+        let editor = Self {
             connection,
             window,
             protocols,
             delete,
             closed: Cell::new(false),
+            configured: Cell::new(false),
+            parent: None,
+        };
+        editor.wait_mapped()?;
+        Ok(editor)
+    }
+    pub fn open_embedded(
+        parent: vst_audio_protocol::ParentWindow,
+        width: i32,
+        height: i32,
+    ) -> io::Result<Self> {
+        let vst_audio_protocol::ParentWindow::X11 { window: id } = parent else {
+            return Err(error("parent window platform does not match the worker"));
+        };
+        let id = u32::try_from(id)
+            .ok()
+            .filter(|id| *id != 0)
+            .ok_or_else(|| error("parent window is not a window"))?;
+        let (connection, _) = shared()?;
+        connection
+            .get_geometry(id)
+            .map_err(error)?
+            .reply()
+            .map_err(|_| error("parent window is not a window"))?;
+        // Geometry accepts pixmaps too; require an actual InputOutput window.
+        let attributes = connection
+            .get_window_attributes(id)
+            .map_err(error)?
+            .reply()
+            .map_err(|_| error("parent window is not a window"))?;
+        if attributes.class != WindowClass::INPUT_OUTPUT {
+            return Err(error("parent window is not a window"));
+        }
+        connection
+            .change_window_attributes(
+                id,
+                &ChangeWindowAttributesAux::new().event_mask(EventMask::STRUCTURE_NOTIFY),
+            )
+            .map_err(error)?
+            .check()
+            .map_err(error)?;
+        let window = connection.generate_id().map_err(error)?;
+        connection
+            .create_window(
+                COPY_DEPTH_FROM_PARENT,
+                window,
+                id,
+                0,
+                0,
+                width.clamp(1, 8192) as u16,
+                height.clamp(1, 8192) as u16,
+                0,
+                WindowClass::INPUT_OUTPUT,
+                0,
+                &CreateWindowAux::new()
+                    .event_mask(EventMask::EXPOSURE | EventMask::STRUCTURE_NOTIFY),
+            )
+            .map_err(error)?
+            .check()
+            .map_err(error)?;
+        connection
+            .map_window(window)
+            .map_err(error)?
+            .check()
+            .map_err(error)?;
+        connection.flush().map_err(error)?;
+        Ok(Self {
+            connection,
+            window,
+            delete: 0,
+            protocols: 0,
+            closed: Cell::new(false),
+            configured: Cell::new(false),
+            parent: Some(parent),
         })
+    }
+    pub fn parent(&self) -> Option<vst_audio_protocol::ParentWindow> {
+        self.parent
     }
     pub fn handle_value(&self) -> usize {
         self.window as usize
     }
     pub fn pump(&self) -> bool {
+        let parent = match self.parent {
+            Some(vst_audio_protocol::ParentWindow::X11 { window }) => u32::try_from(window).ok(),
+            _ => None,
+        };
+        // The shared connection also carries events for windows this editor
+        // replaced; only this window and its parent concern it.
         while let Ok(Some(event)) = self.connection.poll_for_event() {
             match event {
                 Event::ClientMessage(event)
-                    if event.type_ == self.protocols
+                    if event.window == self.window
+                        && event.type_ == self.protocols
                         && event.data.as_data32()[0] == self.delete =>
                 {
                     self.closed.set(true)
                 }
-                Event::DestroyNotify(_) => self.closed.set(true),
+                // Only destruction closes an embedded editor: the application
+                // may unmap its parent to minimize or switch views.
+                Event::DestroyNotify(event)
+                    if event.window == self.window || Some(event.window) == parent =>
+                {
+                    self.closed.set(true)
+                }
+                Event::ConfigureNotify(event) if event.window == self.window => {
+                    self.configured.set(true);
+                }
                 _ => {}
             }
         }
         self.closed.get()
+    }
+    fn wait_mapped(&self) -> io::Result<()> {
+        // A desktop WM redirects MapWindow asynchronously (unlike bare Xvfb).
+        // Only floating windows wait; an embedded parent's visibility is external.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while self.parent.is_none() && !self.status()?.0 {
+            if std::time::Instant::now() >= deadline {
+                return Err(error("editor mapping timed out"));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        Ok(())
     }
     pub fn show(&self, visible: bool) -> io::Result<()> {
         if visible {
@@ -113,7 +251,11 @@ impl EditorWindow {
                 .check()
                 .map_err(error)?;
         }
-        self.connection.flush().map_err(error)
+        self.connection.flush().map_err(error)?;
+        if visible {
+            self.wait_mapped()?;
+        }
+        Ok(())
     }
     pub fn focus(&self) -> io::Result<()> {
         self.connection
@@ -217,6 +359,14 @@ impl EditorWindow {
         Ok(())
     }
     pub fn resize(&self, width: i32, height: i32) -> io::Result<()> {
+        // Drain older notifications before starting this request.
+        let (_, w, h) = self.status()?;
+        self.pump();
+        self.configured.set(false);
+        let expected = (width.clamp(1, 8192) as u32, height.clamp(1, 8192) as u32);
+        if (w, h) == expected {
+            return Ok(());
+        }
         self.connection
             .configure_window(
                 self.window,
@@ -225,7 +375,20 @@ impl EditorWindow {
                     .height(height.clamp(1, 8192) as u32),
             )
             .map_err(error)?;
-        self.connection.flush().map_err(error)
+        self.connection.flush().map_err(error)?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if self.pump() {
+                return Err(error("editor closed during resize"));
+            }
+            if self.configured.get() {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(error("editor resize timed out"));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
     }
 }
 impl Drop for EditorWindow {

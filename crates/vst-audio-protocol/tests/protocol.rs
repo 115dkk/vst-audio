@@ -3,10 +3,45 @@
 use std::io::Cursor;
 
 use vst_audio_protocol::{
-    Action, Bus, ClassInfo, CodecError, DecodedFrame, DisableReason, Frame, HostWatch, KillReason,
-    MAX_STRING_BYTES, Message, PluginFormat, Received, RequestKind, StateHistory, WatchState,
-    decode_frame, encode_frame, read_frame,
+    Action, Bus, BusInfo, BusKind, ClassInfo, CodecError, DecodedFrame, DisableReason, EditPhase,
+    Frame, HostWatch, KillReason, MAX_STRING_BYTES, Message, PluginFormat, Received, RequestKind,
+    StateHistory, WatchState, decode_frame, encode_frame, read_frame,
 };
+
+#[test]
+fn editor_platforms_round_trip_and_reject_unknown_tags() {
+    use vst_audio_protocol::{EditorPlatform, EditorStatus};
+    for platform in [
+        EditorPlatform::Win32,
+        EditorPlatform::Cocoa,
+        EditorPlatform::X11,
+        EditorPlatform::Wayland,
+    ] {
+        let message = Message::EditorStatus(EditorStatus {
+            platform,
+            visible: true,
+            embedded: false,
+            width: 320,
+            height: 200,
+            scale: 1.0,
+            resize_supported: true,
+            scale_supported: false,
+        });
+        round_trip(message.clone());
+        let mut bytes = encode_frame(&Frame {
+            flags: 0,
+            request: 1,
+            message,
+        })
+        .unwrap();
+        let offset = bytes.len() - 17;
+        bytes[offset] = 4;
+        assert!(matches!(
+            decode_frame(&bytes),
+            Err(CodecError::InvalidValue)
+        ));
+    }
+}
 
 fn round_trip(message: Message) {
     let frame = Frame {
@@ -30,12 +65,20 @@ fn round_trip(message: Message) {
 #[test]
 fn codec_round_trips_every_message() {
     let id = [9; 16];
-    let buses = vec![Bus {
-        channels: 6,
-        arrangement: 0x3f,
+    let buses = vec![BusInfo {
+        layout: Bus {
+            channels: 6,
+            arrangement: 0x3f,
+        },
+        kind: BusKind::Aux,
+        name: "Sidechain".into(),
+        default_active: false,
     }];
     for message in [
         Message::hello(),
+        Message::Sandboxed {
+            mechanism: "landlock-abi-7+seccomp".into(),
+        },
         Message::Load {
             path: "plugin.vst3".into(),
             format: PluginFormat::Vst3,
@@ -53,6 +96,22 @@ fn codec_round_trips_every_message() {
         },
         Message::GetState,
         Message::OpenEditor,
+        Message::OpenEditorIn {
+            parent: vst_audio_protocol::ParentWindow::Win32 { hwnd: u64::MAX },
+        },
+        Message::OpenEditorIn {
+            parent: vst_audio_protocol::ParentWindow::X11 { window: 0x12345678 },
+        },
+        Message::EditorStatus(vst_audio_protocol::EditorStatus {
+            platform: vst_audio_protocol::EditorPlatform::Wayland,
+            visible: true,
+            embedded: true,
+            width: 640,
+            height: 480,
+            scale: 1.5,
+            resize_supported: true,
+            scale_supported: false,
+        }),
         Message::CloseEditor,
         Message::Shutdown,
         Message::Scan {
@@ -84,11 +143,81 @@ fn codec_round_trips_every_message() {
         },
         Message::Ack,
         Message::EditorClosed,
+        Message::EditorResized {
+            width: 500,
+            height: 280,
+        },
+        Message::ParameterEdit {
+            id: 42,
+            phase: EditPhase::Perform,
+            value: 0.5,
+        },
         Message::Scan {
             path: "C:\\".to_owned() + &"a".repeat(MAX_STRING_BYTES - 3),
         },
     ] {
         round_trip(message);
+    }
+}
+
+#[test]
+fn parameter_edit_rejects_invalid_payloads() {
+    let valid = encode_frame(&Frame {
+        flags: 0,
+        request: 0,
+        message: Message::ParameterEdit {
+            id: 7,
+            phase: EditPhase::Perform,
+            value: 0.5,
+        },
+    })
+    .unwrap();
+
+    let mut phase = valid.clone();
+    phase[16] = 3;
+    assert!(matches!(
+        decode_frame(&phase),
+        Err(CodecError::InvalidValue)
+    ));
+
+    for value in [f64::NAN, 1.5] {
+        let mut bytes = valid.clone();
+        bytes[17..25].copy_from_slice(&value.to_le_bytes());
+        assert!(matches!(
+            decode_frame(&bytes),
+            Err(CodecError::InvalidValue)
+        ));
+    }
+
+    let mut short = valid.clone();
+    short.truncate(short.len() - 1);
+    assert!(matches!(decode_frame(&short), Err(CodecError::Truncated)));
+
+    let mut trailing = valid;
+    trailing[0..4].copy_from_slice(&22_u32.to_le_bytes());
+    trailing.push(0);
+    assert!(matches!(
+        decode_frame(&trailing),
+        Err(CodecError::TrailingBytes)
+    ));
+}
+
+#[test]
+fn embedding_rejects_unknown_platform_tags() {
+    let mut bytes = encode_frame(&Frame {
+        flags: 0,
+        request: 1,
+        message: Message::OpenEditorIn {
+            parent: vst_audio_protocol::ParentWindow::Win32 { hwnd: 1 },
+        },
+    })
+    .unwrap();
+    for tag in [2, 127, 255] {
+        bytes[12] = tag;
+        assert!(matches!(
+            decode_frame(&bytes),
+            Err(CodecError::InvalidValue)
+        ));
     }
 }
 
@@ -143,6 +272,47 @@ fn malicious_frames_are_rejected_and_unknown_kinds_skip() {
         })
         .is_err()
     );
+}
+
+#[test]
+fn bus_info_rejects_unknown_kinds_and_flags() {
+    let frame = Frame {
+        flags: 0,
+        request: 1,
+        message: Message::Loaded {
+            name: String::new(),
+            vendor: String::new(),
+            latency_frames: 0,
+            inputs: vec![BusInfo {
+                layout: Bus {
+                    channels: 2,
+                    arrangement: 3,
+                },
+                kind: BusKind::Main,
+                name: String::new(),
+                default_active: true,
+            }],
+            outputs: Vec::new(),
+        },
+    };
+    let encoded = encode_frame(&frame).unwrap();
+    // Header (12), two empty strings (4), latency (4), count (2), layout (10).
+    let kind = 32;
+    let flags = kind + 1;
+
+    let mut unknown_kind = encoded.clone();
+    unknown_kind[kind] = 2;
+    assert!(matches!(
+        decode_frame(&unknown_kind),
+        Err(CodecError::InvalidValue)
+    ));
+
+    let mut unknown_flags = encoded;
+    unknown_flags[flags] = 2;
+    assert!(matches!(
+        decode_frame(&unknown_flags),
+        Err(CodecError::InvalidValue)
+    ));
 }
 
 fn running(now: u64) -> HostWatch {
@@ -431,4 +601,48 @@ fn the_backoff_starts_again_once_the_window_is_clear() {
     watch.process_exited(700_000, 1);
     assert_eq!(watch.tick(700_499), Action::None);
     assert_eq!(watch.tick(700_500), Action::Spawn);
+}
+
+#[test]
+fn editor_resized_rejects_out_of_range_dimensions() {
+    for (width, height) in [(0, 1), (1, 0), (8193, 1), (1, 8193), (u32::MAX, 1)] {
+        let frame = Frame {
+            flags: 0,
+            request: 0,
+            message: Message::EditorResized { width, height },
+        };
+        assert!(matches!(
+            encode_frame(&frame),
+            Err(CodecError::InvalidValue)
+        ));
+
+        let mut bytes = vec![0; 20];
+        bytes[..4].copy_from_slice(&16u32.to_le_bytes());
+        bytes[4..6].copy_from_slice(&31u16.to_le_bytes());
+        bytes[12..16].copy_from_slice(&width.to_le_bytes());
+        bytes[16..20].copy_from_slice(&height.to_le_bytes());
+        assert!(matches!(
+            decode_frame(&bytes),
+            Err(CodecError::InvalidValue)
+        ));
+    }
+}
+
+#[test]
+fn editor_resized_rejects_short_body() {
+    let bytes = encode_frame(&Frame {
+        flags: 0,
+        request: 0,
+        message: Message::EditorResized {
+            width: 500,
+            height: 280,
+        },
+    })
+    .unwrap();
+    assert_eq!(u16::from_le_bytes(bytes[4..6].try_into().unwrap()), 31);
+    for length in 0..8 {
+        let mut short = bytes[..12 + length].to_vec();
+        short[..4].copy_from_slice(&((8 + length) as u32).to_le_bytes());
+        assert!(decode_frame(&short).is_err());
+    }
 }

@@ -10,7 +10,7 @@ at 1432f61cc437c99fde8e8e84e10e648fe516d4ce with permission to distribute under 
 The VST2 ABI is translated from Xaymar/vst2sdk at
 339d4f31590bf77c0d0d248e09a380ac6285e069, BSD-3-Clause. The complete
 copyright and license notice is preserved in crates/vst-audio-worker-sys/src/vst2.rs.
-VST3 bindings: coupler-rs/vst3-rs 0.3.0, MIT OR Apache-2.0.
+VST3 bindings: coupler-rs/vst3-rs 0.3 (0.3.0 in this repository's Cargo.lock), MIT OR Apache-2.0.
 No Steinberg VST2 SDK, private third-party plugin, ASIO code or app UI was copied.
 VST is a registered trademark of Steinberg Media Technologies GmbH.
 This project is independent of Steinberg.
