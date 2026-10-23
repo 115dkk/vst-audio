@@ -21,6 +21,9 @@ impl ControlWatch {
     pub fn state(&self) -> vst_audio_protocol::WatchState {
         self.watch.state()
     }
+    pub fn restore_succeeded(&mut self) {
+        self.states.restore_succeeded();
+    }
     pub fn received(&mut self, now_ms: u64, frame: &Frame) -> Action {
         self.watch.received(
             now_ms,
@@ -126,6 +129,22 @@ mod tests {
         ));
         assert_eq!(watch.state(), WatchState::Disabled);
     }
+    #[test]
+    fn a_failed_respawn_start_counts_as_the_next_failure() {
+        let mut watch = ControlWatch::new(0);
+        running(&mut watch, 0);
+        assert_eq!(watch.poll(1, 0, Some(1)), [Action::EnterFallback]);
+        assert_eq!(watch.poll(500, 0, None), []);
+        assert_eq!(watch.poll(501, 0, None), [Action::Spawn]);
+        assert_eq!(watch.poll(501, 0, Some(1)), [Action::EnterFallback]);
+        assert_eq!(watch.poll(2_500, 0, None), []);
+        assert_eq!(watch.poll(2_501, 0, None), [Action::Spawn]);
+        assert!(matches!(
+            watch.poll(2_501, 0, Some(1)).as_slice(),
+            [Action::Disable { .. }]
+        ));
+    }
+
     #[test]
     fn requested_shutdown_does_not_respawn() {
         let mut watch = ControlWatch::new(0);

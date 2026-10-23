@@ -1,6 +1,95 @@
 use std::cell::Cell;
 use vst_audio_protocol::{EditorImage, ParentWindow};
-use x11rb::{connection::Connection, protocol::xproto::*, rust_connection::RustConnection};
+use x11rb::{
+    connection::Connection, protocol::xproto::*, rust_connection::RustConnection,
+    wrapper::ConnectionExt as _,
+};
+
+#[derive(Debug)]
+pub struct ResourceManager {
+    connection: RustConnection,
+    root: u32,
+    atom: u32,
+    previous: Option<(u32, u8, Vec<u8>)>,
+}
+impl ResourceManager {
+    /// Replaces the root RESOURCE_MANAGER string until this guard drops.
+    pub fn set(value: Option<&str>) -> Self {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let (connection, screen) = loop {
+            match x11rb::connect(None) {
+                Ok(connection) => break connection,
+                Err(error) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "X11 connection: {error}"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
+        };
+        let root = connection.setup().roots[screen].root;
+        let atom = connection
+            .intern_atom(false, b"RESOURCE_MANAGER")
+            .unwrap()
+            .reply()
+            .unwrap()
+            .atom;
+        let reply = connection
+            .get_property(false, root, atom, AtomEnum::ANY, 0, u32::MAX)
+            .unwrap()
+            .reply()
+            .unwrap();
+        let previous = (reply.type_ != 0).then_some((reply.type_, reply.format, reply.value));
+        match value {
+            Some(value) => connection
+                .change_property8(
+                    PropMode::REPLACE,
+                    root,
+                    atom,
+                    AtomEnum::STRING,
+                    value.as_bytes(),
+                )
+                .unwrap()
+                .check()
+                .unwrap(),
+            None => connection
+                .delete_property(root, atom)
+                .unwrap()
+                .check()
+                .unwrap(),
+        }
+        connection.flush().unwrap();
+        Self {
+            connection,
+            root,
+            atom,
+            previous,
+        }
+    }
+}
+impl Drop for ResourceManager {
+    fn drop(&mut self) {
+        let result = if let Some((type_, format, value)) = &self.previous {
+            let unit = usize::from(*format) / 8;
+            self.connection.change_property(
+                PropMode::REPLACE,
+                self.root,
+                self.atom,
+                *type_,
+                *format,
+                u32::try_from(value.len() / unit).unwrap(),
+                value,
+            )
+        } else {
+            self.connection.delete_property(self.root, self.atom)
+        };
+        if let Ok(cookie) = result {
+            let _ = cookie.check();
+        }
+        let _ = self.connection.flush();
+    }
+}
 
 #[derive(Debug)]
 pub struct Parent {

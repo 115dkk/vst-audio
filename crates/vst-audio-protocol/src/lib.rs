@@ -11,7 +11,8 @@ pub mod editor;
 pub mod layout;
 pub mod processing;
 pub use editor::{
-    EditorAction, EditorImage, EditorPlatform, EditorReply, EditorStatus, ParentWindow,
+    EditorAction, EditorImage, EditorPlatform, EditorReply, EditorScaling, EditorStatus,
+    ParentWindow,
 };
 pub use processing::{BusConfiguration, Capabilities, ProcessingSetup, SampleFormat};
 pub mod state;
@@ -21,7 +22,7 @@ pub struct PluginError(pub String);
 
 pub const MAGIC: [u8; 4] = *b"SSRP";
 pub const PROTOCOL_MAJOR: u16 = 4;
-pub const PROTOCOL_MINOR: u16 = 0;
+pub const PROTOCOL_MINOR: u16 = 1;
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 pub const MAX_STATE_BYTES: usize = 64 * 1024 * 1024;
 /// Longest UTF-8 string in a message. Windows long paths are why it is above
@@ -131,9 +132,12 @@ pub enum Message {
         blob: Vec<u8>,
     },
     GetState,
-    OpenEditor,
+    OpenEditor {
+        scaling: EditorScaling,
+    },
     OpenEditorIn {
         parent: ParentWindow,
+        scaling: EditorScaling,
     },
     CloseEditor,
     ListParameters {
@@ -218,7 +222,7 @@ impl Message {
             Self::Activate => 4,
             Self::SetState { .. } => 5,
             Self::GetState => 6,
-            Self::OpenEditor => 7,
+            Self::OpenEditor { .. } => 7,
             Self::OpenEditorIn { .. } => 30,
             Self::CloseEditor => 18,
             Self::ListParameters { .. } => 19,
@@ -442,11 +446,11 @@ fn encode_message(message: &Message, out: &mut Vec<u8>) -> Result<(), CodecError
         | Message::Describe
         | Message::GetState
         | Message::CloseEditor
-        | Message::OpenEditor
         | Message::Shutdown
         | Message::ParamsChanged
         | Message::Ack
         | Message::EditorClosed => {}
+        Message::OpenEditor { scaling } => out.push(*scaling as u8),
         Message::SetState { blob } | Message::State { blob } => out.extend_from_slice(blob),
         Message::Scan { path } => put_string(out, path)?,
         Message::Loaded {
@@ -498,13 +502,14 @@ fn encode_message(message: &Message, out: &mut Vec<u8>) -> Result<(), CodecError
             EditorAction::Inspect => out.push(5),
             EditorAction::Capture => out.push(6),
         },
-        Message::OpenEditorIn { parent } => {
+        Message::OpenEditorIn { parent, scaling } => {
             let (tag, handle) = match parent {
                 ParentWindow::Win32 { hwnd } => (0, hwnd),
                 ParentWindow::X11 { window } => (1, window),
             };
             out.push(tag);
             put_u64(out, *handle);
+            out.push(*scaling as u8);
         }
         Message::EditorStatus(status) => {
             out.push(status.platform as u8);
@@ -515,6 +520,7 @@ fn encode_message(message: &Message, out: &mut Vec<u8>) -> Result<(), CodecError
             put_u32(out, status.scale.to_bits());
             out.push(u8::from(status.resize_supported));
             out.push(u8::from(status.scale_supported));
+            out.push(status.scaling as u8);
         }
         Message::EditorImage(image) => {
             if !image.valid() {
@@ -609,6 +615,24 @@ fn encode_message(message: &Message, out: &mut Vec<u8>) -> Result<(), CodecError
     Ok(())
 }
 
+fn decode_editor_scaling(value: u8) -> Result<EditorScaling, CodecError> {
+    match value {
+        0 => Ok(EditorScaling::Auto),
+        1 => Ok(EditorScaling::Plugin),
+        2 => Ok(EditorScaling::Stretch),
+        3 => Ok(EditorScaling::Off),
+        _ => Err(CodecError::InvalidValue),
+    }
+}
+
+fn decode_optional_editor_scaling(cursor: &mut Cursor<'_>) -> Result<EditorScaling, CodecError> {
+    if cursor.remaining() == 0 {
+        Ok(EditorScaling::Auto)
+    } else {
+        decode_editor_scaling(cursor.u8()?)
+    }
+}
+
 fn decode_message(kind: u16, body: &[u8]) -> Result<Option<Message>, CodecError> {
     let mut cursor = Cursor::new(body);
     let message = match kind {
@@ -663,7 +687,9 @@ fn decode_message(kind: u16, body: &[u8]) -> Result<Option<Message>, CodecError>
             blob: body.to_vec(),
         },
         6 => Message::GetState,
-        7 => Message::OpenEditor,
+        7 => Message::OpenEditor {
+            scaling: decode_optional_editor_scaling(&mut cursor)?,
+        },
         8 => Message::Shutdown,
         9 => Message::Scan {
             path: cursor.string()?,
@@ -723,8 +749,8 @@ fn decode_message(kind: u16, body: &[u8]) -> Result<Option<Message>, CodecError>
             6 => EditorAction::Capture,
             _ => return Err(CodecError::InvalidValue),
         }),
-        30 => Message::OpenEditorIn {
-            parent: match cursor.u8()? {
+        30 => {
+            let parent = match cursor.u8()? {
                 0 => ParentWindow::Win32 {
                     hwnd: cursor.u64()?,
                 },
@@ -732,24 +758,39 @@ fn decode_message(kind: u16, body: &[u8]) -> Result<Option<Message>, CodecError>
                     window: cursor.u64()?,
                 },
                 _ => return Err(CodecError::InvalidValue),
-            },
-        },
-        27 => Message::EditorStatus(EditorStatus {
-            platform: match cursor.u8()? {
+            };
+            Message::OpenEditorIn {
+                parent,
+                scaling: decode_optional_editor_scaling(&mut cursor)?,
+            }
+        }
+        27 => {
+            let platform = match cursor.u8()? {
                 0 => EditorPlatform::Win32,
                 1 => EditorPlatform::Cocoa,
                 2 => EditorPlatform::X11,
                 3 => EditorPlatform::Wayland,
                 _ => return Err(CodecError::InvalidValue),
-            },
-            visible: cursor.boolean()?,
-            embedded: cursor.boolean()?,
-            width: cursor.u32()?,
-            height: cursor.u32()?,
-            scale: f32::from_bits(cursor.u32()?),
-            resize_supported: cursor.boolean()?,
-            scale_supported: cursor.boolean()?,
-        }),
+            };
+            let visible = cursor.boolean()?;
+            let embedded = cursor.boolean()?;
+            let width = cursor.u32()?;
+            let height = cursor.u32()?;
+            let scale = f32::from_bits(cursor.u32()?);
+            let resize_supported = cursor.boolean()?;
+            let scale_supported = cursor.boolean()?;
+            Message::EditorStatus(EditorStatus {
+                platform,
+                scaling: decode_optional_editor_scaling(&mut cursor)?,
+                visible,
+                embedded,
+                width,
+                height,
+                scale,
+                resize_supported,
+                scale_supported,
+            })
+        }
         28 => {
             let width = cursor.u32()?;
             let height = cursor.u32()?;
@@ -1346,6 +1387,17 @@ impl StateHistory {
             self.current.as_deref()
         }
     }
+    /// The state a respawned worker restores: the newest, unless the worker
+    /// failed right after restoring the newest, then the one before. Marks the
+    /// chosen state as being restored, so a failure right after it moves on.
+    pub fn respawn_state(&mut self) -> Option<Vec<u8>> {
+        let after_crash = self.crash_after_restore().map(<[u8]>::to_vec);
+        if after_crash.as_deref() == self.current() {
+            self.begin_restore().map(<[u8]>::to_vec)
+        } else {
+            after_crash
+        }
+    }
     pub fn current(&self) -> Option<&[u8]> {
         self.current.as_deref()
     }
@@ -1356,4 +1408,201 @@ impl StateHistory {
 
 pub fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod state_history_tests {
+    use super::StateHistory;
+
+    #[test]
+    fn respawn_uses_current_then_previous_after_a_failed_restore() {
+        let mut history = StateHistory::new();
+        assert_eq!(history.respawn_state(), None);
+        history.save(vec![1]);
+        history.save(vec![2]);
+        assert_eq!(history.respawn_state(), Some(vec![2]));
+        assert_eq!(history.respawn_state(), Some(vec![1]));
+        history.save(vec![3]);
+        assert_eq!(history.respawn_state(), Some(vec![3]));
+    }
+}
+
+#[cfg(test)]
+mod editor_scaling_tests {
+    use super::*;
+
+    fn round_trip(message: Message) -> Result<Message, CodecError> {
+        let encoded = encode_frame(&Frame {
+            flags: 0,
+            request: 1,
+            message,
+        })?;
+        let DecodedFrame::Known(decoded) = decode_frame(&encoded)? else {
+            panic!("known message decoded as unknown");
+        };
+        Ok(decoded.message)
+    }
+
+    fn scaling_modes() -> [EditorScaling; 4] {
+        [
+            EditorScaling::Auto,
+            EditorScaling::Plugin,
+            EditorScaling::Stretch,
+            EditorScaling::Off,
+        ]
+    }
+
+    #[test]
+    fn editor_open_scaling_round_trips_and_accepts_old_bodies() {
+        for scaling in scaling_modes() {
+            assert_eq!(
+                round_trip(Message::OpenEditor { scaling }).unwrap(),
+                Message::OpenEditor { scaling }
+            );
+            for parent in [
+                ParentWindow::Win32 { hwnd: 42 },
+                ParentWindow::X11 { window: 43 },
+            ] {
+                assert_eq!(
+                    round_trip(Message::OpenEditorIn { parent, scaling }).unwrap(),
+                    Message::OpenEditorIn { parent, scaling }
+                );
+            }
+        }
+
+        let old_open = [8, 0, 0, 0, 7, 0, 0, 0, 1, 0, 0, 0];
+        assert!(matches!(
+            decode_frame(&old_open).unwrap(),
+            DecodedFrame::Known(Frame {
+                message: Message::OpenEditor {
+                    scaling: EditorScaling::Auto
+                },
+                ..
+            })
+        ));
+
+        let mut old_embedded = encode_frame(&Frame {
+            flags: 0,
+            request: 1,
+            message: Message::OpenEditorIn {
+                parent: ParentWindow::X11 { window: 44 },
+                scaling: EditorScaling::Auto,
+            },
+        })
+        .unwrap();
+        old_embedded.pop();
+        old_embedded[0..4].copy_from_slice(&17_u32.to_le_bytes());
+        assert!(matches!(
+            decode_frame(&old_embedded).unwrap(),
+            DecodedFrame::Known(Frame {
+                message: Message::OpenEditorIn {
+                    parent: ParentWindow::X11 { window: 44 },
+                    scaling: EditorScaling::Auto
+                },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn editor_open_rejects_unknown_scaling() {
+        let mut open = encode_frame(&Frame {
+            flags: 0,
+            request: 1,
+            message: Message::OpenEditor {
+                scaling: EditorScaling::Auto,
+            },
+        })
+        .unwrap();
+        *open.last_mut().unwrap() = 4;
+        assert!(matches!(decode_frame(&open), Err(CodecError::InvalidValue)));
+
+        let mut embedded = encode_frame(&Frame {
+            flags: 0,
+            request: 1,
+            message: Message::OpenEditorIn {
+                parent: ParentWindow::Win32 { hwnd: 42 },
+                scaling: EditorScaling::Auto,
+            },
+        })
+        .unwrap();
+        *embedded.last_mut().unwrap() = u8::MAX;
+        assert!(matches!(
+            decode_frame(&embedded),
+            Err(CodecError::InvalidValue)
+        ));
+    }
+
+    #[test]
+    fn editor_status_scaling_round_trips_and_accepts_old_body() {
+        for scaling in scaling_modes() {
+            let status = EditorStatus {
+                platform: EditorPlatform::Wayland,
+                scaling,
+                visible: true,
+                embedded: false,
+                width: 320,
+                height: 200,
+                scale: 2.0,
+                resize_supported: true,
+                scale_supported: true,
+            };
+            assert_eq!(
+                round_trip(Message::EditorStatus(status.clone())).unwrap(),
+                Message::EditorStatus(status)
+            );
+        }
+
+        let mut old = encode_frame(&Frame {
+            flags: 0,
+            request: 1,
+            message: Message::EditorStatus(EditorStatus {
+                platform: EditorPlatform::X11,
+                scaling: EditorScaling::Auto,
+                visible: true,
+                embedded: false,
+                width: 640,
+                height: 480,
+                scale: 1.0,
+                resize_supported: true,
+                scale_supported: false,
+            }),
+        })
+        .unwrap();
+        old.pop();
+        old[0..4].copy_from_slice(&25_u32.to_le_bytes());
+        let DecodedFrame::Known(Frame {
+            message: Message::EditorStatus(status),
+            ..
+        }) = decode_frame(&old).unwrap()
+        else {
+            panic!("expected editor status");
+        };
+        assert_eq!(status.scaling, EditorScaling::Auto);
+    }
+
+    #[test]
+    fn editor_status_rejects_unknown_scaling() {
+        let mut encoded = encode_frame(&Frame {
+            flags: 0,
+            request: 1,
+            message: Message::EditorStatus(EditorStatus {
+                platform: EditorPlatform::Win32,
+                scaling: EditorScaling::Auto,
+                visible: true,
+                embedded: false,
+                width: 320,
+                height: 200,
+                scale: 1.0,
+                resize_supported: true,
+                scale_supported: true,
+            }),
+        })
+        .unwrap();
+        *encoded.last_mut().unwrap() = 9;
+        assert!(matches!(
+            decode_frame(&encoded),
+            Err(CodecError::InvalidValue)
+        ));
+    }
 }

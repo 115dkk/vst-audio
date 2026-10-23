@@ -217,14 +217,20 @@ impl Plugin for Vst2 {
     fn set_state(&mut self, blob: &[u8]) -> Result<(), PluginError> {
         self.inner.set_state(blob).map_err(plugin_error)
     }
-    fn open_editor(&mut self) -> Result<(), PluginError> {
-        self.inner.open_editor().map_err(plugin_error)
+    fn open_editor(
+        &mut self,
+        scaling: vst_audio_protocol::EditorScaling,
+    ) -> Result<(), PluginError> {
+        self.inner.open_editor(scaling).map_err(plugin_error)
     }
     fn open_editor_in(
         &mut self,
         parent: vst_audio_protocol::ParentWindow,
+        scaling: vst_audio_protocol::EditorScaling,
     ) -> Result<(), PluginError> {
-        self.inner.open_editor_in(parent).map_err(plugin_error)
+        self.inner
+            .open_editor_in(parent, scaling)
+            .map_err(plugin_error)
     }
     fn editor_action(
         &mut self,
@@ -383,7 +389,7 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
                         Message::Editor(_)
                             | Message::ListParameters { .. }
                             | Message::SetParameter { .. }
-                            | Message::OpenEditor
+                            | Message::OpenEditor { .. }
                             | Message::OpenEditorIn { .. }
                             | Message::CloseEditor
                     );
@@ -590,19 +596,19 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
                                 Ok(Message::EditorImage(i))
                             }
                         },
-                        Message::OpenEditor => {
+                        Message::OpenEditor { scaling } => {
                             plugin
                                 .as_mut()
                                 .ok_or_else(|| StartError("Load required".into()))?
-                                .open_editor()
+                                .open_editor(scaling)
                                 .map_err(error)?;
                             Ok(Message::Ack)
                         }
-                        Message::OpenEditorIn { parent } => {
+                        Message::OpenEditorIn { parent, scaling } => {
                             let plugin = plugin
                                 .as_mut()
                                 .ok_or_else(|| StartError("Load required".into()))?;
-                            plugin.open_editor_in(parent).map_err(|failure| {
+                            plugin.open_editor_in(parent, scaling).map_err(|failure| {
                                 // Windows may refuse a Low-integrity child of a higher
                                 // parent; the native error stays in diagnostics.
                                 #[cfg(windows)]

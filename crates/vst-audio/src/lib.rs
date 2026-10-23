@@ -26,8 +26,12 @@ pub use vst_audio_protocol::{EditPhase, Parameter};
 
 pub use vst_audio_protocol::{BusConfiguration, Capabilities, ProcessingSetup, SampleFormat};
 pub use vst_audio_ring::{
-    Event as AudioEvent, EventBuffer, EventData, MAX_EVENTS, MAX_SLOTS, MAX_SYSEX_BYTES, Transport,
+    BlockError, BlockLane, Event as AudioEvent, EventBuffer, EventData, Exchange, MAX_EVENTS,
+    MAX_SLOTS, MAX_SYSEX_BYTES, SlotReader, SlotWriter, Transport,
 };
+
+mod block;
+pub use block::{BlockEndpoint, BlockStatus};
 
 mod audio;
 pub use audio::{AudioEndpoint, AudioStatus, ProcessReport};
@@ -35,5 +39,5 @@ pub use audio::{AudioEndpoint, AudioStatus, ProcessReport};
 mod supervision;
 
 pub use vst_audio_protocol::{
-    EditorAction, EditorImage, EditorPlatform, EditorStatus, ParentWindow,
+    EditorAction, EditorImage, EditorPlatform, EditorScaling, EditorStatus, ParentWindow,
 };

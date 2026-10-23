@@ -147,6 +147,32 @@ fn directory(root: &Path, name: &str) -> PathBuf {
     fs::create_dir(&path).unwrap_or_else(|e| panic!("create fresh {}: {e}", path.display()));
     path
 }
+/// Answers the Editor's message boxes (No, else OK); true when one was open.
+/// The plugin panel dialog (it has Apply) is not a message box.
+fn dismiss_message_boxes(case: Case, pid: u32) -> bool {
+    let boxes: Vec<_> = desktop::top_windows(pid)
+        .into_iter()
+        .filter(|w| {
+            !w.title.contains("Configuration Editor")
+                && w.class == "Qt6120QWindowIcon"
+                && desktop::find_named(w.handle, "Apply", None).is_none()
+        })
+        .collect();
+    for window in &boxes {
+        if let Some(rect) = desktop::find_named(window.handle, "No", None)
+            .or_else(|| desktop::find_named(window.handle, "OK", None))
+        {
+            println!(
+                "METRIC {{\"case\":{:?},\"message_box\":{:?}}}",
+                case.name(),
+                window.title
+            );
+            let (x, y) = rect.center();
+            desktop::click(pid, x, y);
+        }
+    }
+    !boxes.is_empty()
+}
 fn gui(case: Case, app: &Path, root: &Path, library: &Path) -> (PluginLine, usize) {
     let dir = directory(root, &format!("{}-gui", case.name()));
     let config = dir.join("config.txt");
@@ -177,43 +203,48 @@ fn gui(case: Case, app: &Path, root: &Path, library: &Path) -> (PluginLine, usiz
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut quiet = Instant::now();
     while Instant::now() < deadline {
-        let boxes: Vec<_> = desktop::top_windows(pid)
-            .into_iter()
-            .filter(|w| !w.title.contains("Configuration Editor") && w.class == "Qt6120QWindowIcon")
-            .collect();
-        if boxes.is_empty() {
-            if quiet.elapsed() >= Duration::from_secs(2) {
-                break;
-            }
-        } else {
+        if dismiss_message_boxes(case, pid) {
             quiet = Instant::now();
-            for window in boxes {
-                if let Some(rect) = desktop::find_named(window.handle, "No", None)
-                    .or_else(|| desktop::find_named(window.handle, "OK", None))
-                {
-                    println!(
-                        "METRIC {{\"case\":{:?},\"message_box\":{:?}}}",
-                        case.name(),
-                        window.title
-                    );
-                    let (x, y) = rect.center();
-                    desktop::click(pid, x, y);
-                }
-            }
+        } else if quiet.elapsed() >= Duration::from_secs(2) {
+            break;
         }
         std::thread::sleep(Duration::from_millis(200));
     }
     let button = until(15, "Open panel", || {
         desktop::find_named(main.handle, "Open panel", None)
     });
-    let (x, y) = button.center();
-    desktop::click(pid, x, y);
-    let (dialog, plugin) = until(10, "DPF plugin HWND", || {
-        desktop::top_windows(pid).into_iter().find_map(|w| {
-            desktop::find_child_class(w.handle, &format!("DISTRHO-{}", case.plugin()))
-                .map(|p| (w, p))
-        })
-    });
+    // On a cold runner a startup message box can appear after the quiet period
+    // above; it is modal, so the click lands on a disabled window and no panel
+    // opens. Close late boxes while waiting and press the button again.
+    let mut clicks = 0;
+    let (dialog, plugin) = loop {
+        clicks += 1;
+        let (x, y) = button.center();
+        desktop::click(pid, x, y);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let found = loop {
+            let found = desktop::top_windows(pid).into_iter().find_map(|w| {
+                desktop::find_child_class(w.handle, &format!("DISTRHO-{}", case.plugin()))
+                    .map(|p| (w, p))
+            });
+            if found.is_some() || Instant::now() >= deadline {
+                break found;
+            }
+            dismiss_message_boxes(case, pid);
+            std::thread::sleep(Duration::from_millis(200));
+        };
+        if let Some(found) = found {
+            break found;
+        }
+        assert!(
+            clicks < 3,
+            "timed out: DPF plugin HWND after {clicks} presses of Open panel"
+        );
+        println!(
+            "METRIC {{\"case\":{:?},\"open_panel_retry\":{clicks}}}",
+            case.name()
+        );
+    };
     let r = plugin.rect;
     println!(
         "METRIC {{\"case\":{:?},\"plugin_rect\":[{},{},{},{}]}}",

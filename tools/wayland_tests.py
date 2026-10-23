@@ -57,6 +57,7 @@ def main():
                         env["DISPLAY"] = display.group(1)
                         run("wayland", "wayland_attach_rejection_falls_back_only_for_auto",
                             dict(env, VST_AUDIO_REJECT_WAYLAND="1"))
+                        run("wayland", "stretch_uses_the_desktop_xwayland", env)
                         # Existing tests default to Auto. Remove Wayland discovery
                         # only in the workers, retaining the desktop's XWayland.
                         env.pop("WAYLAND_DISPLAY")

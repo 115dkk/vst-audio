@@ -34,6 +34,11 @@ pub(crate) fn wayland_session() -> bool {
 pub(crate) fn x11_available() -> bool {
     std::env::var_os("DISPLAY").is_some()
 }
+/// A Wayland session whose desktop XWayland may host X11 editors: the
+/// compositor then scales them like any X11 application (`Stretch`).
+pub(crate) fn desktop_xwayland() -> bool {
+    wayland_session() && x11_available() && policy() != Policy::Wayland
+}
 pub(crate) fn x11_selection() -> io::Result<()> {
     match policy() {
         Policy::Wayland => Err(io::Error::other(

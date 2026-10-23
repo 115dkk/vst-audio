@@ -54,8 +54,13 @@ worker can therefore stall application input. Independent supervision must
 terminate the hung worker to release that coupling.** This is crash containment,
 not input isolation. Mixed-DPI hosting is a property of the parent at creation;
 changing `SetThreadDpiHostingBehavior` in the worker cannot retrofit the application's
-parent. The worker leaves DPI context/hosting behavior unchanged. Applications
-must create a compatible parent; mixed-DPI combinations require native testing.
+parent. The worker creates each editor window inside a thread DPI scope that it
+restores afterwards: per-monitor-v2, or unaware with GDI scaling for a stretched
+floating editor. A child whose awareness differs from the application's parent
+is created with mixed hosting for that call only; the parent's own hosting
+policy stays the application's. These functions are looked up at run time, so
+older Windows releases open editors at scale 1. Real mixed-DPI multi-monitor
+setups still require native testing.
 A sandboxed worker may be denied access to a higher-integrity parent by Windows;
 that creation failure is an explicit request failure, with the native error
 retained in worker diagnostics, never a floating-window fallback.
@@ -72,13 +77,14 @@ and a caller-rendered parameter UI remain the portable alternatives.
 backend. Other operating systems ignore the Linux choice. Embedded X11 windows
 always use the session `DISPLAY`, regardless of that choice.
 
-The intended three routes are native VST 3 Wayland, the session X display
-(Xorg or desktop XWayland), and a private rootful Xwayland per editor. Native
-Wayland and session X are implemented; **private Xwayland is not implemented in
-this change**. `Auto` currently tries a supporting VST 3 view on Wayland and then
-the session X display. `Wayland` rejects VST 2/unsupported views; `X11` never
-exposes a Wayland host. Private Xwayland is planned, not implemented, and has no
-public selection or wire tag. Both public backend enums are non-exhaustive.
+Two routes are implemented: native VST 3 Wayland and the session X display
+(Xorg or desktop XWayland). `Auto` tries a supporting VST 3 view on Wayland and
+then the session X display. `Wayland` rejects VST 2/unsupported views; `X11` never
+exposes a Wayland host. `EditorScaling::Stretch` skips native Wayland so that the
+compositor scales the desktop XWayland window. A private rootful Xwayland per
+editor was considered and not implemented: plugins connect to `DISPLAY`
+themselves, and an X server cannot be stopped under a plugin's connection
+(`docs/support.md` has the details). Both public backend enums are non-exhaustive.
 `Auto` also retries a fresh view on X11 after Wayland setup or attachment fails;
 explicit `Wayland` never falls back.
 
@@ -181,17 +187,17 @@ Queued work and notifications have bounded storage and explicit overflow.
 The wire ABI never contains Rust object layout or process-local pointers.
 
 Realtime blocks use preallocated shared memory, sequence numbers, configuration
-generations and sample positions. Each lane has 2 to 16 contiguous sample slots;
-the configured pipeline depth selects the exact earlier application block to
-consume. Applications that read before publishing may use depth up to the slot
-count; publish-then-read requires one spare slot. The parent trusts its own
-validated geometry. Plugin processing receives private scratch buffers, never
-the shared mapping. Late outputs cannot be substituted for a different sample
-interval. The callback does not allocate, block or perform synchronous control
-I/O. The implemented high-level adapter chooses
-`depth = ceil(max_callback_frames / quantum)`, allocates `depth + 1` slots, and
-reports `(depth + 1) * quantum + plugin latency` frames. The default is depth 1,
-two slots and two quanta plus plugin latency.
+generations and sample positions. `BlockLane` is the ring-only client;
+`BlockEndpoint` adds instance recovery and reports a missed `k - depth` block for
+caller fallback; `AudioEndpoint` adds variable callback batching, events,
+transport and fallback. Each lane has 2 to 16 contiguous sample slots selected by
+`Configuration::slots` (default callback depth plus one). The parent trusts its
+own validated geometry. Plugin processing receives private scratch buffers,
+never the shared mapping. Late outputs cannot be substituted for a different
+sample interval. The callback does not allocate, block or perform synchronous
+control I/O. `BlockEndpoint` reports `depth * quantum + plugin latency`; the
+adapter reports `(depth + 1) * quantum + plugin latency`. See
+[ADR 0004](adr/0004-block-endpoint.md).
 
 Native pointer/lifetime operations are audited in sys crates. For loading a
 plugin, crash isolation does not make unknown native code memory-safe inside the
@@ -213,6 +219,9 @@ Crashes and hangs are confined to one worker. Effects can use latency-aligned
 bypass, silence or caller-provided fallback; instruments use silence. Recovery
 creates a new process and session, restores the last successful state and
 reconciles transport/notes. Past MIDI/automation is not blindly replayed.
+`RecoveryPolicy::Watch` carries the low-level watch across processes: it retries
+after 0.5, 2 and 8 seconds, retains two saved states for restore fallback, and
+disables automatic recovery after three failures in ten minutes.
 `Configuration::sandbox` and `ProcessingOptions::sandbox` optionally select an
 OS sandbox; `None` preserves plugin compatibility. `SandboxPolicy` denies
 network access, execution of other programs and writes outside per-worker

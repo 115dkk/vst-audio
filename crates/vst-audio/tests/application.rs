@@ -4,8 +4,8 @@ use std::{
     time::{Duration, Instant},
 };
 use vst_audio::{
-    AudioStatus, Command, Configuration, EditPhase, Host, HostEvent, PluginDescriptor,
-    PluginFormat, Status,
+    AudioStatus, BlockError, BlockStatus, Command, Configuration, EditPhase, Host, HostEvent,
+    PluginDescriptor, PluginFormat, RecoveryPolicy, Status,
 };
 
 #[global_allocator]
@@ -416,6 +416,273 @@ fn recovery_replaces_resources_only_at_an_audio_boundary() {
     }
 }
 
+fn watch_configuration() -> Configuration {
+    Configuration {
+        recovery: RecoveryPolicy::Watch,
+        ..Configuration::default()
+    }
+}
+
+#[test]
+#[ignore = "native fixtures required"]
+fn watch_policy_respawns_a_crashed_worker_with_its_state() {
+    for format in [PluginFormat::Vst2, PluginFormat::Vst3] {
+        let mut instance = host()
+            .spawn(
+                &descriptor(format),
+                &watch_configuration(),
+                Some(&state(format, 0)),
+            )
+            .unwrap();
+        let controller = instance.controller();
+        let mut audio = instance.take_audio().unwrap();
+        let saved = controller.request(Command::SaveState).unwrap();
+        let crash = controller
+            .request(Command::RestoreState(state(format, 1)))
+            .unwrap();
+        let input = [0.25; 128];
+        let mut output = [[0.0; 128]; 6];
+        let mut refs: Vec<_> = output.iter_mut().map(|plane| &mut plane[..]).collect();
+        audio.process(&[&input, &input], &mut refs);
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(4);
+        let mut saw_saved = false;
+        let mut saw_crash_ack = false;
+        let mut saw_failed = false;
+        let mut recovered_at = None;
+        while Instant::now() < deadline {
+            if let Some(event) = instance.try_next_event() {
+                match event {
+                    HostEvent::State { request, .. } if request == Some(saved) => saw_saved = true,
+                    HostEvent::Completed { request } if request == crash => saw_crash_ack = true,
+                    HostEvent::Failed { .. } => {
+                        saw_failed = true;
+                        assert_eq!(controller.status(), Status::Recovering);
+                    }
+                    HostEvent::Recovered { generation: 2 } => {
+                        recovered_at = Some(started.elapsed());
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            audio.process(&[&input, &input], &mut refs);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let delay = recovered_at.expect("watch did not recover generation 2");
+        eprintln!("{format:?} watch respawn recovered after {delay:?}");
+        assert!(saw_saved);
+        assert!(saw_crash_ack);
+        assert!(saw_failed);
+        assert!(delay >= Duration::from_millis(500));
+        let processing_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < processing_deadline {
+            if audio.process(&[&input, &input], &mut refs) == AudioStatus::Processed
+                && (refs[0][100] - 0.25).abs() < 1e-6
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(controller.status(), Status::Running);
+        assert!((refs[0][100] - 0.25).abs() < 1e-6);
+    }
+}
+
+#[test]
+#[ignore = "native fixtures required"]
+fn watch_policy_disables_after_three_failures() {
+    for format in [PluginFormat::Vst2, PluginFormat::Vst3] {
+        let mut instance = host()
+            .spawn(&descriptor(format), &watch_configuration(), None)
+            .unwrap();
+        let controller = instance.controller();
+        let mut audio = instance.take_audio().unwrap();
+        let input = [0.25; 128];
+        let mut output = [[0.0; 128]; 6];
+        let mut refs: Vec<_> = output.iter_mut().map(|plane| &mut plane[..]).collect();
+        for generation in [2, 3] {
+            controller
+                .request(Command::RestoreState(state(format, 1)))
+                .unwrap();
+            audio.process(&[&input, &input], &mut refs);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                audio.process(&[&input, &input], &mut refs);
+                if matches!(instance.try_next_event(), Some(HostEvent::Recovered { generation: value }) if value == generation)
+                {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "missing generation {generation}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        controller
+            .request(Command::RestoreState(state(format, 1)))
+            .unwrap();
+        audio.process(&[&input, &input], &mut refs);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut recovery_required = false;
+        while Instant::now() < deadline {
+            audio.process(&[&input, &input], &mut refs);
+            if matches!(instance.try_next_event(), Some(HostEvent::RecoveryRequired)) {
+                recovery_required = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(recovery_required);
+        assert_eq!(controller.status(), Status::Failed);
+        let pid = controller.worker_pid();
+        std::thread::sleep(Duration::from_secs(1));
+        assert_eq!(controller.worker_pid(), pid);
+        let recover = controller
+            .request(Command::Recover { use_previous: true })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(4);
+        loop {
+            audio.process(&[&input, &input], &mut refs);
+            if matches!(instance.try_next_event(), Some(HostEvent::Completed { request }) if request == recover)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "manual recovery did not start a fresh window"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+#[test]
+#[ignore = "native fixtures required"]
+fn watch_policy_shutdown_during_backoff_does_not_respawn() {
+    for format in [PluginFormat::Vst2, PluginFormat::Vst3] {
+        let mut instance = host()
+            .spawn(&descriptor(format), &watch_configuration(), None)
+            .unwrap();
+        let controller = instance.controller();
+        let mut audio = instance.take_audio().unwrap();
+        let input = [0.25; 128];
+        let mut output = [[0.0; 128]; 6];
+        let mut refs: Vec<_> = output.iter_mut().map(|plane| &mut plane[..]).collect();
+        controller
+            .request(Command::RestoreState(state(format, 1)))
+            .unwrap();
+        audio.process(&[&input, &input], &mut refs);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while controller.status() != Status::Recovering {
+            audio.process(&[&input, &input], &mut refs);
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let pid = controller.worker_pid();
+        controller.request(Command::Shutdown).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while controller.status() != Status::Stopped {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::thread::sleep(Duration::from_millis(700));
+        assert_eq!(controller.status(), Status::Stopped);
+        assert_eq!(controller.worker_pid(), pid);
+    }
+}
+
+#[test]
+#[ignore = "native fixtures required"]
+fn block_endpoint_delivers_and_adopts_recovery() {
+    for format in [PluginFormat::Vst2, PluginFormat::Vst3] {
+        let mut instance = host()
+            .spawn(
+                &descriptor(format),
+                &Configuration {
+                    slots: Some(8),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        let controller = instance.controller();
+        let mut blocks = instance.take_blocks().unwrap();
+        assert!(instance.take_audio().is_none());
+        let input = [0.25; 256];
+        let mut invalid = [-1.0; 767];
+        assert_eq!(
+            blocks.process(&input, &mut invalid),
+            BlockStatus::InvalidBuffer
+        );
+        assert!(invalid.iter().all(|sample| *sample == -1.0));
+        assert_eq!(blocks.restart(8), Err(BlockError::Depth));
+        blocks.restart(7).unwrap();
+        let mut output = [-1.0; 768];
+        for _ in 0..7 {
+            assert_eq!(
+                assert_no_alloc::assert_no_alloc(|| blocks.process(&input, &mut output)),
+                BlockStatus::Missed
+            );
+            assert!(output.iter().all(|sample| *sample == -1.0));
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            let status = assert_no_alloc::assert_no_alloc(|| blocks.process(&input, &mut output));
+            if status == BlockStatus::Delivered {
+                assert!((output[100] - 0.25).abs() < 1e-6);
+                assert!((output[5 * 128 + 100] - 0.125).abs() < 1e-6);
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        let crash = controller
+            .request(Command::RestoreState(state(format, 1)))
+            .unwrap();
+        while !matches!(instance.try_next_event(),Some(HostEvent::Completed{request})if request==crash)
+        {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let _ = blocks.process(&input, &mut output);
+        while controller.status() != Status::Failed {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let recover = controller
+            .request(Command::Recover {
+                use_previous: false,
+            })
+            .unwrap();
+        while !matches!(instance.try_next_event(),Some(HostEvent::Completed{request})if request==recover)
+        {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let mut adopted = false;
+        while Instant::now() < deadline {
+            let _ = assert_no_alloc::assert_no_alloc(|| blocks.process(&input, &mut output));
+            if blocks.generation() == 2 {
+                adopted = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        assert!(adopted);
+        blocks.restart(1).unwrap();
+        let mut delivered = false;
+        while Instant::now() < deadline {
+            if assert_no_alloc::assert_no_alloc(|| blocks.process(&input, &mut output)).delivered()
+            {
+                delivered = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        assert!(delivered);
+    }
+}
+
 #[test]
 #[ignore = "native fixtures required"]
 fn cancellation_interrupts_a_hung_state_restore() {
@@ -522,11 +789,62 @@ fn editor_visibility_focus_scaling_errors_and_pixels_roundtrip() {
                 assert_eq!((status.width, status.height, status.scale), (w, h, scale));
                 assert!(status.resize_supported && status.scale_supported);
             }
-        } else {
+        } else if cfg!(target_os = "macos") {
+            // macOS leaves Retina scaling to the system: no VST 2 scale request.
             assert!(matches!(
                 wait(control.request(Command::Editor(A::Scale(1.5))).unwrap()),
                 HostEvent::RequestFailed { .. }
             ));
+        } else {
+            // The VST 2 fixture accepts the 'PreS'/'AeCs' content scale and
+            // reports its 320x200 rectangle scaled.
+            let HostEvent::EditorStatus { status, .. } =
+                wait(control.request(Command::Editor(A::Scale(1.5))).unwrap())
+            else {
+                panic!("missing VST 2 scale response")
+            };
+            assert_eq!((status.width, status.height, status.scale), (480, 300, 1.5));
+            assert!(status.scale_supported && !status.resize_supported);
+            // Mode 19 does not answer supportsViewDpiScaling: no scale contract.
+            let plain = host()
+                .spawn(
+                    &descriptor(format),
+                    &Configuration::default(),
+                    Some(&state(format, 19)),
+                )
+                .unwrap();
+            let plain_control = plain.controller();
+            let plain_wait = |request| {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    if let Some(event) = plain.try_next_event() {
+                        let id = match &event {
+                            HostEvent::Completed { request }
+                            | HostEvent::RequestFailed { request, .. }
+                            | HostEvent::EditorStatus { request, .. } => Some(*request),
+                            _ => None,
+                        };
+                        if id == Some(request) {
+                            break event;
+                        }
+                    }
+                    assert!(Instant::now() < deadline, "editor response timeout");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            };
+            assert!(matches!(
+                plain_wait(plain_control.request(Command::OpenEditor).unwrap()),
+                HostEvent::Completed { .. }
+            ));
+            assert!(matches!(
+                plain_wait(
+                    plain_control
+                        .request(Command::Editor(A::Scale(1.5)))
+                        .unwrap()
+                ),
+                HostEvent::RequestFailed { .. }
+            ));
+            drop(plain);
         }
         // Unsupported or invalid requests leave the editor and audio instance alive.
         assert!(matches!(

@@ -7,8 +7,8 @@ use std::{
     time::{Duration, Instant},
 };
 use vst_audio::{
-    Command, Configuration, EditorAction as A, EditorPlatform, Host, HostEvent, Instance,
-    LinuxEditor, PluginDescriptor, PluginFormat,
+    Command, Configuration, EditorAction as A, EditorPlatform, EditorScaling, Host, HostEvent,
+    Instance, LinuxEditor, PluginDescriptor, PluginFormat,
 };
 fn spawn(format: PluginFormat, policy: LinuxEditor, sandbox: bool) -> Instance {
     Host::new(PathBuf::from(
@@ -142,7 +142,7 @@ fn pixels(label: &str) -> (usize, u32, u32) {
     (count, bounds.0, bounds.1)
 }
 #[test]
-#[ignore = "native fixtures required"]
+#[ignore = "native fixtures and display required"]
 fn native_wayland_pixels_lifecycle_scale_and_sandbox() {
     assert!(std::env::var_os("DISPLAY").is_none());
     let scale: u32 = std::env::var("VST_AUDIO_TEST_SCALE")
@@ -159,6 +159,7 @@ fn native_wayland_pixels_lifecycle_scale_and_sandbox() {
             panic!("{status:?}")
         };
         assert_eq!(status.platform, EditorPlatform::Wayland);
+        assert_eq!(status.scaling, EditorScaling::Plugin);
         assert_eq!(status.scale, scale as f32);
         let (count, width, height) = pixels("shown");
         assert_eq!((width, height), (320 * scale, 200 * scale));
@@ -257,7 +258,7 @@ fn native_wayland_pixels_lifecycle_scale_and_sandbox() {
     }
 }
 #[test]
-#[ignore = "native fixtures required"]
+#[ignore = "native fixtures and display required"]
 fn failed_wayland_recreation_closes_editor() {
     let mut instance = spawn(PluginFormat::Vst3, LinuxEditor::Auto, false);
     let mut audio = instance.take_audio().unwrap();
@@ -292,7 +293,7 @@ fn failed_wayland_recreation_closes_editor() {
     audio_continues(&mut audio);
 }
 #[test]
-#[ignore = "native fixtures required"]
+#[ignore = "native fixtures and display required"]
 fn wayland_selection_and_vst2_rejection() {
     let instance = spawn(PluginFormat::Vst3, LinuxEditor::Auto, false);
     let opened = response(&instance, Command::OpenEditor);
@@ -307,7 +308,7 @@ fn wayland_selection_and_vst2_rejection() {
 }
 
 #[test]
-#[ignore = "native fixtures required"]
+#[ignore = "native fixtures and display required"]
 fn wayland_attach_rejection_falls_back_only_for_auto() {
     assert!(std::env::var_os("VST_AUDIO_REJECT_WAYLAND").is_some());
     let instance = spawn(PluginFormat::Vst3, LinuxEditor::Auto, false);
@@ -339,7 +340,7 @@ fn wayland_attach_rejection_falls_back_only_for_auto() {
     ));
 }
 #[test]
-#[ignore = "native fixtures required"]
+#[ignore = "native fixtures and display required"]
 fn rejected_content_scale_preserves_actual_scale() {
     assert!(std::env::var_os("VST_AUDIO_REJECT_SCALE").is_some());
     let instance = spawn(PluginFormat::Vst3, LinuxEditor::Wayland, false);
@@ -350,7 +351,7 @@ fn rejected_content_scale_preserves_actual_scale() {
     assert!(matches!(status, HostEvent::EditorStatus { status, .. } if status.scale == 1.0));
 }
 #[test]
-#[ignore = "native fixtures required"]
+#[ignore = "native fixtures and display required"]
 fn initial_content_scale_precedes_attachment() {
     let instance = spawn(PluginFormat::Vst3, LinuxEditor::Wayland, false);
     let opened = response(&instance, Command::OpenEditor);
@@ -365,7 +366,7 @@ fn initial_content_scale_precedes_attachment() {
     assert!(pixels("initial scale").0 > 0);
 }
 #[test]
-#[ignore = "native fixtures required"]
+#[ignore = "native fixtures and display required"]
 fn compositor_disconnect_closes_editor_and_preserves_audio() {
     let mut instance = spawn(PluginFormat::Vst3, LinuxEditor::Wayland, false);
     let mut audio = instance.take_audio().unwrap();
@@ -404,4 +405,47 @@ fn compositor_disconnect_closes_editor_and_preserves_audio() {
         std::thread::sleep(Duration::from_millis(5));
     }
     eprintln!("post-disconnect audio blocks={processed}");
+}
+
+#[test]
+#[ignore = "native fixtures and display required"]
+fn stretch_uses_the_desktop_xwayland() {
+    // A Wayland session with the desktop's XWayland: both sockets are set.
+    assert!(std::env::var_os("WAYLAND_DISPLAY").is_some() && std::env::var_os("DISPLAY").is_some());
+    let stretch = Command::OpenEditorWith {
+        parent: None,
+        scaling: EditorScaling::Stretch,
+    };
+    for format in [PluginFormat::Vst3, PluginFormat::Vst2] {
+        let instance = spawn(format, LinuxEditor::Auto, false);
+        let opened = response(&instance, stretch.clone());
+        assert!(matches!(opened, HostEvent::Completed { .. }), "{opened:?}");
+        let HostEvent::EditorStatus { status, .. } =
+            response(&instance, Command::Editor(A::Inspect))
+        else {
+            panic!("missing status")
+        };
+        assert_eq!(status.platform, EditorPlatform::X11, "{format:?}");
+        assert_eq!(status.scaling, EditorScaling::Stretch, "{format:?}");
+        assert_eq!((status.scale, status.width, status.height), (1.0, 320, 200));
+        let HostEvent::EditorImage { image, .. } = response(&instance, Command::Editor(A::Capture))
+        else {
+            panic!("X11 capture failed")
+        };
+        let count = image
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| p[..3] == [32, 64, 128])
+            .count();
+        eprintln!("stretch {format:?} platform=X11 pixels={count}");
+        assert_eq!(count, 64000);
+    }
+    // The explicit Wayland policy never uses an X server.
+    let instance = spawn(PluginFormat::Vst3, LinuxEditor::Wayland, false);
+    assert!(matches!(
+        response(&instance, stretch),
+        HostEvent::RequestFailed { reason, .. } if reason.starts_with("stretched editors need")
+    ));
 }

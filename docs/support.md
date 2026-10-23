@@ -9,17 +9,17 @@ from this repository. Required CI executes the implementation on Windows x64, Li
 | Architectures | Bounded PE, ELF and Mach-O (including universal) header inspection; `Host::with_worker` registers architecture-specific workers and native slices are preferred. CI runs the native, feature and cross-architecture tests (VST2/VST3 numeric audio, events, state and editors) with a foreign worker on four native runners: Linux x86_64 + i686, Windows x64 + i686, Windows ARM64 + x64 (emulation) and macOS arm64 + x86_64 (Rosetta) |
 | Isolation | One worker per instance; crash/hang A while parent and B keep processing. Windows creates workers without a console window (`CREATE_NO_WINDOW`), so a GUI application does not open one per instance |
 | Sandbox | Opt-in, off by default, fail-closed setup: Linux Landlock + seccomp, Windows AppContainer (network capabilities only when allowed) + job, macOS Seatbelt. VST2/VST3 native probes for TCP, writes outside the allowed folders and process creation, plus audio, editor and scan, run on Linux, Windows and macOS CI runners for every policy. On Windows a network-allowed worker reaches loopback only after an administrator exempts the `vst-audio.worker.network` profile (`CheckNetIsolation LoopbackExempt`) |
-| Audio | Planar f32/f64, callbacks up to configured `max_callback_frames`, 2–16 slots per lane, fixed-depth preallocated reblocking and explicit fallback; allocator guard covers the callback, and native tests cover 480-frame callbacks over a 128-frame quantum |
+| Audio | Planar f32/f64, callbacks up to configured `max_callback_frames`, `Configuration::slots` (2–16) per lane, `BlockEndpoint`/ring-only `BlockLane`, fixed-depth preallocated reblocking and explicit fallback; allocator guards cover block and callback paths, and native tests cover 480-frame callbacks over a 128-frame quantum |
 | Events | Sample offsets and bus indices, MIDI channel messages and owned SysEx (up to 256 bytes); bounded 256-event packets and explicit host overflow |
 | Automation / transport | VST3 parameter queues retain offsets; VST2 splits at automation boundaries; in-block transport changes split both formats |
 | Buses | Multiple buses, sidechains, auxiliary outputs, active flags and general speaker masks; declared bus kind, name and default-active flag; activation chosen after loading (`BusSelector`, `BusSelector::main_only`); native order retained and negotiated layouts read back |
 | Parameters | Paged IDs, values, steps, units and read-only/automatable/hidden attributes; invalid and read-only edits return errors; plugin-originated begin/perform/end edits are bounded, ordered notifications with explicit coarse refresh on loss; a VST3 editor burst larger than the processor queue still delivers each parameter's latest value to the processor |
-| Editors | Floating worker-owned windows; open, hide, show, focus, close, status and bounded native-view capture |
-| Editor embedding | Worker-owned child of an application HWND or X11 window; parent destruction closes only the editor. Linux x86_64/X11 VST2/VST3 parent pixels, lifecycle and default sandbox and Windows x64 VST2/VST3 parent pixels and lifecycle are native-tested. Windows refuses a sandboxed (AppContainer) worker's child under the application window: that request fails explicitly, so sandboxed Windows editors float. Mixed DPI is untested. macOS returns explicit unsupported; no floating fallback |
-| Editor negotiation | VST3 constrained resize and optional content-scale interface; VST2 post-open sizing and plugin sizeWindow. Both formats emit coalesced EditorResized with actual dimensions, floating and embedded. VST2 host-driven resize/scale remains unsupported |
+| Editors | Floating worker-owned windows; open, hide, show, focus, close, status and bounded native-view capture. `EditorScaling` selects automatic, plugin-only, system-stretched or unscaled opening; status reports the resolved mode |
+| Editor embedding | Worker-owned child of an application HWND or X11 window; parent destruction closes only the editor. Linux x86_64/X11 VST2/VST3 parent pixels, lifecycle and default sandbox and Windows x64 VST2/VST3 parent pixels and lifecycle are native-tested. Windows refuses a sandboxed (AppContainer) worker's child under the application window: that request fails explicitly, so sandboxed Windows editors float. Real mixed-DPI multi-monitor setups remain unverified. macOS returns explicit unsupported; no floating fallback |
+| Editor negotiation | VST3 constrained resize and optional content-scale interface; VST2 post-open sizing, plugin sizeWindow and optional `supportsViewDpiScaling` vendor scaling. Both formats emit coalesced EditorResized with actual dimensions, floating and embedded. VST2 host-driven resize remains unsupported |
 | GUI consumers | Separate egui and iced example workspace; the same IPC API runs each editor lifecycle on all four native targets |
 | Linux Wayland editor | Native VST 3 floating view, shared host display, xdg-shell, shm background, optional decoration/activation, logical resize and integer output scale. Tested on Weston 13 headless/pixman at scales 1 and 2, with and without default sandbox. Hide tears down the view; Show recreates it. Capture and embedding unsupported; other compositors unverified |
-| Private Xwayland editor | Planned, not implemented; no public selection value. Auto stops after native Wayland/session X |
+| Private Xwayland editor | Not implemented, by decision (see the Linux editor section). VST 2 and X11-only VST 3 editors use the session X display; `Stretch` in a Wayland session uses the desktop's XWayland |
 | Linux event loop | VST3 IRunLoop on host context and editor frame, with timers and file descriptors |
 | Recovery | Saved-state history, bounded manual/automatic restart, generation changes and endpoint handover at audio boundaries; old resources reclaimed off audio |
 | Stress | Variable callbacks and four repeated crashes per format, with 400 numeric healthy-peer callbacks and latest-checkpoint preservation |
@@ -27,6 +27,10 @@ from this repository. Required CI executes the implementation on Windows x64, Li
 | Extended checks | Coverage-guided control/ring fuzzing plus AddressSanitizer and leak checks on native workers and public fixtures |
 | Delivery | Seven crate archives consumed outside the checkout; optimized worker ZIPs extracted and executed; manifests, checksums and dependency licenses |
 | Toolchain | Rust 1.99.0 minimum, tested directly; nightly is used only by the extended test lane |
+
+`RecoveryPolicy::Watch` exposes the low-level 0.5/2/8-second restart schedule to
+high-level instances, preserves two state snapshots across workers, and disables
+automatic recovery after three failures in ten minutes.
 
 The [independent-plugin ledger](independent-plugins.md) records the exact pinned
 upstreams and assertions. DPF's pinned VST3 adapter has no SysEx input conversion
@@ -52,7 +56,55 @@ does not replay old MIDI notes; applications can send current musical state
 after `Recovered`.
 A changed layout requires a newly prepared application audio endpoint.
 
+## Editor scaling
+
+`Command::OpenEditor` and `OpenEditorIn` use `EditorScaling::Auto`.
+Use `Command::OpenEditorWith { parent, scaling }` or
+`PluginControl::open_editor_with(parent, scaling)` for an explicit mode.
+`EditorStatus.scaling` reports `Plugin`, `Stretch` or `Off`, not the requested
+`Auto`. `scale` is the factor sent to the plugin, or 1.0 when none was sent.
+
+| Mode | Windows floating | Windows embedded / X11 / Wayland session |
+|---|---|---|
+| `Auto` | Plugin scaling when accepted; otherwise system stretching | Plugin scaling when accepted; otherwise 1:1 |
+| `Plugin` | Plugin scaling when accepted; otherwise 1:1 | Same |
+| `Stretch` | System-stretched 1:1 drawing; may be blurry | Wayland session with the desktop's XWayland (`DISPLAY`): a floating X11 window at scale 1, which the compositor scales as its setting for X11 applications decides; embedded, plain X11 or no `DISPLAY`: request error |
+| `Off` | No plugin scale request; 1:1 physical pixels | No plugin scale request |
+
+macOS retains its existing Retina behavior for every mode. Its status is `Off`
+unless the VST3 view has accepted a content-scale request.
+VST2 support requires `effCanDo("supportsViewDpiScaling") == 1`. The host sends
+`effVendorSpecific` with `PreS` / `AeCs` before the first editor rectangle query;
+explicit `EditorAction::Scale` uses the same request and rereads the rectangle.
+A plugin-scaled VST2 editor is reset to scale 1 during teardown so a subsequent
+unscaled open does not inherit the old factor. An explicit scale request on a
+stretched Windows editor recreates the window in plugin-scaling mode.
+VST3 requires `IPlugViewContentScaleSupport` and a successful
+`setContentScaleFactor`, offered before attachment.
+
+Windows editor DPI handling needs Windows 10 version 1809 or later; the worker
+looks its functions up at run time, so on older systems it still starts and
+editors open with the default awareness at scale 1 (mixed hosting needs 1803,
+stretched windows 1809).
+Editor creation scopes use per-monitor-v2 awareness, except stretched windows,
+which use `DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED`. The previous thread
+context is restored. For a differently aware parent, the child creation scope
+also requests mixed hosting and restores it afterwards; this does not change
+the application's existing parent hosting policy. Initial scale comes from the
+editor window's DPI, or the parent's DPI when embedded. `WM_DPICHANGED` rescales
+plugin-scaled views and uses their new size; otherwise it uses the suggested
+rectangle. Native Windows CI must verify these contexts and synthetic DPI
+changes. Real mixed-DPI multi-monitor transitions are not verified by CI.
+
 ## Linux editor verification and remaining work
+
+X11 reads `Xft.dpi` from the display root's `RESOURCE_MANAGER` property when an
+editor opens, including embedded editors. The factor is DPI / 96, without
+rounding, clamped to 0.5–4.0; missing or invalid values use 1.0. Native Wayland
+continues to use compositor integer output scale for `Auto` and `Plugin`;
+`Off` skips plugin content-scale requests. X11 tests cover fixture sizes and
+pixels at 96 and 192 DPI; the independent DPF Parameters VST2 check compares
+its sizes at both DPIs through the public API.
 
 Run `python3 tools/wayland_tests.py`: Weston is required, not silently skipped.
 The native Wayland fixture is tested without `DISPLAY`; scale-2 captures show a
@@ -74,12 +126,20 @@ rejection, and EditorClosed plus continued audio after compositor exit. Direct
 host query and createInstance return the same interface. Other compositors,
 keyboard/IME and popup behavior have not been tested.
 
-The planned private-rootful-Xwayland route needs Xwayland 23.1 or later and one
-extra process per editor. Its root confines menus/popups to the editor bounds;
-clipboard integration is unverified. Without `-hidpi`, the compositor scales
-its scale-1 buffer, potentially making it blurry. Process creation must be
-allowed by the sandbox. Process startup, RandR resizing, hide/show, child reaping
-and parent-death cleanup for this route are **not implemented or tested here**.
+A private rootful Xwayland per editor was planned and is not implemented.
+Plugins open their own X connection from `DISPLAY`, so a private server would
+have to be chosen before the plugin loads, or `DISPLAY` changed in a worker whose
+plugin threads may read the environment. The server also cannot be stopped while
+a plugin holds a connection: Xlib's default I/O error handler exits the process.
+Xwayland 23.2 (Ubuntu 24.04) has no `-hidpi`; probes on it confirmed rootful
+startup with `-geometry`, `-displayfd` and `-decorate`, and RandR custom modes.
+VST 2 and X11-only VST 3 editors therefore need the session X display (desktop
+XWayland on GNOME, KDE and most compositors); without one they fail with an
+explicit error. `EditorScaling::Stretch` in a Wayland session opens the editor on
+the desktop's XWayland at scale 1, and the compositor scales it as its setting for
+X11 applications decides (GNOME and KDE can also leave X11 windows unscaled).
+`tools/wayland_tests.py` checks the routing under Weston's XWayland, not the
+compositor's scaling.
 
 ## Sandbox policy and platform exceptions
 
@@ -202,7 +262,7 @@ logs and JSON reports are suitable CI artifacts.
 
 ## EQ APO XT engine comparison (Windows)
 
-On Windows `tools/third_party.py` also downloads EQ APO XT v2.60.4 (x64-sse2
+On Windows `tools/third_party.py` also downloads EQ APO XT v2.60.6 (x64-sse2
 full package, SHA-256 pinned) and extracts its application folder into the
 external build tree. Nothing is installed: no driver, service or registry
 entry. EQ APO XT is GPL software and serves only as an independent engine
@@ -259,8 +319,13 @@ or of the plugin, recorded by the test, and not vst-audio defects.
 - **Benchmark output parameter changes:** Benchmark.exe passes no output
   parameter change list to VST 3 `process()`; DPF prints an assertion message
   and continues.
-- **Configuration encoding:** `config.txt` must be UTF-8 without a byte order
-  mark. A BOM makes EQ APO XT ignore the first command.
+- **VST 2 values saved before v2.60.5:** the Editor wrote VST 2 parameter
+  values with six significant digits, so a saved value could read back as a
+  different float. EqualizerAPO-XT#439 writes the shortest decimal that reads
+  back as the same float.
+- **Configuration encoding before v2.60.6:** a `config.txt` that starts with a
+  UTF-8 byte order mark lost its first command (EqualizerAPO-XT#440). The test
+  writes UTF-8 without a BOM.
 - **3 Band EQ initial crossover:** the pinned 3 Band EQ reports a 220 Hz low
   crossover but filters at 200 Hz until "Low-Mid Freq" is written. EQ APO XT
   applies every parameter when it loads a line or a chunk, and the reverse
