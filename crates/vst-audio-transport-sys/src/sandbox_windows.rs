@@ -14,7 +14,7 @@ use windows::{
         Security::{Authorization::*, Isolation::*, *},
         Storage::FileSystem::{
             DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ,
-            FILE_GENERIC_WRITE,
+            FILE_GENERIC_WRITE, GetFinalPathNameByHandleW, VOLUME_NAME_NT,
         },
         System::{
             SystemServices::{SE_GROUP_INTEGRITY, SECURITY_MANDATORY_LOW_RID},
@@ -150,72 +150,64 @@ impl LaunchSecurity {
     }
 }
 
-/// Temporary: the security descriptor and user behind a denied open.
-fn describe(path: &Path, user: PSID) -> String {
-    let text = |pointer: PWSTR| {
-        // SAFETY: a successful conversion returned a terminated LocalAlloc string.
-        let value = unsafe { pointer.to_string() }.unwrap_or_default();
-        let _ = Local(HLOCAL(pointer.0.cast()));
-        value
-    };
-    let mut sid = PWSTR::null();
-    // SAFETY: live SID and writable output.
-    let user = unsafe { ConvertSidToStringSidW(user, &mut sid) }
-        .map(|()| text(sid))
-        .unwrap_or_else(|error| error.to_string());
-    let Ok(name) = wide(path) else {
-        return user;
-    };
-    let information = OWNER_SECURITY_INFORMATION
-        | GROUP_SECURITY_INFORMATION
-        | DACL_SECURITY_INFORMATION
-        | LABEL_SECURITY_INFORMATION;
-    let mut descriptor = PSECURITY_DESCRIPTOR::default();
-    // SAFETY: terminated path and writable descriptor output.
-    let read = unsafe {
-        GetNamedSecurityInfoW(
-            PCWSTR(name.as_ptr()),
-            SE_FILE_OBJECT,
-            information,
-            None,
-            None,
-            None,
-            None,
-            &mut descriptor,
+/// Temporary: which token or path form can open a file the worker cannot.
+fn describe(path: &Path, _user: PSID) -> String {
+    use std::os::windows::io::AsRawHandle;
+    let probe = |token: windows::core::Result<OwnedHandle>, path: &Path| {
+        token.and_then(|token| openable(&token, path)).map_or_else(
+            |error| format!("{:?}", error.code()),
+            |open| open.to_string(),
         )
     };
-    if read.is_err() {
-        return format!("user {user}, descriptor {read:?}");
-    }
-    let _descriptor = Local(HLOCAL(descriptor.0));
-    let mut sddl = PWSTR::null();
-    // SAFETY: live descriptor and writable output.
-    let sddl = unsafe {
-        ConvertSecurityDescriptorToStringSecurityDescriptorW(
-            descriptor,
-            SDDL_REVISION_1,
-            information,
-            &mut sddl,
-            None,
-        )
-    }
-    .map(|()| text(sddl))
-    .unwrap_or_else(|error| error.to_string());
-    let variants = [
-        ("low", false, false, true),
-        ("no-admin", true, false, false),
-        ("no-privileges", false, true, false),
-        ("no-admin-no-privileges", true, true, false),
-        ("no-admin-low", true, false, true),
-    ]
-    .map(|(label, admin, privileges, low)| {
-        let result = token_variant(admin, privileges, low)
-            .and_then(|token| openable(&token, path))
-            .map_or_else(|error| error.to_string(), |open| open.to_string());
-        format!("{label}={result}")
-    })
-    .join(" ");
-    format!("user {user}, {sddl}, open as: {variants}")
+    let duplicate = || -> windows::core::Result<OwnedHandle> {
+        // SAFETY: pseudo handle only; not owned or closed.
+        let process = unsafe { GetCurrentProcess() };
+        let mut original = HANDLE::default();
+        // SAFETY: current process and writable token handle output.
+        unsafe { OpenProcessToken(process, TOKEN_ALL_ACCESS, &mut original) }?;
+        let original = own(original);
+        let mut token = HANDLE::default();
+        // SAFETY: live source token; output uniquely owned.
+        unsafe {
+            DuplicateTokenEx(
+                raw(&original),
+                TOKEN_ACCESS_MASK(0),
+                None,
+                SecurityImpersonation,
+                TokenPrimary,
+                &mut token,
+            )
+        }?;
+        let token = own(token);
+        lower(&token)?;
+        Ok(token)
+    };
+    let global = std::fs::File::open(path).ok().and_then(|file| {
+        let mut buffer = vec![0u16; 1024];
+        // SAFETY: live file handle and writable buffer.
+        let length = unsafe {
+            GetFinalPathNameByHandleW(HANDLE(file.as_raw_handle()), &mut buffer, VOLUME_NAME_NT)
+        } as usize;
+        (length > 0 && length < buffer.len()).then(|| {
+            std::path::PathBuf::from(format!(
+                r"\\?\GLOBALROOT{}",
+                String::from_utf16_lossy(&buffer[..length])
+            ))
+        })
+    });
+    format!(
+        "open as: low={} dup-low={} medium-no-admin={} low-globalroot={} ({})",
+        probe(token_variant(false, false, true), path),
+        probe(duplicate(), path),
+        probe(token_variant(true, false, false), path),
+        global.as_deref().map_or_else(
+            || "none".into(),
+            |global| probe(token_variant(false, false, true), global)
+        ),
+        global
+            .as_deref()
+            .map_or_else(String::new, |g| g.display().to_string()),
+    )
 }
 
 fn executables<'a>(exe: &'a Path, plugin: &'a Path) -> impl Iterator<Item = &'a Path> {
@@ -403,9 +395,13 @@ fn token_variant(
         )
     }?;
     let token = own(token);
-    if !low {
-        return Ok(token);
+    if low {
+        lower(&token)?;
     }
+    Ok(token)
+}
+
+fn lower(token: &OwnedHandle) -> windows::core::Result<()> {
     let mut storage = [0u32; 17];
     let mut bytes = size_of_val(&storage) as u32;
     let low_sid = PSID(storage.as_mut_ptr().cast());
@@ -420,13 +416,13 @@ fn token_variant(
     // SAFETY: label and referenced SID are live; token has TOKEN_ADJUST_DEFAULT rights.
     unsafe {
         SetTokenInformation(
-            raw(&token),
+            raw(token),
             TokenIntegrityLevel,
             (&label as *const TOKEN_MANDATORY_LABEL).cast(),
             size_of_val(&label) as u32 + bytes,
         )
     }?;
-    Ok(token)
+    Ok(())
 }
 
 fn restricted_token() -> windows::core::Result<OwnedHandle> {
