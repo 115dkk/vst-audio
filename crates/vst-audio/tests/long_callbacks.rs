@@ -37,7 +37,6 @@ struct Paced {
     processed: usize,
     max_late: Duration,
     late_starts: usize,
-    late_misses: usize,
 }
 
 impl Paced {
@@ -50,20 +49,22 @@ impl std::fmt::Display for Paced {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{}/{} processed ({:.1}%), {} starts over 1 ms late (max {:?}), {} misses right after one",
+            "{}/{} processed ({:.1}%), {} sleeps over 1 ms late (max {:?})",
             self.processed,
             self.measured,
             self.ratio() * 100.0,
             self.late_starts,
-            self.max_late,
-            self.late_misses
+            self.max_late
         )
     }
 }
 
-/// Calls `frames`-frame callbacks every `period`, as an audio device would,
-/// and counts processed outputs. After warm-up the fixture passes plane 0's
-/// 0.25 through; before it, its own 64-frame delay still shows.
+/// Calls `frames`-frame callbacks at least one `period` apart and counts
+/// processed outputs. A late wake-up delays the following callbacks instead of
+/// bunching them, so the result measures the endpoint rather than how far a
+/// busy CI runner oversleeps: catching up would hand the worker several
+/// periods of work within microseconds. After warm-up the fixture passes plane
+/// 0's 0.25 through; before it, its own 64-frame delay shows.
 fn paced(
     audio: &mut AudioEndpoint,
     frames: usize,
@@ -76,13 +77,13 @@ fn paced(
         processed: 0,
         max_late: Duration::ZERO,
         late_starts: 0,
-        late_misses: 0,
     };
     let mut due = Instant::now();
-    let mut previous_late = false;
     for _ in 0..count {
-        let late = Instant::now().saturating_duration_since(due);
+        let start = Instant::now();
+        let late = start.saturating_duration_since(due);
         run.max_late = run.max_late.max(late);
+        run.late_starts += usize::from(late > Duration::from_millis(1));
         let (status, outputs) = callback(audio, frames);
         run.measured += 1;
         if status == AudioStatus::Processed {
@@ -93,12 +94,8 @@ fn paced(
                         .iter()
                         .all(|sample| (*sample - 0.25).abs() < 1e-6)
             );
-        } else if previous_late {
-            run.late_misses += 1;
         }
-        previous_late = late > Duration::from_millis(1);
-        run.late_starts += usize::from(previous_late);
-        due += period;
+        due = start + period;
         let now = Instant::now();
         if due > now {
             std::thread::sleep(due - now);
