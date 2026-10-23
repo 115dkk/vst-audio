@@ -172,6 +172,15 @@ def main():
             assert mutation_passed, "mutation did not fail at the sound assertion"
         else:
             report["mutation"] = {"not_run": "macOS synthetic editor input is unsupported"}
+        if sys.platform == "win32":
+            # Temporary discovery step for the EqualizerAPO-XT comparison; never fails.
+            try:
+                probe = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                    ROOT / "tools/eapo_probe.ps1", "-Root", root / "eapo-probe", "-Vst3", paths["EQ_VST3"],
+                    "-Vst2", paths["EQ_VST2"]], capture_output=True, text=True, timeout=420)
+                print(probe.stdout[-200000:], probe.stderr[-20000:], flush=True)
+            except Exception as error:
+                print(f"PROBE failed to run: {error}", flush=True)
         if report["returncode"]:
             raise SystemExit(report["returncode"])
         report["passed"] = True
