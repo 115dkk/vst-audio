@@ -12,7 +12,8 @@ name: Release
 #            the release worker archives.
 #   crates   cargo publish of the workspace through crates.io trusted
 #            publishing (no stored token); versions already on crates.io are
-#            skipped, so a re-run finishes a partial publication.
+#            skipped, so another attempt (or a re-run of the failed job)
+#            finishes a partial publication.
 #   github   the tag and the GitHub release with the worker archives of all
 #            four targets and SHA256SUMS.txt. While the major version is 0 it
 #            is a prerelease.
@@ -20,7 +21,8 @@ name: Release
 # Every job checks out release_sha, the commit the gate decided on (the bump
 # commit when it bumped), so a push that lands meanwhile cannot slip in. The
 # bump is pushed with the workflow token, which starts no workflow, so it does
-# not release itself. A failed release is retried by re-running its run.
+# not release itself. A failed release is retried by re-running its failed
+# jobs; re-running the gate as well may bump again (see release_gate.py).
 on:
   push:
     branches: [main]
@@ -109,9 +111,26 @@ jobs:
         if: steps.pending.outputs.pending != '0'
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-          EXCLUDE: ${{ steps.pending.outputs.exclude }}
-        # EXCLUDE is unquoted on purpose: it holds `--exclude <name>` pairs.
-        run: cargo publish --locked --workspace $EXCLUDE
+        # cargo waits 60 s for each crate to appear in the index before it
+        # publishes the crates that depend on it, and gives up when the index
+        # is slower (vst-audio-worker-runtime 0.2.1 did). Crates already on
+        # crates.io are skipped, so a later attempt finishes the rest.
+        run: |
+          set -uo pipefail
+          for attempt in 1 2 3; do
+            exclude=()
+            for name in $(cargo metadata --locked --no-deps --format-version 1 \
+                | python3 -c 'import json,sys; [print(p["name"]) for p in json.load(sys.stdin)["packages"] if p["publish"] != []]'); do
+              status=$(curl -s -o /dev/null -w '%{http_code}' \
+                -A "vst-audio release (https://github.com/${GITHUB_REPOSITORY})" \
+                "https://crates.io/api/v1/crates/$name/$VERSION")
+              if [ "$status" = 200 ]; then exclude+=(--exclude "$name"); fi
+            done
+            if cargo publish --locked --workspace "${exclude[@]}"; then exit 0; fi
+            echo "::warning::cargo publish attempt $attempt failed; retrying the crates not yet on crates.io"
+            sleep 120
+          done
+          exit 1
 
   github:
     name: GitHub release

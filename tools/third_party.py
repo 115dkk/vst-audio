@@ -13,7 +13,7 @@ import stat
 import subprocess
 import sys
 import tempfile
-import urllib.request
+from fixtures import download
 
 ROOT = Path(__file__).resolve().parents[1]
 PINS = {
@@ -107,7 +107,7 @@ def install_software_opengl(root, plugins):
     url, digest = MESA
     archive, extracted = root / "mesa.7z", root / "mesa"
     if not archive.exists() or hashlib.sha256(archive.read_bytes()).hexdigest() != digest:
-        urllib.request.urlretrieve(url, archive)
+        archive.write_bytes(download(url, timeout=120))
     actual = hashlib.sha256(archive.read_bytes()).hexdigest()
     assert actual == digest, f"Mesa archive digest {actual}"
     if not (extracted / "x64" / "opengl32.dll").exists():
@@ -126,11 +126,11 @@ def install_eapo(root) -> Path:
     """Verify and unpack the black-box GPL engine only in the external work tree."""
     import zipfile
     url, digest = EAPO
-    download = root / "eapo-package"
-    download.mkdir(exist_ok=True)
-    package = download / "release.nupkg"
+    folder = root / "eapo-package"
+    folder.mkdir(exist_ok=True)
+    package = folder / "release.nupkg"
     if not package.exists() or hashlib.sha256(package.read_bytes()).hexdigest() != digest:
-        urllib.request.urlretrieve(url, package)
+        package.write_bytes(download(url, timeout=120))
     actual = hashlib.sha256(package.read_bytes()).hexdigest()
     assert actual == digest, f"EqualizerAPO-XT archive digest {actual}"
     app = root / "eapo"

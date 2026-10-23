@@ -50,6 +50,23 @@ class Gate(unittest.TestCase):
         self.assertEqual(g.decide("0.1.0", {"v0.1.0", "v0.1.1"}, ["a"], ["fix: x"]),
                          ("bump", "0.1.2"))
 
+    def test_decide_untagged_version(self):
+        # A manual bump, or a failed patch release retried by a later fix.
+        self.assertEqual(g.decide("0.3.0", {"v0.2.0"}, ["a"], ["feat!: x"]),
+                         ("release", "0.3.0"))
+        self.assertEqual(g.decide("0.2.1", {"v0.2.0"}, ["a"], ["fix: x", "test: y"]),
+                         ("release", "0.2.1"))
+        # A failed patch release followed by a breaking change.
+        self.assertEqual(g.decide("0.2.1", {"v0.2.0"}, ["a"], ["test: y", "feat!: x"]),
+                         ("bump", "0.3.0"))
+        # Crates of the version are on crates.io from an earlier commit.
+        self.assertEqual(g.decide("0.2.1", {"v0.2.0"}, ["a"], ["fix: x"], published=True),
+                         ("bump", "0.2.2"))
+        self.assertEqual(g.decide("0.2.1", {"v0.2.0"}, ["a"], ["feat!: x"], published=True),
+                         ("bump", "0.3.0"))
+        self.assertEqual(g.decide("0.1.0", set(), [], [], published=True), ("bump", "0.1.1"))
+        self.assertEqual(g.lower_tag("0.2.1", {"v0.1.9", "v0.2.0", "v0.3.0", "x"}), "v0.2.0")
+
     def test_bump_rewrites_members_only(self):
         members = {"vst-audio", "vst-audio-ring"}
         toml = g.set_workspace_version(TOML, members, "0.1.0", "0.2.0")
