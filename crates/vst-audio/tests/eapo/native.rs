@@ -43,12 +43,10 @@ impl Case {
             [((312, 56), (312, 26)), ((184, 56), (184, 86))]
         }
     }
-    /// Values set through vst-audio for the reverse direction. For 3 Band EQ
-    /// these are the two parameters the forward direction showed EQ APO XT
-    /// resolving by name; "Mid" is checked on its own as an observation.
+    /// Values set through vst-audio for the reverse direction.
     fn reverse(self) -> &'static [(&'static str, f64)] {
         if self.eq() {
-            &[("Low", 0.75), ("High", 0.25)]
+            &[("Low", 0.75), ("Mid", 0.625), ("High", 0.25)]
         } else {
             &[("Decay", 0.75), ("Size", 0.375), ("Mix", 0.625)]
         }
@@ -707,10 +705,7 @@ pub fn compare(case: Case) {
         compare_output(case, "forward", &app, &root, &x, &y1, &saved.raw);
     }
     let mut reverse = spawn();
-    let entries = parameters(&reverse);
-    for (name, value) in case.reverse() {
-        set(&reverse, &entries, name, *value);
-    }
+    write_all(&reverse, &parameters(&reverse), case.reverse());
     // VST 3 hands a parameter value to the processor in process(), and a DPF
     // component saves the processor's values: save after processing, as an
     // application with running audio does.
@@ -748,26 +743,25 @@ pub fn compare(case: Case) {
         case.name()
     );
     compare_output(case, "reverse", &app, &root, &x, &y2, &line);
-    if matches!(case, Case::EqVst2) {
-        // Which names EQ APO XT resolves: one parameter changed at a time.
-        for (name, value) in [("Low", 0.75), ("Mid", 0.625), ("High", 0.25)] {
-            let mut single = spawn();
-            set(&single, &entries, name, value);
-            let y = render(&mut single, &x);
-            let line = format!("{library_line}{}", named(&parameters(&single)));
-            let max = plain_difference(
-                &app,
-                &root,
-                &format!("{}-single-{name}", case.name()),
-                &x,
-                &y,
-                &line,
-            );
-            println!(
-                "METRIC {{\"case\":{:?},\"observation\":\"one VST 2 parameter by name\",\"parameter\":{name:?},\"value\":{value},\"plain_max_lsb\":{max}}}",
-                case.name()
-            );
-        }
+}
+/// Writes every visible, writable parameter, the given ones with their new
+/// value, as EQ APO XT does when it loads a line or a chunk. A fresh pinned
+/// 3 Band EQ reports a 220 Hz low crossover but filters at 200 Hz until
+/// "Low-Mid Freq" is written.
+fn write_all(instance: &Instance, entries: &[Parameter], values: &[(&str, f64)]) {
+    let writable = |p: &&Parameter| !p.read_only && !p.hidden;
+    for (name, _) in values {
+        assert!(
+            entries.iter().filter(writable).any(|p| p.name == *name),
+            "missing writable parameter {name}: {entries:?}"
+        );
+    }
+    for p in entries.iter().filter(writable) {
+        let value = values
+            .iter()
+            .find(|(name, _)| *name == p.name)
+            .map_or(p.value, |(_, value)| *value);
+        set(instance, entries, &p.name, value);
     }
 }
 /// `"<name>" <value>` pairs for every parameter, as the Editor writes them.
