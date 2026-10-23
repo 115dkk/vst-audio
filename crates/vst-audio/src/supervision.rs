@@ -54,6 +54,8 @@ fn prepare_audio_handover(
     expected_setup: &vst_audio_protocol::ProcessingSetup,
     shared: &Shared,
     updates: &mut rtrb::Producer<PreparedAudio>,
+    events: &mpsc::SyncSender<HostEvent>,
+    latency: &mut u32,
 ) -> Result<(PluginControl, u64), String> {
     if started.geometry != expected_geometry
         || started.setup != *expected_setup
@@ -93,6 +95,11 @@ fn prepare_audio_handover(
     shared.generation.store(generation, Ordering::Release);
     shared.status.store(3, Ordering::Release);
     shared.worker_pid.store(control.pid(), Ordering::Release);
+    // The application sized its delays for the old worker's plugin latency.
+    if latency_frames != *latency {
+        *latency = latency_frames;
+        emit(events, shared, HostEvent::LatencyChanged(latency_frames));
+    }
     Ok((control, generation))
 }
 
@@ -107,6 +114,7 @@ pub(crate) fn supervise(
 ) {
     let launch = recovery_config.launch;
     let watch_policy = launch.configuration.recovery == RecoveryPolicy::Watch;
+    let mut latency = initial.latency();
     let mut control = Some(initial);
     let mut orphaned_watch: Option<OrphanedWatch> = None;
     let mut pending = BTreeMap::new();
@@ -306,6 +314,8 @@ pub(crate) fn supervise(
                     &recovery_config.setup,
                     &shared,
                     &mut updates,
+                    &events,
+                    &mut latency,
                 ) {
                     Ok((mut new_control, generation)) => {
                         if watch_policy && request.is_some() {
@@ -465,6 +475,7 @@ pub(crate) fn supervise(
                                 emit(&events, &shared, HostEvent::ParametersChanged)
                             }
                             Message::LatencyChanged { frames } => {
+                                latency = frames;
                                 emit(&events, &shared, HostEvent::LatencyChanged(frames))
                             }
                             Message::Fault { text, .. } => {
@@ -618,6 +629,8 @@ pub(crate) fn supervise(
                     &recovery_config.setup,
                     &shared,
                     &mut updates,
+                    &events,
+                    &mut latency,
                 ) {
                     Ok((mut new_control, generation)) => {
                         let now_ms = orphan.now_ms();
@@ -686,6 +699,8 @@ pub(crate) fn supervise(
                         &recovery_config.setup,
                         &shared,
                         &mut updates,
+                        &events,
+                        &mut latency,
                     ) {
                         Ok((mut new_control, generation)) => {
                             let orphan = orphaned_watch.take().expect("orphaned watch exists");

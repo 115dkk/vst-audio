@@ -54,8 +54,13 @@ worker can therefore stall application input. Independent supervision must
 terminate the hung worker to release that coupling.** This is crash containment,
 not input isolation. Mixed-DPI hosting is a property of the parent at creation;
 changing `SetThreadDpiHostingBehavior` in the worker cannot retrofit the application's
-parent. The worker leaves DPI context/hosting behavior unchanged. Applications
-must create a compatible parent; mixed-DPI combinations require native testing.
+parent. The worker creates each editor window inside a thread DPI scope that it
+restores afterwards: per-monitor-v2, or unaware with GDI scaling for a stretched
+floating editor. A child whose awareness differs from the application's parent
+is created with mixed hosting for that call only; the parent's own hosting
+policy stays the application's. These functions are looked up at run time, so
+older Windows releases open editors at scale 1. Real mixed-DPI multi-monitor
+setups still require native testing.
 A sandboxed worker may be denied access to a higher-integrity parent by Windows;
 that creation failure is an explicit request failure, with the native error
 retained in worker diagnostics, never a floating-window fallback.
