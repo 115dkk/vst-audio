@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*", "apps/*"]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.99"
 license = "MIT"
@@ -23,12 +23,12 @@ missing_safety_doc = "deny"
 dbg_macro = "deny"
 
 [workspace.dependencies]
-vst-audio = { path = "crates/vst-audio", version = "=0.3.0" }
-vst-audio-ring = { path = "crates/vst-audio-ring", version = "=0.3.0" }
-vst-audio-protocol = { path = "crates/vst-audio-protocol", version = "=0.3.0" }
-vst-audio-worker-sys = { path = "crates/vst-audio-worker-sys", version = "=0.3.0" }
-vst-audio-transport-sys = { path = "crates/vst-audio-transport-sys", version = "=0.3.0" }
-vst-audio-worker-runtime = { path = "crates/vst-audio-worker-runtime", version = "=0.3.0" }
+vst-audio = { path = "crates/vst-audio", version = "=0.4.0" }
+vst-audio-ring = { path = "crates/vst-audio-ring", version = "=0.4.0" }
+vst-audio-protocol = { path = "crates/vst-audio-protocol", version = "=0.4.0" }
+vst-audio-worker-sys = { path = "crates/vst-audio-worker-sys", version = "=0.4.0" }
+vst-audio-transport-sys = { path = "crates/vst-audio-transport-sys", version = "=0.4.0" }
+vst-audio-worker-runtime = { path = "crates/vst-audio-worker-runtime", version = "=0.4.0" }
 vst3 = "0.3.0"
 thiserror = "2.0.21"
 clap = { version = "4.6.7", features = ["derive"] }

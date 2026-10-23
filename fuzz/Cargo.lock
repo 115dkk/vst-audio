@@ -153,7 +153,7 @@ dependencies = [
 
 [[package]]
 name = "vst-audio-protocol"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "thiserror",
  "vst-audio-ring",
@@ -162,7 +162,7 @@ dependencies = [
 
 [[package]]
 name = "vst-audio-ring"
-version = "0.3.0"
+version = "0.4.0"
 
 [[package]]
 name = "vst3"
