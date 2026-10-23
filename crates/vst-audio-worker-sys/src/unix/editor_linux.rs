@@ -1,5 +1,9 @@
 //! Worker-owned X11 floating or embedded window. No application GUI framework is involved.
-use std::{cell::Cell, io};
+use std::{
+    cell::{Cell, RefCell},
+    io,
+    sync::Arc,
+};
 use x11rb::{
     COPY_DEPTH_FROM_PARENT,
     connection::Connection,
@@ -10,7 +14,7 @@ use x11rb::{
 
 #[derive(Debug)]
 pub struct EditorWindow {
-    connection: RustConnection,
+    connection: Arc<RustConnection>,
     window: u32,
     delete: u32,
     protocols: u32,
@@ -21,9 +25,36 @@ pub struct EditorWindow {
 fn error(e: impl std::fmt::Display) -> io::Error {
     io::Error::other(e.to_string())
 }
+thread_local! {
+    // Every editor window of this worker shares one connection. With one
+    // connection per window, closing a window freed its resource-ID range and
+    // the next window could take the ID of a top level the window manager was
+    // still managing; weston's XWM then reparented a new embedded editor into
+    // the stale frame of the floating editor it replaced.
+    static SHARED: RefCell<Option<(Arc<RustConnection>, usize)>> = const { RefCell::new(None) };
+}
+fn shared() -> io::Result<(Arc<RustConnection>, usize)> {
+    SHARED.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if let Some((connection, screen)) = slot.as_ref()
+            && connection
+                .get_input_focus()
+                .ok()
+                .and_then(|cookie| cookie.reply().ok())
+                .is_some()
+        {
+            return Ok((connection.clone(), *screen));
+        }
+        // A broken connection took its windows with it; start a new one.
+        let (connection, screen) = x11rb::connect(None).map_err(error)?;
+        let connection = Arc::new(connection);
+        *slot = Some((connection.clone(), screen));
+        Ok((connection, screen))
+    })
+}
 impl EditorWindow {
     pub fn open(title: &str, width: i32, height: i32) -> io::Result<Self> {
-        let (connection, screen) = x11rb::connect(None).map_err(error)?;
+        let (connection, screen) = shared()?;
         let screen = &connection.setup().roots[screen];
         let window = connection.generate_id().map_err(error)?;
         connection
@@ -99,7 +130,7 @@ impl EditorWindow {
             .ok()
             .filter(|id| *id != 0)
             .ok_or_else(|| error("parent window is not a window"))?;
-        let (connection, _) = x11rb::connect(None).map_err(error)?;
+        let (connection, _) = shared()?;
         connection
             .get_geometry(id)
             .map_err(error)?
@@ -164,17 +195,28 @@ impl EditorWindow {
         self.window as usize
     }
     pub fn pump(&self) -> bool {
+        let parent = match self.parent {
+            Some(vst_audio_protocol::ParentWindow::X11 { window }) => u32::try_from(window).ok(),
+            _ => None,
+        };
+        // The shared connection also carries events for windows this editor
+        // replaced; only this window and its parent concern it.
         while let Ok(Some(event)) = self.connection.poll_for_event() {
             match event {
                 Event::ClientMessage(event)
-                    if event.type_ == self.protocols
+                    if event.window == self.window
+                        && event.type_ == self.protocols
                         && event.data.as_data32()[0] == self.delete =>
                 {
                     self.closed.set(true)
                 }
                 // Only destruction closes an embedded editor: the application
                 // may unmap its parent to minimize or switch views.
-                Event::DestroyNotify(_) => self.closed.set(true),
+                Event::DestroyNotify(event)
+                    if event.window == self.window || Some(event.window) == parent =>
+                {
+                    self.closed.set(true)
+                }
                 Event::ConfigureNotify(event) if event.window == self.window => {
                     self.configured.set(true);
                 }
