@@ -31,9 +31,14 @@ def main():
                        VST_AUDIO_TEST_SCALE=str(scale))
             log_path = ROOT / "test-results" / f"weston-scale-{scale}-desktop-{desktop}.log"
             log_path.parent.mkdir(parents=True, exist_ok=True)
+            # Screenshots count fixture-colored pixels over the whole output, so
+            # the desktop must not draw anything that changes: no panel clock,
+            # a solid background instead of the default gradient.
+            config = Path(directory) / "weston.ini"
+            config.write_text("[shell]\npanel-position=none\nbackground-color=0xff000000\nlocking=false\n")
             with log_path.open("w") as log:
                 weston = subprocess.Popen(["weston", "--backend=headless", "--renderer=pixman",
-                    "--debug", "--socket=vst-audio-test", "--width=1280", "--height=800",
+                    f"--config={config}", "--debug", "--socket=vst-audio-test", "--width=1280", "--height=800",
                     "--idle-time=0", f"--scale={scale}"] + (["--xwayland"] if desktop else []), env=env, stdout=log, stderr=log)
                 try:
                     deadline = time.monotonic() + 10
