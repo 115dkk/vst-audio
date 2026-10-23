@@ -168,7 +168,9 @@ runner SendInput reached the plugin windows: the EQ drags and SendNote keys
 passed in both formats. A GPU-less runner offers only the GDI OpenGL 1.1, on
 which the DPF editors draw nothing, so the Windows run places a pinned Mesa
 llvmpipe (`opengl32.dll`, `libgallium_wgl.dll`, `GALLIUM_DRIVER=llvmpipe`) beside
-a copy of the worker outside the checkout, as Mesa serves Xvfb on Linux.
+each plugin binary in the external build tree, as Mesa serves Xvfb on Linux. The
+worker loads plugins with `LOAD_WITH_ALTERED_SEARCH_PATH`, so a plugin's imports
+resolve from its own folder before System32 and never from the worker's folder.
 macOS reports `known limitation: macOS synthetic editor input` because embedding
 is unsupported and synthetic input needs accessibility authorization. Wayland
 input is outside this test.

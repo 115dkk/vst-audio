@@ -24,7 +24,10 @@ PINS = {
 
 # A GPU-less Windows runner has only the GDI OpenGL 1.1, on which DPF editors draw
 # nothing (their pixels read near black). As with Mesa under Xvfb on Linux, a pinned
-# Mesa llvmpipe beside the worker renders them in software.
+# Mesa llvmpipe renders them in software. The worker loads plugins with
+# LOAD_WITH_ALTERED_SEARCH_PATH, which resolves their imports from the plugin's own
+# folder before System32 and never from the worker's, so the DLLs go beside each
+# plugin binary in the external build tree.
 MESA = ("https://github.com/pal1000/mesa-dist-win/releases/download/26.2.4/mesa3d-26.2.4-release-msvc.7z",
         "351fc8c8b695878ffb3eaa044b3ead08672a48b1a045e3c3e3975811df0f6695")
 
@@ -90,8 +93,8 @@ target_include_directories(d_3BandEQ PUBLIC "{plugins.as_posix()}/plugins/3BandE
             run("codesign", "--force", "--sign", "-", path)
     return paths
 
-def with_software_opengl(root, worker, name):
-    """Copy the worker next to Mesa's WGL DLLs outside the checkout and Cargo cache."""
+def install_software_opengl(root, plugins):
+    """Place Mesa's WGL DLLs beside every plugin binary built outside the checkout."""
     url, digest = MESA
     archive, extracted = root / "mesa.7z", root / "mesa"
     if not archive.exists() or hashlib.sha256(archive.read_bytes()).hexdigest() != digest:
@@ -100,12 +103,15 @@ def with_software_opengl(root, worker, name):
     assert actual == digest, f"Mesa archive digest {actual}"
     if not (extracted / "x64" / "opengl32.dll").exists():
         run("7z", "x", "-y", f"-o{extracted}", archive, "x64/opengl32.dll", "x64/libgallium_wgl.dll")
-    directory = root / name
-    directory.mkdir(exist_ok=True)
-    for dll in ("opengl32.dll", "libgallium_wgl.dll"):
-        shutil.copy2(extracted / "x64" / dll, directory / dll)
-    shutil.copy2(worker, directory / worker.name)
-    return directory / worker.name
+    directories = set()
+    for plugin in plugins:
+        binaries = list((plugin / "Contents" / "x86_64-win").glob("*.vst3")) if plugin.is_dir() else [plugin]
+        assert binaries, plugin
+        directories.update(binary.parent for binary in binaries)
+    for directory in sorted(directories):
+        for dll in ("opengl32.dll", "libgallium_wgl.dll"):
+            shutil.copy2(extracted / "x64" / dll, directory / dll)
+    return sorted(str(directory) for directory in directories)
 
 def main():
     parser = argparse.ArgumentParser()
@@ -128,8 +134,9 @@ def main():
         target = Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "target"))
         worker = target / "debug" / ("vst-audio-worker.exe" if sys.platform == "win32" else "vst-audio-worker")
         if sys.platform == "win32":
-            worker = with_software_opengl(root, worker, "worker")
-            report["software_opengl"] = {"url": MESA[0], "sha256": MESA[1], "driver": "llvmpipe"}
+            installed = install_software_opengl(root, paths.values())
+            report["software_opengl"] = {"url": MESA[0], "sha256": MESA[1], "driver": "llvmpipe",
+                                         "directories": len(installed)}
         env = dict(os.environ, VST_AUDIO_WORKER=str(worker), **{f"VST_AUDIO_REAL_{key}": str(value) for key, value in paths.items()})
         if sys.platform == "win32":
             env["GALLIUM_DRIVER"] = "llvmpipe"
@@ -150,8 +157,6 @@ def main():
             run("cargo", "build", "--locked", "-p", "vst-audio-worker", "--features",
                 "vst-audio-worker-sys/__test-drop-editor-edits", "--target-dir", mutant_target)
             mutant = mutant_target / "debug" / worker.name
-            if sys.platform == "win32":
-                mutant = with_software_opengl(root, mutant, "mutant-worker")
             mutation_env = dict(env, VST_AUDIO_WORKER=str(mutant))
             result = subprocess.run(["cargo", "test", "--locked", "-p", "vst-audio", "--test", "third_party",
                 "editor_input_eq_vst3", "--", "--exact", "--ignored", "--nocapture", "--test-threads=1"],
