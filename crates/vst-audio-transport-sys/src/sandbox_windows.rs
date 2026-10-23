@@ -201,7 +201,21 @@ fn describe(path: &Path, user: PSID) -> String {
     }
     .map(|()| text(sddl))
     .unwrap_or_else(|error| error.to_string());
-    format!("user {user}, {sddl}")
+    let variants = [
+        ("low", false, false, true),
+        ("no-admin", true, false, false),
+        ("no-privileges", false, true, false),
+        ("no-admin-no-privileges", true, true, false),
+        ("no-admin-low", true, false, true),
+    ]
+    .map(|(label, admin, privileges, low)| {
+        let result = token_variant(admin, privileges, low)
+            .and_then(|token| openable(&token, path))
+            .map_or_else(|error| error.to_string(), |open| open.to_string());
+        format!("{label}={result}")
+    })
+    .join(" ");
+    format!("user {user}, {sddl}, open as: {variants}")
 }
 
 fn executables<'a>(exe: &'a Path, plugin: &'a Path) -> impl Iterator<Item = &'a Path> {
@@ -343,7 +357,13 @@ fn low_label(path: &Path) -> windows::core::Result<()> {
     }
     .ok()
 }
-fn restricted_token() -> windows::core::Result<OwnedHandle> {
+/// Temporary: a token with each restriction chosen separately, to find which one
+/// denies the sandboxed worker's reads.
+fn token_variant(
+    disable_admin: bool,
+    drop_privileges: bool,
+    low: bool,
+) -> windows::core::Result<OwnedHandle> {
     // SAFETY: pseudo handle only; not owned or closed.
     let process = unsafe { GetCurrentProcess() };
     let mut original = HANDLE::default();
@@ -371,17 +391,24 @@ fn restricted_token() -> windows::core::Result<OwnedHandle> {
     unsafe {
         CreateRestrictedToken(
             raw(&original),
-            DISABLE_MAX_PRIVILEGE,
-            Some(&disable),
+            if drop_privileges {
+                DISABLE_MAX_PRIVILEGE
+            } else {
+                CREATE_RESTRICTED_TOKEN_FLAGS(0)
+            },
+            disable_admin.then_some(&disable[..]),
             None,
             None,
             &mut token,
         )
     }?;
     let token = own(token);
-    let mut low = [0u32; 17];
-    let mut bytes = size_of_val(&low) as u32;
-    let low_sid = PSID(low.as_mut_ptr().cast());
+    if !low {
+        return Ok(token);
+    }
+    let mut storage = [0u32; 17];
+    let mut bytes = size_of_val(&storage) as u32;
+    let low_sid = PSID(storage.as_mut_ptr().cast());
     // SAFETY: aligned maximum-sized SID storage and writable size.
     unsafe { CreateWellKnownSid(WinLowLabelSid, None, Some(low_sid), &mut bytes) }?;
     let label = TOKEN_MANDATORY_LABEL {
@@ -399,6 +426,11 @@ fn restricted_token() -> windows::core::Result<OwnedHandle> {
             size_of_val(&label) as u32 + bytes,
         )
     }?;
+    Ok(token)
+}
+
+fn restricted_token() -> windows::core::Result<OwnedHandle> {
+    let token = token_variant(true, true, true)?;
     // An elevated token gives new objects (the worker process and its threads)
     // to Administrators and SYSTEM. With Administrators deny-only the worker could
     // not open its own threads, which the loader does for DLLs with static TLS.
