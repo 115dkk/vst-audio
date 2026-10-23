@@ -11,7 +11,9 @@ use std::{
     time::{Duration, Instant},
 };
 use wayland_client::{
-    Connection, Dispatch, EventQueue, Proxy, QueueHandle, delegate_noop,
+    Connection, Dispatch, EventQueue, Proxy, QueueHandle,
+    backend::WaylandError,
+    delegate_noop,
     protocol::{wl_buffer, wl_compositor, wl_output, wl_registry, wl_shm, wl_shm_pool, wl_surface},
 };
 use wayland_protocols::xdg::{
@@ -22,14 +24,26 @@ use wayland_protocols::xdg::{
 fn err(e: impl std::fmt::Display) -> io::Error {
     io::Error::other(e.to_string())
 }
+// A full socket or an empty read is not a broken connection: queued requests
+// go out on the next flush and events arrive on the next read.
+fn nonfatal<T: Default>(result: Result<T, WaylandError>) -> io::Result<T> {
+    match result {
+        Err(WaylandError::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => Ok(T::default()),
+        result => result.map_err(err),
+    }
+}
+fn flush(connection: &Connection) -> io::Result<()> {
+    nonfatal(connection.flush())
+}
 
 #[derive(Default)]
 pub(crate) struct WaylandHost {
     connection: RefCell<Option<Connection>>,
     references: Cell<usize>,
-    // Displays a plugin opened and never closed stay connected until the host
-    // object is released; freeing them would leave the plugin a dangling pointer.
-    retired: RefCell<Vec<Connection>>,
+    // A connection replaced while a plugin still held its display, with the
+    // plugin's open count. It is released once the plugin closes it; freeing it
+    // earlier would leave the plugin a dangling pointer.
+    retired: RefCell<Vec<(Connection, usize)>>,
 }
 impl WaylandHost {
     pub fn connection(&self) -> io::Result<Connection> {
@@ -53,14 +67,18 @@ impl WaylandHost {
         }
     }
     pub fn close(&self, display: *mut c_void) -> bool {
-        if self
-            .retired
-            .borrow()
+        let mut retired = self.retired.borrow_mut();
+        if let Some(index) = retired
             .iter()
-            .any(|c| c.backend().display_ptr().cast::<c_void>() == display)
+            .position(|(c, _)| c.backend().display_ptr().cast::<c_void>() == display)
         {
+            retired[index].1 -= 1;
+            if retired[index].1 == 0 {
+                retired.swap_remove(index);
+            }
             return true;
         }
+        drop(retired);
         if self.references.get() == 0 || !self.matches(display) {
             return false;
         }
@@ -78,10 +96,11 @@ impl WaylandHost {
     // Call only after removed()/frame teardown: guest proxies still borrow this display.
     pub fn reset(&self) {
         let connection = self.connection.borrow_mut().take();
+        let references = self.references.replace(0);
         if let Some(connection) = connection
-            && self.references.replace(0) > 0
+            && references > 0
         {
-            self.retired.borrow_mut().push(connection);
+            self.retired.borrow_mut().push((connection, references));
         }
     }
     pub fn pump(&self, run_loop: &crate::linux_runloop::RunLoop) -> io::Result<()> {
@@ -96,7 +115,7 @@ impl WaylandHost {
             if let Some(guard) = backend.prepare_read()
                 && readable(fd)
             {
-                guard.read().map_err(err)?;
+                nonfatal(guard.read())?;
             }
             // SAFETY: this owner retains the display; UI thread, pending-only dispatch never reads.
             let result = unsafe {
@@ -109,7 +128,7 @@ impl WaylandHost {
             }
         }
         backend.dispatch_inner_queue().map_err(err)?;
-        connection.flush().map_err(err)
+        flush(&connection)
     }
 }
 fn readable(fd: i32) -> bool {
@@ -255,7 +274,7 @@ impl Window {
     fn wait_configure(&self) -> io::Result<()> {
         let deadline = Instant::now() + Duration::from_secs(5);
         while !self.inner.borrow().state.configured {
-            self.connection.flush().map_err(err)?;
+            flush(&self.connection)?;
             let backend = self.connection.backend();
             if let Some(read) = backend.prepare_read()
                 && readable(backend.poll_fd().as_raw_fd())
@@ -345,7 +364,7 @@ impl Window {
         self.surface.commit();
         inner.state.redraw = false;
         self.scale.set(scale);
-        self.connection.flush().map_err(err)
+        flush(&self.connection)
     }
     pub fn pump(&self) -> bool {
         if self.dispatch().is_err() {
@@ -362,7 +381,7 @@ impl Window {
     }
     pub fn commit(&self) -> io::Result<()> {
         self.surface.commit();
-        self.connection.flush().map_err(err)
+        flush(&self.connection)
     }
     pub fn take_size(&self) -> Option<(i32, i32)> {
         self.inner.borrow_mut().state.pending_size.take()
@@ -393,7 +412,7 @@ impl Window {
             token.set_surface(&self.surface);
             token.commit();
         }
-        self.connection.flush().map_err(err)
+        flush(&self.connection)
     }
     pub fn request_close(&self) -> io::Result<()> {
         self.inner.borrow_mut().state.closed = true;

@@ -1424,13 +1424,14 @@ impl Vst3Plugin {
                     }
                 }
             }
-            if editor.output_scale != window.scale()
-                && let Some(scale) = editor.view.cast::<IPlugViewContentScaleSupport>()
-            {
-                // SAFETY: retained main-thread scale interface and bounded compositor scale.
-                if unsafe { scale.setContentScaleFactor(window.scale()) } == kResultOk {
+            if editor.output_scale != window.scale() {
+                // Offer each new output scale once; a refusal keeps the accepted scale.
+                editor.output_scale = window.scale();
+                if let Some(scale) = editor.view.cast::<IPlugViewContentScaleSupport>()
+                    // SAFETY: retained main-thread scale interface and bounded compositor scale.
+                    && unsafe { scale.setContentScaleFactor(window.scale()) } == kResultOk
+                {
                     editor.scale = window.scale();
-                    editor.output_scale = window.scale();
                 }
             }
         }
