@@ -661,21 +661,7 @@ pub fn compare(case: Case) {
         );
     } else {
         if let Some(chunk) = &saved.chunk {
-            assert!(matches!(
-                request(
-                    &forward,
-                    Command::RestoreState(state::encode(chunk, &[]).unwrap())
-                ),
-                HostEvent::Completed { .. }
-            ));
-            let roundtrip = component(&forward);
-            assert!(
-                roundtrip == *chunk,
-                "component roundtrip mismatch: lengths {} vs {}, first differing byte {:?}",
-                roundtrip.len(),
-                chunk.len(),
-                roundtrip.iter().zip(chunk).position(|(a, b)| a != b)
-            );
+            restore(&forward, chunk);
         } else {
             for (name, value) in &saved.parameters {
                 set(&forward, &defaults, name, *value);
@@ -706,17 +692,25 @@ pub fn compare(case: Case) {
     }
     let mut reverse = spawn();
     write_all(&reverse, &parameters(&reverse), case.reverse());
-    // VST 3 hands a parameter value to the processor in process(), and a DPF
-    // component saves the processor's values: save after processing, as an
-    // application with running audio does.
-    let y2 = render(&mut reverse, &x);
     let library_line = format!("VSTPlugin: Library \"{}\"", library.display());
-    let line = if case.format() == PluginFormat::Vst3 {
-        format!(
-            "{library_line} ChunkData \"{}\"",
-            base64_encode(&component(&reverse))
+    let (y2, line) = if case.format() == PluginFormat::Vst3 {
+        // VST 3 hands a parameter value to the processor in process(), and a DPF
+        // component saves the processor's values: process a few blocks, save,
+        // and render from that state restored into a fresh instance, as EQ APO
+        // XT loads ChunkData.
+        render(
+            &mut reverse,
+            &[vec![0.0; 8 * QUANTUM], vec![0.0; 8 * QUANTUM]],
+        );
+        let chunk = component(&reverse);
+        let mut restored = spawn();
+        restore(&restored, &chunk);
+        (
+            render(&mut restored, &x),
+            format!("{library_line} ChunkData \"{}\"", base64_encode(&chunk)),
         )
     } else {
+        let y2 = render(&mut reverse, &x);
         // By name, as the Editor writes them; each value as the shortest decimal
         // that reads back as the plugin's f32.
         let values = parameters(&reverse);
@@ -736,7 +730,7 @@ pub fn compare(case: Case) {
             "METRIC {{\"case\":{:?},\"observation\":\"VST 2 parameters written by index\",\"plain_max_lsb\":{max}}}",
             case.name()
         );
-        format!("{library_line}{}", named(&values))
+        (y2, format!("{library_line}{}", named(&values)))
     };
     println!(
         "METRIC {{\"case\":{:?},\"reverse_line\":{line:?}}}",
@@ -745,9 +739,10 @@ pub fn compare(case: Case) {
     compare_output(case, "reverse", &app, &root, &x, &y2, &line);
 }
 /// Writes every visible, writable parameter, the given ones with their new
-/// value, as EQ APO XT does when it loads a line or a chunk. A fresh pinned
-/// 3 Band EQ reports a 220 Hz low crossover but filters at 200 Hz until
-/// "Low-Mid Freq" is written.
+/// value, as EQ APO XT does when it loads a VST 2 line. A fresh pinned 3 Band
+/// EQ reports a 220 Hz low crossover but filters at 200 Hz until "Low-Mid
+/// Freq" is written. A DPF VST 3 processor ignores a write of the value it
+/// holds, so for VST 3 only a restored state applies every parameter.
 fn write_all(instance: &Instance, entries: &[Parameter], values: &[(&str, f64)]) {
     let writable = |p: &&Parameter| !p.read_only && !p.hidden;
     for (name, _) in values {
@@ -763,6 +758,24 @@ fn write_all(instance: &Instance, entries: &[Parameter], values: &[(&str, f64)])
             .map_or(p.value, |(_, value)| *value);
         set(instance, entries, &p.name, value);
     }
+}
+/// Restores a VST 3 component state, which must save back byte for byte.
+fn restore(instance: &Instance, chunk: &[u8]) {
+    assert!(matches!(
+        request(
+            instance,
+            Command::RestoreState(state::encode(chunk, &[]).unwrap())
+        ),
+        HostEvent::Completed { .. }
+    ));
+    let roundtrip = component(instance);
+    assert!(
+        roundtrip == chunk,
+        "component roundtrip mismatch: lengths {} vs {}, first differing byte {:?}",
+        roundtrip.len(),
+        chunk.len(),
+        roundtrip.iter().zip(chunk).position(|(a, b)| a != b)
+    );
 }
 /// `"<name>" <value>` pairs for every parameter, as the Editor writes them.
 fn named(parameters: &[Parameter]) -> String {
