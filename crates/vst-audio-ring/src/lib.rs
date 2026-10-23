@@ -45,6 +45,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+mod block;
+pub use block::{BlockError, BlockLane, Exchange};
 pub mod events;
 use events::{CONTEXT_WORDS, EVENT_WORDS, METADATA_WORDS, PACKET_WORDS};
 pub use events::{Event, EventBuffer, EventData, MAX_EVENTS, MAX_SYSEX_BYTES, Transport};
@@ -235,6 +237,18 @@ pub trait Signal: Send + Sync {
     fn signal(&self);
 }
 
+impl<T: Signal + ?Sized> Signal for Arc<T> {
+    fn signal(&self) {
+        T::signal(self);
+    }
+}
+
+impl<T: Signal + ?Sized> Signal for Box<T> {
+    fn signal(&self) {
+        T::signal(self);
+    }
+}
+
 pub trait Wait: Send + Sync {
     fn wait(&self, timeout: Duration) -> Waited;
 }
@@ -406,6 +420,12 @@ impl RegionMemory for RegionBuf {
 }
 
 impl<T: RegionMemory + ?Sized> RegionMemory for Arc<T> {
+    fn region(&self) -> Region<'_> {
+        T::region(self)
+    }
+}
+
+impl<T: RegionMemory + ?Sized> RegionMemory for Box<T> {
     fn region(&self) -> Region<'_> {
         T::region(self)
     }
@@ -721,6 +741,62 @@ impl SlotWriter<'_> {
             self.samples[index].store((sample as f32).to_bits().to_le(), Ordering::Relaxed);
         }
     }
+
+    pub fn write_plane(&mut self, plane: usize, samples: &[f32]) -> bool {
+        if plane >= self.planes || samples.len() != self.frames {
+            return false;
+        }
+        let words = self.format.words();
+        let destination =
+            &self.samples[plane * self.frames * words..(plane + 1) * self.frames * words];
+        if self.format == SampleFormat::F64 {
+            for (to, from) in destination.as_chunks::<2>().0.iter().zip(samples) {
+                let bits = f64::from(*from).to_bits();
+                to[0].store((bits as u32).to_le(), Ordering::Relaxed);
+                to[1].store(((bits >> 32) as u32).to_le(), Ordering::Relaxed);
+            }
+        } else {
+            for (to, from) in destination.iter().zip(samples) {
+                to.store(from.to_bits().to_le(), Ordering::Relaxed);
+            }
+        }
+        true
+    }
+
+    pub fn write_plane_f64(&mut self, plane: usize, samples: &[f64]) -> bool {
+        if plane >= self.planes || samples.len() != self.frames {
+            return false;
+        }
+        let words = self.format.words();
+        let destination =
+            &self.samples[plane * self.frames * words..(plane + 1) * self.frames * words];
+        if self.format == SampleFormat::F64 {
+            for (to, from) in destination.as_chunks::<2>().0.iter().zip(samples) {
+                let bits = from.to_bits();
+                to[0].store((bits as u32).to_le(), Ordering::Relaxed);
+                to[1].store(((bits >> 32) as u32).to_le(), Ordering::Relaxed);
+            }
+        } else {
+            for (to, from) in destination.iter().zip(samples) {
+                to.store((*from as f32).to_bits().to_le(), Ordering::Relaxed);
+            }
+        }
+        true
+    }
+
+    pub fn clear_plane(&mut self, plane: usize) -> bool {
+        if plane >= self.planes {
+            return false;
+        }
+        let words = self.format.words();
+        let destination =
+            &self.samples[plane * self.frames * words..(plane + 1) * self.frames * words];
+        for word in destination {
+            word.store(0, Ordering::Relaxed);
+        }
+        true
+    }
+
     pub fn set_transport(&mut self, transport: Transport) {
         for (to, from) in self.metadata.iter().zip(transport.words()) {
             to.store(from.to_le(), Ordering::Relaxed);
@@ -780,6 +856,47 @@ impl SlotReader<'_> {
             f64::from(f32::from_bits(lo))
         }
     }
+
+    pub fn read_plane(self, plane: usize, samples: &mut [f32]) -> bool {
+        if plane >= self.planes || samples.len() != self.frames {
+            return false;
+        }
+        let words = self.format.words();
+        let source = &self.samples[plane * self.frames * words..(plane + 1) * self.frames * words];
+        if self.format == SampleFormat::F64 {
+            for (to, from) in samples.iter_mut().zip(source.as_chunks::<2>().0.iter()) {
+                let lo = u32::from_le(from[0].load(Ordering::Relaxed));
+                let hi = u32::from_le(from[1].load(Ordering::Relaxed));
+                *to = f64::from_bits(u64::from(lo) | (u64::from(hi) << 32)) as f32;
+            }
+        } else {
+            for (to, from) in samples.iter_mut().zip(source) {
+                *to = f32::from_bits(u32::from_le(from.load(Ordering::Relaxed)));
+            }
+        }
+        true
+    }
+
+    pub fn read_plane_f64(self, plane: usize, samples: &mut [f64]) -> bool {
+        if plane >= self.planes || samples.len() != self.frames {
+            return false;
+        }
+        let words = self.format.words();
+        let source = &self.samples[plane * self.frames * words..(plane + 1) * self.frames * words];
+        if self.format == SampleFormat::F64 {
+            for (to, from) in samples.iter_mut().zip(source.as_chunks::<2>().0.iter()) {
+                let lo = u32::from_le(from[0].load(Ordering::Relaxed));
+                let hi = u32::from_le(from[1].load(Ordering::Relaxed));
+                *to = f64::from_bits(u64::from(lo) | (u64::from(hi) << 32));
+            }
+        } else {
+            for (to, from) in samples.iter_mut().zip(source) {
+                *to = f64::from(f32::from_bits(u32::from_le(from.load(Ordering::Relaxed))));
+            }
+        }
+        true
+    }
+
     pub fn output_events(self, events: &mut EventBuffer) -> bool {
         load_packet(
             &self.metadata[CONTEXT_WORDS + PACKET_WORDS..],

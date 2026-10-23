@@ -4,8 +4,8 @@ use std::{
     time::{Duration, Instant},
 };
 use vst_audio::{
-    AudioStatus, Command, Configuration, EditPhase, Host, HostEvent, PluginDescriptor,
-    PluginFormat, Status,
+    AudioStatus, BlockError, BlockStatus, Command, Configuration, EditPhase, Host, HostEvent,
+    PluginDescriptor, PluginFormat, Status,
 };
 
 #[global_allocator]
@@ -413,6 +413,99 @@ fn recovery_replaces_resources_only_at_an_audio_boundary() {
         }
         assert!(recovered);
         assert!((refs[0][100] - 0.25).abs() < 1e-6);
+    }
+}
+
+#[test]
+#[ignore = "native fixtures required"]
+fn block_endpoint_delivers_and_adopts_recovery() {
+    for format in [PluginFormat::Vst2, PluginFormat::Vst3] {
+        let mut instance = host()
+            .spawn(
+                &descriptor(format),
+                &Configuration {
+                    slots: Some(8),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        let controller = instance.controller();
+        let mut blocks = instance.take_blocks().unwrap();
+        assert!(instance.take_audio().is_none());
+        let input = [0.25; 256];
+        let mut invalid = [-1.0; 767];
+        assert_eq!(
+            blocks.process(&input, &mut invalid),
+            BlockStatus::InvalidBuffer
+        );
+        assert!(invalid.iter().all(|sample| *sample == -1.0));
+        assert_eq!(blocks.restart(8), Err(BlockError::Depth));
+        blocks.restart(7).unwrap();
+        let mut output = [-1.0; 768];
+        for _ in 0..7 {
+            assert_eq!(
+                assert_no_alloc::assert_no_alloc(|| blocks.process(&input, &mut output)),
+                BlockStatus::Missed
+            );
+            assert!(output.iter().all(|sample| *sample == -1.0));
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            let status = assert_no_alloc::assert_no_alloc(|| blocks.process(&input, &mut output));
+            if status == BlockStatus::Delivered {
+                assert!((output[100] - 0.25).abs() < 1e-6);
+                assert!((output[5 * 128 + 100] - 0.125).abs() < 1e-6);
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        let crash = controller
+            .request(Command::RestoreState(state(format, 1)))
+            .unwrap();
+        while !matches!(instance.try_next_event(),Some(HostEvent::Completed{request})if request==crash)
+        {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let _ = blocks.process(&input, &mut output);
+        while controller.status() != Status::Failed {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let recover = controller
+            .request(Command::Recover {
+                use_previous: false,
+            })
+            .unwrap();
+        while !matches!(instance.try_next_event(),Some(HostEvent::Completed{request})if request==recover)
+        {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let mut adopted = false;
+        while Instant::now() < deadline {
+            let _ = assert_no_alloc::assert_no_alloc(|| blocks.process(&input, &mut output));
+            if blocks.generation() == 2 {
+                adopted = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        assert!(adopted);
+        blocks.restart(1).unwrap();
+        let mut delivered = false;
+        while Instant::now() < deadline {
+            if assert_no_alloc::assert_no_alloc(|| blocks.process(&input, &mut output)).delivered()
+            {
+                delivered = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        assert!(delivered);
     }
 }
 

@@ -211,10 +211,16 @@ pub(crate) fn supervise(
                         capabilities,
                         ..
                     } = started;
+                    let lane = match vst_audio_ring::BlockLane::new(region, work, publisher, 0, 1) {
+                        Ok(lane) => lane,
+                        Err(_) => {
+                            shared.status.store(1, Ordering::Release);
+                            drop(new_control);
+                            continue;
+                        }
+                    };
                     let prepared = PreparedAudio {
-                        region,
-                        work,
-                        publisher,
+                        lane,
                         geometry,
                         latency: latency_frames,
                         setup,

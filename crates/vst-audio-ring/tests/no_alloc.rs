@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use assert_no_alloc::{AllocDisabler, assert_no_alloc};
-use vst_audio_ring::{Geometry, Producer, Publish, RegionBuf, Signal, Wait, Waited};
+use vst_audio_ring::{BlockLane, Geometry, Producer, Publish, RegionBuf, Signal, Wait, Waited};
 
 #[global_allocator]
 static ALLOCATOR: AllocDisabler = AllocDisabler;
@@ -85,4 +85,32 @@ fn producer_per_block_path_does_not_allocate() {
         );
     });
     assert_eq!(touched.load(Ordering::Relaxed), 2);
+}
+
+#[test]
+fn block_lane_planes_do_not_allocate() {
+    let geometry = Geometry {
+        sample_format: vst_audio_ring::SampleFormat::F32,
+        lanes: 1,
+        slots: 2,
+        input_channels: 2,
+        output_channels: 6,
+        max_frames: 480,
+        sample_rate: 48_000,
+        latency_bound_frames: 1_024,
+    };
+    let storage = RegionBuf::new(geometry).unwrap();
+    let noop = Noop;
+    let mut producer = Producer::new(storage.region(), [Some(&noop), None], &noop);
+    producer.announce(geometry, 1).unwrap();
+    let publisher = producer.publisher().unwrap();
+    vst_audio_ring::Consumer::new(storage.region(), &noop, [None, None])
+        .validate_and_ready(2)
+        .unwrap();
+    let mut lane = BlockLane::new(storage, noop, publisher, 0, 1).unwrap();
+    let input = [0.25; 960];
+    let mut output = [0.0; 2_880];
+    assert_no_alloc(|| {
+        let _ = lane.process_planes(&input, &mut output).unwrap();
+    });
 }

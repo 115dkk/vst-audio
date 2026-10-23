@@ -39,12 +39,14 @@ if let Some(instance) = task.try_complete()? {
 }
 ```
 
-`Instance::take_audio` transfers the unique preallocated audio endpoint.
+`Instance::take_audio` transfers the unique preallocated variable-callback
+endpoint; `take_blocks` instead transfers a block-synchronous `BlockEndpoint`.
 It accepts variable-length planar f32/f64 callbacks up to the configured
 `max_callback_frames`, reblocks them into a prepared quantum, and carries bounded
 sample-offset MIDI/SysEx, automation and transport data. The implemented ring
-uses a configurable number of slots per lane and a matching fixed pipeline depth.
-The endpoint returns processed or explicit fallback output and reports
+uses `Configuration::slots` for the ring capacity. `BlockLane` is the standalone
+ring-crate client; block misses are reported for caller fallback. The audio
+endpoint returns processed or explicit fallback output and reports
 `(ceil(max_callback_frames / quantum) + 1) * quantum` plus plugin latency; the
 default remains two quanta plus plugin latency. Recovered workers swap at audio
 boundaries. The supervisor runs even when the GUI does not poll. Drop audio

@@ -22,3 +22,6 @@ slots, reports `(depth + 1) * quantum` plus plugin latency, and refuses longer
 callbacks with `InvalidBuffer` and zeroed outputs before touching its state.
 The default stays depth 1, two slots and two quanta. Low-level users choose
 `ProcessingOptions::slots` and `Pipeline::with_depth` themselves.
+
+The follow-up [block endpoint decision](0004-block-endpoint.md) centralizes this
+client logic in `BlockLane` and exposes it through `BlockEndpoint`.

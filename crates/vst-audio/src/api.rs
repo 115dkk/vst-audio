@@ -1,6 +1,9 @@
 //! GUI- and executor-independent application API.
 use crate::audio::{AudioEndpoint, PreparedAudio};
-use crate::{Architecture, PluginFormat, PluginProcess, StartError, Started, plugin_architectures};
+use crate::{
+    Architecture, BlockEndpoint, PluginFormat, PluginProcess, StartError, Started,
+    plugin_architectures,
+};
 use std::{
     path::{Path, PathBuf},
     sync::{
@@ -22,6 +25,8 @@ pub struct Configuration {
     /// quanta could not be processed in time. Latency is
     /// `(ceil(max_callback_frames / quantum) + 1) * quantum + plugin latency`.
     pub max_callback_frames: Option<u32>,
+    /// Ring slots per lane; `None` uses callback depth + 1.
+    pub slots: Option<u32>,
     pub fallback: Fallback,
     pub recovery: RecoveryPolicy,
     pub sample_format: vst_audio_protocol::SampleFormat,
@@ -38,6 +43,7 @@ impl Default for Configuration {
             sample_rate: 48_000,
             quantum: 128,
             max_callback_frames: None,
+            slots: None,
             fallback: Fallback::Silence,
             recovery: RecoveryPolicy::Manual,
             sample_format: vst_audio_protocol::SampleFormat::F32,
@@ -91,10 +97,11 @@ impl Configuration {
             )));
         }
         let depth = maximum / self.quantum + u32::from(!maximum.is_multiple_of(self.quantum));
-        let slots = depth.saturating_add(1);
-        if slots > crate::MAX_SLOTS {
+        let required = depth.saturating_add(1);
+        let slots = self.slots.unwrap_or(required);
+        if slots < required || slots > crate::MAX_SLOTS {
             return Err(StartError(format!(
-                "max_callback_frames {maximum} with quantum {} requires {slots} slots, but MAX_SLOTS is {}",
+                "max_callback_frames {maximum} with quantum {} requires at least {required} slots; slots {slots} must not exceed MAX_SLOTS ({})",
                 self.quantum,
                 crate::MAX_SLOTS
             )));
@@ -445,6 +452,23 @@ fn status(shared: &Shared) -> Status {
     }
 }
 
+#[cfg(test)]
+impl Shared {
+    pub(crate) fn for_audio_test() -> Arc<Self> {
+        Arc::new(Self {
+            stop: Arc::new(AtomicBool::new(false)),
+            status: AtomicU8::new(0),
+            worker_pid: AtomicU32::new(1),
+            overflow: AtomicBool::new(false),
+            next_request: AtomicU64::new(1),
+            generation: AtomicU64::new(1),
+            applied_generation: AtomicU64::new(1),
+            processed_generation: AtomicU64::new(0),
+            history: Mutex::new(vst_audio_protocol::StateHistory::new()),
+        })
+    }
+}
+
 /// Owns one worker's lifetime. Drop on a control thread. Dropping this owner
 /// requests teardown even if cloned controllers or its audio endpoint remain.
 #[derive(Debug)]
@@ -489,10 +513,10 @@ impl Instance {
             geometry,
             setup: setup.clone(),
         };
+        let lane = vst_audio_ring::BlockLane::new(region, work, publisher, 0, 1)
+            .map_err(|error| StartError(format!("invalid block lane: {error:?}")))?;
         let prepared = PreparedAudio {
-            region,
-            work,
-            publisher,
+            lane,
             geometry,
             latency: latency_frames,
             setup,
@@ -542,6 +566,10 @@ impl Instance {
     /// Transfer the only realtime handle to the application's audio thread.
     pub fn take_audio(&mut self) -> Option<AudioEndpoint> {
         self.audio.take()
+    }
+    /// Transfer the only realtime handle as a block-synchronous endpoint.
+    pub fn take_blocks(&mut self) -> Option<BlockEndpoint> {
+        self.audio.take().map(AudioEndpoint::into_blocks)
     }
     pub fn try_next_event(&self) -> Option<HostEvent> {
         if self
