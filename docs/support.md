@@ -202,7 +202,7 @@ logs and JSON reports are suitable CI artifacts.
 
 ## EQ APO XT engine comparison (Windows)
 
-On Windows `tools/third_party.py` also downloads EQ APO XT v2.60.3 (x64-sse2
+On Windows `tools/third_party.py` also downloads EQ APO XT v2.60.4 (x64-sse2
 full package, SHA-256 pinned) and extracts its application folder into the
 external build tree. Nothing is installed: no driver, service or registry
 entry. EQ APO XT is GPL software and serves only as an independent engine
@@ -240,20 +240,19 @@ must exceed -120 dBFS.
 In CI every comparison meets these bounds: each plain run differs from
 vst-audio by at most 0.501 LSB (16-bit rounding), each residual is zero at the
 output's resolution, and the controls read -60 dBFS (the one-sample delay,
-limited by the 16-bit output) and about -100 dBFS (the gain error). VST 2
-runs both directions for both plugins and VST 3 runs the reverse direction;
-the first finding below explains why the VST 3 forward direction has no state
-to compare.
+limited by the 16-bit output) and about -100 dBFS (the gain error). Both
+directions run for both plugins in both formats.
 
-EQ APO XT v2.60.3 shows the following behavior. These are properties of that
-engine or of the plugin, recorded by the test, and not vst-audio defects.
+EQ APO XT shows the following behavior. These are properties of that engine
+or of the plugin, recorded by the test, and not vst-audio defects.
 
-- **VST 3 panel edits are not saved:** for both DPF plugins `ChunkData` keeps
-  the default state although the panel's pixels change (3973 and 408 pixels).
-  A DPF VST 3 component takes parameter values from `process()` with frames,
-  and the saved state is the component's. The test reports `known limitation:
-  EQ APO XT v2.60.3 does not save VST 3 editor edits`; the reverse direction
-  still compares VST 3.
+- **VST 3 panel edits before v2.60.4:** v2.60.3 kept the default state in
+  `ChunkData` for both DPF plugins although the panel's pixels changed (3973
+  and 408 pixels). While no audio ran, its Editor passed a panel edit to the
+  processor through a zero-sample process call, which a DPF component returns
+  from before it reads parameter changes, and then saved the component state.
+  EqualizerAPO-XT#437 passes the edit with one silent frame instead; the test
+  now requires the saved state to differ from the default for both formats.
 - **VST 2 values by parameter number are ignored:** a token that begins with
   a digit is read as a value, so a line of `<index> <value>` pairs leaves the
   defaults, thousands of LSB away from vst-audio. The Editor writes names.

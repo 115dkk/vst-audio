@@ -24,8 +24,8 @@ PINS = {
 
 # EqualizerAPO-XT release used by the engine comparison. GPL binaries stay
 # outside the repository, Cargo caches and CI artifacts.
-EAPO = ("https://github.com/115dkk/equalizerapo-xt/releases/download/v2.60.3/EqualizerAPO-XT-x64-sse2-2.60.3-x64-sse2-full.nupkg",
-        "82554fe4c1d92c4f78304972cdd80053078a87d581ef1b56d06b9555011621ae")
+EAPO = ("https://github.com/115dkk/equalizerapo-xt/releases/download/v2.60.4/EqualizerAPO-XT-x64-sse2-2.60.4-x64-sse2-full.nupkg",
+        "334a18580c0e65e6243693ab56377a1146f185d464ae64b72ba4b6f11a1436ce")
 
 # A GPU-less Windows runner has only the GDI OpenGL 1.1, on which DPF editors draw
 # nothing (their pixels read near black). As with Mesa under Xvfb on Linux, a pinned
