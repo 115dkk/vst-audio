@@ -4,6 +4,7 @@ The CI artifact allowlist is only the JSON report and bounded text log. Neither
 the source tree nor any plugin executable is put in Cargo's cache or artifacts.
 """
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -12,6 +13,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
 PINS = {
@@ -19,6 +21,12 @@ PINS = {
     "dpf-plugins": ("https://github.com/DISTRHO/DPF-Plugins.git", "df5cb658a2d8dc6e944d8c26a53853a7c0c6c2b2"),
     "sdk": ("https://github.com/steinbergmedia/vst3sdk.git", "3cdf9ca5d1f5b1b21e0a86832aa4abe55607bd96"),
 }
+
+# A GPU-less Windows runner has only the GDI OpenGL 1.1, on which DPF editors draw
+# nothing (their pixels read near black). As with Mesa under Xvfb on Linux, a pinned
+# Mesa llvmpipe beside the worker renders them in software.
+MESA = ("https://github.com/pal1000/mesa-dist-win/releases/download/26.2.4/mesa3d-26.2.4-release-msvc.7z",
+        "351fc8c8b695878ffb3eaa044b3ead08672a48b1a045e3c3e3975811df0f6695")
 
 def run(*command, cwd=ROOT):
     subprocess.run(list(map(str, command)), cwd=cwd, check=True)
@@ -82,6 +90,23 @@ target_include_directories(d_3BandEQ PUBLIC "{plugins.as_posix()}/plugins/3BandE
             run("codesign", "--force", "--sign", "-", path)
     return paths
 
+def with_software_opengl(root, worker, name):
+    """Copy the worker next to Mesa's WGL DLLs outside the checkout and Cargo cache."""
+    url, digest = MESA
+    archive, extracted = root / "mesa.7z", root / "mesa"
+    if not archive.exists() or hashlib.sha256(archive.read_bytes()).hexdigest() != digest:
+        urllib.request.urlretrieve(url, archive)
+    actual = hashlib.sha256(archive.read_bytes()).hexdigest()
+    assert actual == digest, f"Mesa archive digest {actual}"
+    if not (extracted / "x64" / "opengl32.dll").exists():
+        run("7z", "x", "-y", f"-o{extracted}", archive, "x64/opengl32.dll", "x64/libgallium_wgl.dll")
+    directory = root / name
+    directory.mkdir(exist_ok=True)
+    for dll in ("opengl32.dll", "libgallium_wgl.dll"):
+        shutil.copy2(extracted / "x64" / dll, directory / dll)
+    shutil.copy2(worker, directory / worker.name)
+    return directory / worker.name
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, help="Reuse a developer-owned directory outside the checkout")
@@ -102,7 +127,12 @@ def main():
         run("cargo", "build", "--locked", "-p", "vst-audio-worker")
         target = Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "target"))
         worker = target / "debug" / ("vst-audio-worker.exe" if sys.platform == "win32" else "vst-audio-worker")
+        if sys.platform == "win32":
+            worker = with_software_opengl(root, worker, "worker")
+            report["software_opengl"] = {"url": MESA[0], "sha256": MESA[1], "driver": "llvmpipe"}
         env = dict(os.environ, VST_AUDIO_WORKER=str(worker), **{f"VST_AUDIO_REAL_{key}": str(value) for key, value in paths.items()})
+        if sys.platform == "win32":
+            env["GALLIUM_DRIVER"] = "llvmpipe"
         # Core dumps can contain native code pages. They are neither needed nor retained.
         if sys.platform != "win32":
             import resource
@@ -120,6 +150,8 @@ def main():
             run("cargo", "build", "--locked", "-p", "vst-audio-worker", "--features",
                 "vst-audio-worker-sys/__test-drop-editor-edits", "--target-dir", mutant_target)
             mutant = mutant_target / "debug" / worker.name
+            if sys.platform == "win32":
+                mutant = with_software_opengl(root, mutant, "mutant-worker")
             mutation_env = dict(env, VST_AUDIO_WORKER=str(mutant))
             result = subprocess.run(["cargo", "test", "--locked", "-p", "vst-audio", "--test", "third_party",
                 "editor_input_eq_vst3", "--", "--exact", "--ignored", "--nocapture", "--test-threads=1"],

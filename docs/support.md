@@ -163,8 +163,12 @@ production signing/notarization is described in [distribution](distribution.md).
 3 Band EQ outside the checkout. The ignored tests inject XTest input on Linux
 and SendInput on Windows into embedded editors; they do not call plugin UI
 functions. Windows requires an interactive desktop: foreground denial, UIPI or
-a target belonging to another process fails explicitly. The SendInput path has
-passed x64/i686 MSVC-target clippy checks on Linux, not native Windows execution.
+a target belonging to another process fails explicitly. On the windows-2025
+runner SendInput reached the plugin windows: the EQ drags and SendNote keys
+passed in both formats. A GPU-less runner offers only the GDI OpenGL 1.1, on
+which the DPF editors draw nothing, so the Windows run places a pinned Mesa
+llvmpipe (`opengl32.dll`, `libgallium_wgl.dll`, `GALLIUM_DRIVER=llvmpipe`) beside
+a copy of the worker outside the checkout, as Mesa serves Xvfb on Linux.
 macOS reports `known limitation: macOS synthetic editor input` because embedding
 is unsupported and synthetic input needs accessibility authorization. Wayland
 input is outside this test.
