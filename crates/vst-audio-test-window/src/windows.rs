@@ -89,28 +89,8 @@ impl Parent {
         self.input_pid.set(pid);
     }
     pub(crate) fn pointer(&self, x: i32, y: i32, button: Option<bool>) {
+        use crate::desktop::{move_pointer, send};
         use windows::Win32::{Graphics::Gdi::ClientToScreen, UI::Input::KeyboardAndMouse::*};
-        let send = |dx, dy, flags| {
-            let input = INPUT {
-                r#type: INPUT_MOUSE,
-                Anonymous: INPUT_0 {
-                    mi: MOUSEINPUT {
-                        dx,
-                        dy,
-                        dwFlags: flags,
-                        ..Default::default()
-                    },
-                },
-            };
-            // SAFETY: one fully initialized mouse INPUT, with its exact ABI size.
-            let sent = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
-            assert_eq!(
-                sent,
-                1,
-                "SendInput blocked (desktop/UIPI): {}",
-                windows::core::Error::from_thread()
-            );
-        };
         // Harmless relative zero motion permits a foreground request without bypassing OS policy.
         send(0, 0, MOUSEEVENTF_MOVE);
         // SAFETY: live parent top-level window on this thread.
@@ -140,48 +120,7 @@ impl Parent {
             self.input_pid.get(),
             "input blocked at {point:?}: hit {hit:?}, process {pid}"
         );
-        // SAFETY: these constants query dimensions/origin of the active virtual desktop.
-        let left = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
-        // SAFETY: virtual desktop origin query has no pointer arguments.
-        let top = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
-        // SAFETY: virtual desktop size query has no pointer arguments.
-        let width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
-        // SAFETY: virtual desktop size query has no pointer arguments.
-        let height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
-        assert!(width > 1 && height > 1);
-        let dx = (i64::from(point.x - left) * 65535 / i64::from(width - 1)) as i32;
-        let dy = (i64::from(point.y - top) * 65535 / i64::from(height - 1)) as i32;
-        send(
-            dx,
-            dy,
-            MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE | MOUSEEVENTF_VIRTUALDESK,
-        );
-        if let Some(press) = button {
-            send(
-                0,
-                0,
-                if press {
-                    MOUSEEVENTF_LEFTDOWN
-                } else {
-                    MOUSEEVENTF_LEFTUP
-                },
-            );
-        }
-        // SendInput queues into the system input stream; observe the delivered cursor position.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        loop {
-            self.settle();
-            let mut actual = POINT::default();
-            // SAFETY: writable point receives current desktop cursor coordinates.
-            unsafe { GetCursorPos(&mut actual) }.unwrap();
-            if (actual.x - point.x).abs() <= 1 && (actual.y - point.y).abs() <= 1 {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "OS did not deliver mouse movement: {actual:?}"
-            );
-        }
+        move_pointer(point, button, || self.settle());
     }
     pub fn children(&self) -> Vec<(u64, Option<u32>)> {
         let mut result: Vec<(u64, Option<u32>)> = Vec::new();
@@ -238,7 +177,7 @@ impl Parent {
         self.capture_result().unwrap()
     }
     fn capture_result(&self) -> windows::core::Result<vst_audio_protocol::EditorImage> {
-        use windows::Win32::Graphics::Gdi::*;
+        use windows::Win32::Graphics::Gdi::ClientToScreen;
         let (visible, width, height) = self.status()?;
         if !visible || width == 0 || height == 0 || width > 2048 || height > 2048 {
             return Err(windows::core::Error::new(
@@ -246,75 +185,10 @@ impl Parent {
                 "editor capture unavailable",
             ));
         }
-        // SAFETY: client DC of this owned visible window, released below on every path.
-        let dc = unsafe { GetDC(None) };
         let mut origin = POINT::default();
         // SAFETY: valid client window and writable point converted to screen coordinates.
         assert!(unsafe { ClientToScreen(self.window, &mut origin) }.as_bool());
-        // SAFETY: compatible memory DC inherits the live client DC's format.
-        let memory = unsafe { CreateCompatibleDC(Some(dc)) };
-        // SAFETY: bounded bitmap sized to validated client area.
-        let bitmap = unsafe { CreateCompatibleBitmap(dc, width as i32, height as i32) };
-        // SAFETY: compatible bitmap selected into the memory DC for the copy.
-        let previous = unsafe { SelectObject(memory, bitmap.into()) };
-        // SAFETY: both DCs are live and the copy is bounded to their client bitmap.
-        let copied = unsafe {
-            BitBlt(
-                memory,
-                0,
-                0,
-                width as i32,
-                height as i32,
-                Some(dc),
-                origin.x,
-                origin.y,
-                SRCCOPY,
-            )
-        };
-        // SAFETY: restore original object before reading or deleting the bitmap.
-        let _ = unsafe { SelectObject(memory, previous) };
-        let mut rgba = vec![0u8; width as usize * height as usize * 4];
-        let mut info = BITMAPINFO {
-            bmiHeader: BITMAPINFOHEADER {
-                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: width as i32,
-                biHeight: -(height as i32),
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB.0,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        // SAFETY: output allocation holds exactly height rows of width 32-bit pixels.
-        let rows = unsafe {
-            GetDIBits(
-                dc,
-                bitmap,
-                0,
-                height,
-                Some(rgba.as_mut_ptr().cast()),
-                &mut info,
-                DIB_RGB_COLORS,
-            )
-        };
-        // SAFETY: bitmap deselected, solely owned by this function.
-        let _ = unsafe { DeleteObject(bitmap.into()) };
-        // SAFETY: memory DC has no owned objects selected.
-        let _ = unsafe { DeleteDC(memory) };
-        // SAFETY: release the DC borrowed from this window.
-        let _ = unsafe { ReleaseDC(None, dc) };
-        copied?;
-        if rows != height as i32 {
-            return Err(windows::core::Error::new(
-                windows::Win32::Foundation::E_FAIL,
-                "editor capture unavailable",
-            ));
-        }
-        for pixel in rgba.as_chunks_mut::<4>().0 {
-            pixel.swap(0, 2);
-            pixel[3] = 255;
-        }
+        let rgba = crate::desktop::screen_pixels(origin.x, origin.y, width, height)?;
         Ok(vst_audio_protocol::EditorImage {
             width,
             height,

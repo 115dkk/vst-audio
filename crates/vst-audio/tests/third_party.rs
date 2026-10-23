@@ -7,6 +7,34 @@ use std::{
 };
 use vst_audio::*;
 
+#[cfg_attr(not(windows), allow(dead_code))]
+mod eapo;
+
+#[cfg(windows)]
+#[test]
+#[ignore = "EqualizerAPO-XT release and native desktop required"]
+fn eapo_eq_vst2() {
+    eapo::compare(eapo::Case::EqVst2);
+}
+#[cfg(windows)]
+#[test]
+#[ignore = "EqualizerAPO-XT release and native desktop required"]
+fn eapo_eq_vst3() {
+    eapo::compare(eapo::Case::EqVst3);
+}
+#[cfg(windows)]
+#[test]
+#[ignore = "EqualizerAPO-XT release and native desktop required"]
+fn eapo_mverb_vst2() {
+    eapo::compare(eapo::Case::MverbVst2);
+}
+#[cfg(windows)]
+#[test]
+#[ignore = "EqualizerAPO-XT release and native desktop required"]
+fn eapo_mverb_vst3() {
+    eapo::compare(eapo::Case::MverbVst3);
+}
+
 #[global_allocator]
 static ALLOC: assert_no_alloc::AllocDisabler = assert_no_alloc::AllocDisabler;
 

@@ -23,7 +23,7 @@ from this repository. Required CI executes the implementation on Windows x64, Li
 | Linux event loop | VST3 IRunLoop on host context and editor frame, with timers and file descriptors |
 | Recovery | Saved-state history, bounded manual/automatic restart, generation changes and endpoint handover at audio boundaries; old resources reclaimed off audio |
 | Stress | Variable callbacks and four repeated crashes per format, with 400 numeric healthy-peer callbacks and latest-checkpoint preservation |
-| Independent plugins | DPF MIDI Through/Latency, Steinberg ADelay and mda DX10; MIDI values/offsets, actual DSP, rejected/accepted layouts and repeatability |
+| Independent plugins | DPF MIDI Through/Latency, Steinberg ADelay and mda DX10; MIDI values/offsets, actual DSP, rejected/accepted layouts and repeatability. On Windows, 3 Band EQ and MVerb output is compared with EQ APO XT's engine in both directions |
 | Extended checks | Coverage-guided control/ring fuzzing plus AddressSanitizer and leak checks on native workers and public fixtures |
 | Delivery | Seven crate archives consumed outside the checkout; optimized worker ZIPs extracted and executed; manifests, checksums and dependency licenses |
 | Toolchain | Rust 1.99.0 minimum, tested directly; nightly is used only by the extended test lane |
@@ -157,7 +157,7 @@ Hosted runners do not certify device latency, dropout rates on physical audio
 hardware or universal plugin compatibility. macOS artifacts are ad-hoc signed;
 production signing/notarization is described in [distribution](distribution.md).
 
-## Synthetic editor input verification (in progress)
+## Synthetic editor input verification
 
 `tools/third_party.py` builds pinned DPF Parameters, SendNote and DPF-Plugins
 3 Band EQ outside the checkout. The ignored tests inject XTest input on Linux
@@ -195,10 +195,83 @@ not prevent the mutation diagnostic from running.
 
 DPF is pinned to `b801214e9ce41b56907e1c6c84859b6b4536917d`. The runner uses
 DPF's CMake wrapper and `dpf_add_plugin` for MIDI Through, Latency, Parameters,
-SendNote and the DPF-Plugins 3 Band EQ sources. No native Windows/macOS editor
-input result is claimed until those native runs complete. Plugin binaries and
-external build trees must not be cached or uploaded; only bounded logs and JSON
-reports are suitable CI artifacts.
+SendNote and the DPF-Plugins 3 Band EQ sources. The windows-2025 runner passes
+every case in both formats; macOS reports the known limitation above. Plugin
+binaries and external build trees must not be cached or uploaded; only bounded
+logs and JSON reports are suitable CI artifacts.
+
+## EQ APO XT engine comparison (Windows)
+
+On Windows `tools/third_party.py` also downloads EQ APO XT v2.60.3 (x64-sse2
+full package, SHA-256 pinned) and extracts its application folder into the
+external build tree. Nothing is installed: no driver, service or registry
+entry. EQ APO XT is GPL software and serves only as an independent engine
+under test; none of its code is read for or copied into these crates. The
+comparison uses effect plugins only, since EQ APO XT is not a MIDI or
+instrument host: DPF-Plugins 3 Band EQ and MVerb (reverb), each as VST 2 and
+VST 3.
+
+Each case runs two directions with the same 48 kHz signal: a logarithmic sweep
+from 20 Hz to 20 kHz at -18 dBFS, uniform noise at -30 dBFS and a -6 dBFS
+impulse every 2 s, lasting 20 s (EQ) or 60 s (MVerb). vst-audio renders it in
+512-frame blocks and drops its pipeline delay.
+
+- **Forward:** the EQ APO XT Editor opens the plugin panel through UI
+  Automation and SendInput drags two of the plugin's controls; the editor's
+  pixels must change. After OK and Save, vst-audio applies the saved line
+  (VST 2 values by name; VST 3 `ChunkData` restored and saved back byte for
+  byte) and the sound must change by more than -60 dBFS against the defaults.
+- **Reverse:** vst-audio sets the values and writes the line EQ APO XT
+  reads. For VST 2 it writes every visible, writable parameter, renders, and
+  writes each value by name as the shortest decimal of the plugin's f32. For
+  VST 3 it saves the component state after processing a few blocks, restores
+  it into a fresh instance that renders, and writes the state as `ChunkData`.
+
+Benchmark.exe writes 16-bit PCM, so the comparison has two parts. The plain
+run must line up at lag 0 (searched over ±64 frames) and differ from
+vst-audio by at most 2 LSB. The difference run computes inside the engine:
+the input carries `[x_L, x_R, y_L, y_R]`, the plugin processes channels 1 and
+2, `Copy` subtracts vst-audio's output and `Preamp: 60 dB` raises the
+residual, which must stay at or below -120 dBFS with no growth between the
+first and last 5 s. The residual's resolution is about -156 dBFS. A one-sample
+delay and a 2e-5 gain error of vst-audio's output are negative controls and
+must exceed -120 dBFS.
+
+In CI every comparison meets these bounds: each plain run differs from
+vst-audio by at most 0.501 LSB (16-bit rounding), each residual is zero at the
+output's resolution, and the controls read -60 dBFS (the one-sample delay,
+limited by the 16-bit output) and about -100 dBFS (the gain error). VST 2
+runs both directions for both plugins and VST 3 runs the reverse direction;
+the first finding below explains why the VST 3 forward direction has no state
+to compare.
+
+EQ APO XT v2.60.3 shows the following behavior. These are properties of that
+engine or of the plugin, recorded by the test, and not vst-audio defects.
+
+- **VST 3 panel edits are not saved:** for both DPF plugins `ChunkData` keeps
+  the default state although the panel's pixels change (3973 and 408 pixels).
+  A DPF VST 3 component takes parameter values from `process()` with frames,
+  and the saved state is the component's. The test reports `known limitation:
+  EQ APO XT v2.60.3 does not save VST 3 editor edits`; the reverse direction
+  still compares VST 3.
+- **VST 2 values by parameter number are ignored:** a token that begins with
+  a digit is read as a value, so a line of `<index> <value>` pairs leaves the
+  defaults, thousands of LSB away from vst-audio. The Editor writes names.
+- **Benchmark output parameter changes:** Benchmark.exe passes no output
+  parameter change list to VST 3 `process()`; DPF prints an assertion message
+  and continues.
+- **Configuration encoding:** `config.txt` must be UTF-8 without a byte order
+  mark. A BOM makes EQ APO XT ignore the first command.
+- **3 Band EQ initial crossover:** the pinned 3 Band EQ reports a 220 Hz low
+  crossover but filters at 200 Hz until "Low-Mid Freq" is written. EQ APO XT
+  applies every parameter when it loads a line or a chunk, and the reverse
+  direction does the same on the vst-audio side. For VST 3 that takes a
+  restore, because a DPF VST 3 processor ignores a write of the value it
+  already holds.
+
+For a DPF VST 3 plugin, a vst-audio `SaveState` reflects `SetParameter` only
+after a processed block, because the processor receives parameter changes in
+`process()`. An application that saves state with audio running is unaffected.
 
 ## VST 2 hardening scope
 

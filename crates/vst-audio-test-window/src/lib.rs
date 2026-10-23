@@ -9,6 +9,9 @@ pub use linux::Parent;
 mod windows;
 #[cfg(windows)]
 pub use windows::Parent;
+#[cfg(windows)]
+#[allow(unsafe_code)]
+pub mod desktop;
 
 #[cfg(any(windows, target_os = "linux"))]
 impl Parent {
