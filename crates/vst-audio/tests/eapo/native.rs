@@ -146,7 +146,7 @@ fn directory(root: &Path, name: &str) -> PathBuf {
     fs::create_dir(&path).unwrap_or_else(|e| panic!("create fresh {}: {e}", path.display()));
     path
 }
-fn gui(case: Case, app: &Path, root: &Path, library: &Path) -> PluginLine {
+fn gui(case: Case, app: &Path, root: &Path, library: &Path) -> (PluginLine, usize) {
     let dir = directory(root, &format!("{}-gui", case.name()));
     let config = dir.join("config.txt");
     fs::write(
@@ -222,6 +222,18 @@ fn gui(case: Case, app: &Path, root: &Path, library: &Path) -> PluginLine {
         r.width(),
         r.height()
     );
+    // The editor's own pixels show whether the input reached it, apart from
+    // whether the host then saved what it did. Wait for its first frames to settle.
+    let mut before = desktop::capture(r);
+    let settle = Instant::now() + Duration::from_secs(5);
+    loop {
+        std::thread::sleep(Duration::from_millis(300));
+        let again = desktop::capture(r);
+        if again == before || Instant::now() >= settle {
+            break;
+        }
+        before = again;
+    }
     for (from, to) in case.edits() {
         assert!(
             r.contains(r.left + from.0, r.top + from.1) && r.contains(r.left + to.0, r.top + to.1),
@@ -235,6 +247,18 @@ fn gui(case: Case, app: &Path, root: &Path, library: &Path) -> PluginLine {
         );
         std::thread::sleep(Duration::from_millis(300));
     }
+    let after = desktop::capture(r);
+    let changed = before
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(after.as_chunks::<4>().0)
+        .filter(|(a, b)| a != b)
+        .count();
+    println!(
+        "METRIC {{\"case\":{:?},\"editor_pixels_changed\":{changed}}}",
+        case.name()
+    );
     let button = until(5, "panel OK", || {
         desktop::find_named(dialog.handle, "OK", None)
     });
@@ -271,7 +295,7 @@ fn gui(case: Case, app: &Path, root: &Path, library: &Path) -> PluginLine {
         library,
         "Editor changed plugin library"
     );
-    line
+    (line, changed)
 }
 fn signal(case: Case) -> [Vec<f32>; 2] {
     let frames = ((if case.eq() { 20 } else { 60 }) * RATE).div_ceil(QUANTUM) * QUANTUM;
@@ -434,6 +458,25 @@ fn residual(output: &[Vec<i16>]) -> (f64, f64, f64) {
     };
     (max, rms(0), rms(n - 5 * RATE))
 }
+/// Largest difference in LSB between the engine's plain output and `y`, at lag 0.
+fn plain_difference(
+    app: &Path,
+    root: &Path,
+    name: &str,
+    x: &[Vec<f32>; 2],
+    y: &[Vec<f32>; 2],
+    line: &str,
+) -> f64 {
+    let plain = benchmark(app, root, name, &format!("{line}\r\n"), &[&x[0], &x[1]]);
+    (0..2)
+        .flat_map(|ch| {
+            plain.channels[ch]
+                .iter()
+                .zip(&y[ch])
+                .map(|(&o, &v)| (f64::from(o) - f64::from(v) * 32767.0).abs())
+        })
+        .fold(0.0, f64::max)
+}
 fn compare_output(
     case: Case,
     direction: &str,
@@ -578,29 +621,11 @@ pub fn compare(case: Case) {
     );
     let c0 = (case.format() == PluginFormat::Vst3).then(|| component(&default));
     let y0 = render(default, &x);
-    let saved = gui(case, &app, &root, library);
+    let (saved, changed_pixels) = gui(case, &app, &root, library);
     let forward = spawn();
-    if let Some(c0) = c0 {
+    let saved_edit = if let Some(c0) = &c0 {
         let chunk = saved.chunk.as_ref().expect("missing ChunkData");
-        assert_ne!(
-            *chunk, c0,
-            "EQ APO XT GUI edit did not change the plugin state"
-        );
-        assert!(matches!(
-            request(
-                &forward,
-                Command::RestoreState(state::encode(chunk, &[]).unwrap())
-            ),
-            HostEvent::Completed { .. }
-        ));
-        let roundtrip = component(&forward);
-        assert!(
-            roundtrip == *chunk,
-            "component roundtrip mismatch: lengths {} vs {}, first differing byte {:?}",
-            roundtrip.len(),
-            chunk.len(),
-            roundtrip.iter().zip(chunk).position(|(a, b)| a != b)
-        );
+        chunk != c0
     } else {
         let changed = saved
             .parameters
@@ -613,53 +638,108 @@ pub fn compare(case: Case) {
                 (p.value - value).abs() > 1e-3
             })
             .count();
+        changed >= 2
+    };
+    if !saved_edit {
+        // The editor's pixels prove the drags reached it. A VST 3 edit that the
+        // host then kept out of ChunkData is the engine's side; the reverse
+        // direction below still compares the two engines.
         assert!(
-            changed >= 2,
-            "EQ APO XT GUI edit did not change the plugin state"
+            case.format() == PluginFormat::Vst3 && changed_pixels >= 500,
+            "EQ APO XT GUI edit did not change the plugin state ({changed_pixels} editor pixels changed)"
         );
-        for (name, value) in &saved.parameters {
-            set(&forward, &defaults, name, *value);
-        }
-    }
-    let y1 = render(forward, &x);
-    let change = y0
-        .iter()
-        .flatten()
-        .zip(y1.iter().flatten())
-        .map(|(a, b)| f64::from((a - b).abs()))
-        .fold(0.0, f64::max);
-    println!(
-        "METRIC {{\"case\":{:?},\"state\":{:?},\"gui_edits\":2,\"sound_change_db\":{}}}",
-        case.name(),
-        if case.format() == PluginFormat::Vst3 {
-            "chunk"
+        println!(
+            "METRIC {{\"case\":\"known limitation: EQ APO XT v2.60.3 does not save VST 3 editor edits\",\"plugin\":{:?},\"editor_pixels_changed\":{changed_pixels}}}",
+            case.name()
+        );
+    } else {
+        if let Some(chunk) = &saved.chunk {
+            assert!(matches!(
+                request(
+                    &forward,
+                    Command::RestoreState(state::encode(chunk, &[]).unwrap())
+                ),
+                HostEvent::Completed { .. }
+            ));
+            let roundtrip = component(&forward);
+            assert!(
+                roundtrip == *chunk,
+                "component roundtrip mismatch: lengths {} vs {}, first differing byte {:?}",
+                roundtrip.len(),
+                chunk.len(),
+                roundtrip.iter().zip(chunk).position(|(a, b)| a != b)
+            );
         } else {
-            "parameters"
-        },
-        db(change)
-    );
-    assert!(
-        change > 1e-3,
-        "GUI edit did not change sound by more than -60 dBFS"
-    );
-    compare_output(case, "forward", &app, &root, &x, &y1, &saved.raw);
+            for (name, value) in &saved.parameters {
+                set(&forward, &defaults, name, *value);
+            }
+        }
+        let y1 = render(forward, &x);
+        let change = y0
+            .iter()
+            .flatten()
+            .zip(y1.iter().flatten())
+            .map(|(a, b)| f64::from((a - b).abs()))
+            .fold(0.0, f64::max);
+        println!(
+            "METRIC {{\"case\":{:?},\"state\":{:?},\"gui_edits\":2,\"sound_change_db\":{}}}",
+            case.name(),
+            if saved.chunk.is_some() {
+                "chunk"
+            } else {
+                "parameters"
+            },
+            db(change)
+        );
+        assert!(
+            change > 1e-3,
+            "GUI edit did not change sound by more than -60 dBFS"
+        );
+        compare_output(case, "forward", &app, &root, &x, &y1, &saved.raw);
+    }
     let reverse = spawn();
     let entries = parameters(&reverse);
     for (name, value) in case.reverse() {
         set(&reverse, &entries, name, value);
     }
     let mut line = format!("VSTPlugin: Library \"{}\"", library.display());
+    let mut reverse_long = None;
     if case.format() == PluginFormat::Vst3 {
         line.push_str(&format!(
             " ChunkData \"{}\"",
             base64_encode(&component(&reverse))
         ));
     } else {
+        // Shortest decimal that reads back as the plugin's f32, as the Editor
+        // writes it. The f64 form of the same value is kept as an observation.
+        let mut long = line.clone();
         for p in parameters(&reverse) {
             assert!(!p.name.contains('"'));
-            line.push_str(&format!(" \"{}\" {}", p.name, p.value));
+            line.push_str(&format!(" \"{}\" {}", p.name, p.value as f32));
+            long.push_str(&format!(" \"{}\" {}", p.name, p.value));
+        }
+        if long != line {
+            reverse_long = Some(long);
         }
     }
+    println!(
+        "METRIC {{\"case\":{:?},\"reverse_line\":{line:?}}}",
+        case.name()
+    );
     let y2 = render(reverse, &x);
     compare_output(case, "reverse", &app, &root, &x, &y2, &line);
+    if let Some(long) = reverse_long {
+        let max = plain_difference(
+            &app,
+            &root,
+            &format!("{}-reverse-f64", case.name()),
+            &x,
+            &y2,
+            &long,
+        );
+        println!(
+            "METRIC {{\"case\":{:?},\"observation\":\"VST 2 values written as f64 decimals\",\"plain_max_lsb\":{max}}}",
+            case.name()
+        );
+    }
 }

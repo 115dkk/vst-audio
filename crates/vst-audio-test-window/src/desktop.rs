@@ -163,6 +163,89 @@ pub fn find_named(top: u64, name: &str, class: Option<&str>) -> Option<Rect> {
         && screen.contains(rect.right - 1, rect.bottom - 1))
     .then_some(rect)
 }
+/// RGBA pixels of a screen rectangle as composed on the desktop.
+pub fn capture(rect: Rect) -> Vec<u8> {
+    let (width, height) = (
+        u32::try_from(rect.width()).unwrap(),
+        u32::try_from(rect.height()).unwrap(),
+    );
+    screen_pixels(rect.left, rect.top, width, height).expect("screen capture")
+}
+pub(crate) fn screen_pixels(
+    left: i32,
+    top: i32,
+    width: u32,
+    height: u32,
+) -> windows::core::Result<Vec<u8>> {
+    use windows::Win32::Graphics::Gdi::*;
+    if width == 0 || height == 0 || width > 4096 || height > 4096 {
+        return Err(windows::core::Error::new(E_FAIL, "capture size"));
+    }
+    // SAFETY: screen DC, released below on every path.
+    let dc = unsafe { GetDC(None) };
+    // SAFETY: compatible memory DC inherits the live screen DC's format.
+    let memory = unsafe { CreateCompatibleDC(Some(dc)) };
+    // SAFETY: bounded bitmap sized to the validated rectangle.
+    let bitmap = unsafe { CreateCompatibleBitmap(dc, width as i32, height as i32) };
+    // SAFETY: compatible bitmap selected into the memory DC for the copy.
+    let previous = unsafe { SelectObject(memory, bitmap.into()) };
+    // SAFETY: both DCs are live and the copy is bounded to the bitmap.
+    let copied = unsafe {
+        BitBlt(
+            memory,
+            0,
+            0,
+            width as i32,
+            height as i32,
+            Some(dc),
+            left,
+            top,
+            SRCCOPY,
+        )
+    };
+    // SAFETY: restore original object before reading or deleting the bitmap.
+    let _ = unsafe { SelectObject(memory, previous) };
+    let mut rgba = vec![0u8; width as usize * height as usize * 4];
+    let mut info = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width as i32,
+            biHeight: -(height as i32),
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    // SAFETY: output allocation holds exactly height rows of width 32-bit pixels.
+    let rows = unsafe {
+        GetDIBits(
+            dc,
+            bitmap,
+            0,
+            height,
+            Some(rgba.as_mut_ptr().cast()),
+            &mut info,
+            DIB_RGB_COLORS,
+        )
+    };
+    // SAFETY: bitmap deselected, solely owned by this function.
+    let _ = unsafe { DeleteObject(bitmap.into()) };
+    // SAFETY: memory DC has no owned objects selected.
+    let _ = unsafe { DeleteDC(memory) };
+    // SAFETY: release the screen DC borrowed above.
+    let _ = unsafe { ReleaseDC(None, dc) };
+    copied?;
+    if rows != height as i32 {
+        return Err(windows::core::Error::new(E_FAIL, "capture rows"));
+    }
+    for pixel in rgba.as_chunks_mut::<4>().0 {
+        pixel.swap(0, 2);
+        pixel[3] = 255;
+    }
+    Ok(rgba)
+}
 fn desktop_rect() -> Rect {
     // SAFETY: virtual desktop origin query has no pointer arguments.
     let left = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };

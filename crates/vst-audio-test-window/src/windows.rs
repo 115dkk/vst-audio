@@ -177,7 +177,7 @@ impl Parent {
         self.capture_result().unwrap()
     }
     fn capture_result(&self) -> windows::core::Result<vst_audio_protocol::EditorImage> {
-        use windows::Win32::Graphics::Gdi::*;
+        use windows::Win32::Graphics::Gdi::ClientToScreen;
         let (visible, width, height) = self.status()?;
         if !visible || width == 0 || height == 0 || width > 2048 || height > 2048 {
             return Err(windows::core::Error::new(
@@ -185,75 +185,10 @@ impl Parent {
                 "editor capture unavailable",
             ));
         }
-        // SAFETY: client DC of this owned visible window, released below on every path.
-        let dc = unsafe { GetDC(None) };
         let mut origin = POINT::default();
         // SAFETY: valid client window and writable point converted to screen coordinates.
         assert!(unsafe { ClientToScreen(self.window, &mut origin) }.as_bool());
-        // SAFETY: compatible memory DC inherits the live client DC's format.
-        let memory = unsafe { CreateCompatibleDC(Some(dc)) };
-        // SAFETY: bounded bitmap sized to validated client area.
-        let bitmap = unsafe { CreateCompatibleBitmap(dc, width as i32, height as i32) };
-        // SAFETY: compatible bitmap selected into the memory DC for the copy.
-        let previous = unsafe { SelectObject(memory, bitmap.into()) };
-        // SAFETY: both DCs are live and the copy is bounded to their client bitmap.
-        let copied = unsafe {
-            BitBlt(
-                memory,
-                0,
-                0,
-                width as i32,
-                height as i32,
-                Some(dc),
-                origin.x,
-                origin.y,
-                SRCCOPY,
-            )
-        };
-        // SAFETY: restore original object before reading or deleting the bitmap.
-        let _ = unsafe { SelectObject(memory, previous) };
-        let mut rgba = vec![0u8; width as usize * height as usize * 4];
-        let mut info = BITMAPINFO {
-            bmiHeader: BITMAPINFOHEADER {
-                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: width as i32,
-                biHeight: -(height as i32),
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB.0,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        // SAFETY: output allocation holds exactly height rows of width 32-bit pixels.
-        let rows = unsafe {
-            GetDIBits(
-                dc,
-                bitmap,
-                0,
-                height,
-                Some(rgba.as_mut_ptr().cast()),
-                &mut info,
-                DIB_RGB_COLORS,
-            )
-        };
-        // SAFETY: bitmap deselected, solely owned by this function.
-        let _ = unsafe { DeleteObject(bitmap.into()) };
-        // SAFETY: memory DC has no owned objects selected.
-        let _ = unsafe { DeleteDC(memory) };
-        // SAFETY: release the DC borrowed from this window.
-        let _ = unsafe { ReleaseDC(None, dc) };
-        copied?;
-        if rows != height as i32 {
-            return Err(windows::core::Error::new(
-                windows::Win32::Foundation::E_FAIL,
-                "editor capture unavailable",
-            ));
-        }
-        for pixel in rgba.as_chunks_mut::<4>().0 {
-            pixel.swap(0, 2);
-            pixel[3] = 255;
-        }
+        let rgba = crate::desktop::screen_pixels(origin.x, origin.y, width, height)?;
         Ok(vst_audio_protocol::EditorImage {
             width,
             height,
