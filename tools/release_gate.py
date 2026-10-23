@@ -7,10 +7,19 @@ version is 0 every GitHub release is a prerelease; no suffix is ever appended.
 
 * the workspace version has no tag yet             -> release it as is
                                                       (first release, or a
-                                                      manual bump)
+                                                      manual bump), unless
+                                                      it is too small (below)
 * tagged, shipped files changed since that tag     -> bump, commit the bump to
                                                       main, release it
 * tagged, nothing shipped changed                  -> do nothing
+
+An untagged version is a bump whose release failed, or a manual bump. It is
+released as is only when it is still right for what it would ship: at least the
+bump the shipped commits since the latest lower tag ask for, and not yet on
+crates.io (crates published by a run that failed later came from an older
+commit, and the publish job skips crates already there). Otherwise the gate
+bumps past it. Without this, a ``feat!`` that lands after a failed patch
+release was published as that patch version.
 
 The bump is minor when a commit that touched shipped files has a ``feat``
 subject or says ``BREAKING CHANGE``, and patch otherwise. A file ships when it
@@ -28,7 +37,11 @@ import os
 import re
 import subprocess
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
+
+from fixtures import download
 
 SHIP = (
     "crates/*",
@@ -102,16 +115,55 @@ def bumped(version: str, kind: str) -> str:
     return f"{major}.{minor}.{patch + 1}"
 
 
-def decide(version: str, tags, shipped: list, messages):
-    """Return ``(action, version)``: action is ``release``, ``bump`` or ``none``."""
+def lower_tag(version: str, tags) -> str | None:
+    """The latest tag below ``version``."""
+    return latest_tag(t for t in tags
+                      if TAG_RE.match(t) and parse_version(t[1:]) < parse_version(version))
+
+
+def decide(version: str, tags, shipped: list, messages, *, published=False):
+    """Return ``(action, version)``: action is ``release``, ``bump`` or ``none``.
+
+    For a tagged ``version``, ``shipped`` and ``messages`` describe the shipped
+    changes since its tag. For an untagged one they describe those since the
+    latest lower tag, and ``published`` says whether a crate of ``version`` is
+    already on crates.io.
+    """
     if f"v{version}" not in tags:
-        return "release", version
-    if not shipped:
-        return "none", version
-    candidate = bumped(version, bump_kind(messages))
+        candidate = version
+        lower = lower_tag(version, tags)
+        if lower and shipped:
+            needed = bumped(lower[1:], bump_kind(messages))
+            if parse_version(needed) > parse_version(candidate):
+                candidate = needed
+        if published and candidate == version:
+            candidate = bumped(version, "patch")
+        if candidate == version:
+            return "release", version
+    else:
+        if not shipped:
+            return "none", version
+        candidate = bumped(version, bump_kind(messages))
     while f"v{candidate}" in tags:
         candidate = bumped(candidate, "patch")
     return "bump", candidate
+
+
+def published_on_crates_io(names, version: str) -> bool:
+    """Whether any of ``names`` already has ``version`` on crates.io."""
+    agent = f"vst-audio release gate (https://github.com/{os.environ.get('GITHUB_REPOSITORY', '')})"
+    for name in sorted(names):
+        request = urllib.request.Request(
+            f"https://crates.io/api/v1/crates/{name}/{version}", headers={"User-Agent": agent})
+        try:
+            download(request)
+        except urllib.error.HTTPError as error:
+            if error.code == 404:
+                continue
+            raise
+        print(f"{name} {version} is already on crates.io")
+        return True
+    return False
 
 
 def workspace_version(cargo_toml: str) -> str:
@@ -234,18 +286,21 @@ def main() -> int:
     current_tag = f"v{version}"
     previous = latest_tag(tags)
 
+    tagged = current_tag in tags
+    base = current_tag if tagged else lower_tag(version, tags)
     shipped, messages = [], []
-    if current_tag in tags:
-        changed = _git("diff", "--name-only", current_tag, head).splitlines()
+    if base:
+        changed = _git("diff", "--name-only", base, head).splitlines()
         shipped = [f for f in changed if ships(f)]
         if shipped:
-            log = _git("log", "--no-merges", "--format=%B%x00", f"{current_tag}..{head}",
+            log = _git("log", "--no-merges", "--format=%B%x00", f"{base}..{head}",
                        "--", *shipped)
             messages = [m for m in log.split("\x00") if m.strip()]
+    published = not tagged and published_on_crates_io(workspace_members(), version)
 
-    action, new_version = decide(version, tags, shipped, messages)
-    print(f"head={head[:12]} version={version} tagged={current_tag in tags} "
-          f"previous={previous}")
+    action, new_version = decide(version, tags, shipped, messages, published=published)
+    print(f"head={head[:12]} version={version} tagged={tagged} base={base} "
+          f"published={published} previous={previous}")
     print(f"shipped changes: {shipped[:20]}")
     print(f"decision: {action} {new_version}")
 
