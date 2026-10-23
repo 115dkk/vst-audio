@@ -257,42 +257,22 @@ impl ChildProcess {
         let environment = sandbox.temporary().map(environment).transpose()?;
         let environment = environment.as_ref().map(|block| block.as_ptr().cast());
         let flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT;
-        if let Some(token) = &security.token {
-            // SAFETY: restricted primary token, terminated UTF-16 strings/environment and
-            // initialized extended attributes all remain live; child starts suspended.
-            unsafe {
-                CreateProcessAsUserW(
-                    Some(raw(token)),
-                    PCWSTR(exe.as_ptr()),
-                    Some(PWSTR(command.as_mut_ptr())),
-                    None,
-                    None,
-                    true,
-                    flags,
-                    environment,
-                    None,
-                    &startup.StartupInfo,
-                    &mut info,
-                )
-            }?;
-        } else {
-            // SAFETY: valid terminated strings/environment and extended startup with
-            // optional AppContainer capability SID; child is suspended until job assignment.
-            unsafe {
-                CreateProcessW(
-                    PCWSTR(exe.as_ptr()),
-                    Some(PWSTR(command.as_mut_ptr())),
-                    None,
-                    None,
-                    true,
-                    flags,
-                    environment,
-                    None,
-                    &startup.StartupInfo,
-                    &mut info,
-                )
-            }?;
-        }
+        // SAFETY: valid terminated strings/environment and extended startup with
+        // optional AppContainer capability SID; child is suspended until job assignment.
+        unsafe {
+            CreateProcessW(
+                PCWSTR(exe.as_ptr()),
+                Some(PWSTR(command.as_mut_ptr())),
+                None,
+                None,
+                true,
+                flags,
+                environment,
+                None,
+                &startup.StartupInfo,
+                &mut info,
+            )
+        }?;
         let process = own(info.hProcess);
         let thread = own(info.hThread);
         let child = Self {

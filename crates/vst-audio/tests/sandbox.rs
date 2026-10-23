@@ -42,6 +42,10 @@ fn sandbox_probes_and_audio() {
     let file = PathBuf::from(std::env::var_os("VST_AUDIO_PROBE_FILE").unwrap());
     let worker = PathBuf::from(std::env::var_os("VST_AUDIO_WORKER").unwrap());
     let unrelated = tempfile::tempdir().unwrap();
+    // Windows blocks AppContainer loopback unless an administrator exempts the
+    // network profile; CI does so and says so.
+    let loopback =
+        u8::from(!cfg!(windows) || std::env::var_os("VST_AUDIO_LOOPBACK_EXEMPT").is_some());
     for (label, policy, expected) in [
         ("none", None, [1, 1, 1]),
         ("default", Some(SandboxPolicy::default()), [0, 0, 0]),
@@ -51,7 +55,7 @@ fn sandbox_probes_and_audio() {
                 network: true,
                 ..Default::default()
             }),
-            [1, 0, 0],
+            [loopback, 0, 0],
         ),
         (
             "writable-outside",

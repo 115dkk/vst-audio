@@ -8,7 +8,7 @@ from this repository. Required CI executes the implementation on Windows x64, Li
 | VST2 / VST3 | Disposable scan, effects and instruments, state and native bundles; both formats execute numeric audio tests |
 | Architectures | Bounded PE, ELF and Mach-O (including universal) header inspection; `Host::with_worker` registers architecture-specific workers and native slices are preferred. x86_64 Linux application + i686 worker verified with VST2/VST3 numeric audio, events, state and editors; Windows emulation and macOS Rosetta combinations require native CI verification and are not certified by cross-compilation |
 | Isolation | One worker per instance; crash/hang A while parent and B keep processing |
-| Sandbox | Opt-in, off by default, fail-closed setup: Linux Landlock + seccomp, Windows AppContainer (network denied) or restricted Low token (network allowed) + job, macOS Seatbelt. Linux VST2/VST3 native probes cover TCP/write/exec, audio, editor and scan; Windows/macOS execution remains pending native CI, not certified by cross-compilation |
+| Sandbox | Opt-in, off by default, fail-closed setup: Linux Landlock + seccomp, Windows AppContainer (network capabilities only when allowed) + job, macOS Seatbelt. Linux VST2/VST3 native probes cover TCP/write/exec, audio, editor and scan; Windows/macOS execution remains pending native CI, not certified by cross-compilation |
 | Audio | Planar f32/f64, variable callback sizes, preallocated reblocking and explicit fallback; allocator guard covers the callback |
 | Events | Sample offsets and bus indices, MIDI channel messages and owned SysEx (up to 256 bytes); bounded 256-event packets and explicit host overflow |
 | Automation / transport | VST3 parameter queues retain offsets; VST2 splits at automation boundaries; in-block transport changes split both formats |
@@ -82,26 +82,27 @@ unsandboxed fallback.
   avoid bypassing socket filtering. This is not IPC isolation: a cooperating
   Unix-socket service can proxy network/filesystem operations, and `/dev/shm`
   remains shared. Linux process policy prevents exec, not fork-only children.
-- **Windows:** the persistent profile is `vst-audio.worker`, with no network
-  capabilities. Read/execute ACEs are added to the worker/plugin and containing
-  directories for sibling DLLs and resources; writable directories and private
-  temporary storage receive modify ACEs and inheritable Low integrity labels.
-  Existing ALL APPLICATION PACKAGES read/execute grants are reused. Added ACEs
-  and labels are **not removed**. Thus the fixed container SID shares grants
-  across instances and runs; previously allowed directories remain accessible.
-  AppContainer's own storage and paths already granting package access are OS
-  exceptions, not an exact per-instance filesystem allowlist. With network
-  enabled, the restricted token disables Administrators, removes privileges
-  (except Windows' retained traversal privilege) and runs at Low integrity;
-  existing Low-integrity writable paths are also writable, not just this policy's
-  list. Its default DACL grants the user and SYSTEM, so the worker can open its
-  own process and threads (elevated tokens otherwise default to Administrators).
-  Where opening the worker, the plugin or their directories as that token fails
-  (an elevated application whose files are readable only through
-  Administrators), the user receives read/execute entries, likewise not removed.
-  The one-active-process job blocks children when `processes` is false.
-  Inherited IPC handles retain their granted access. Native execution, GUI,
-  inherited-handle behavior and ACL propagation still require Windows CI.
+- **Windows:** every sandboxed worker runs in a persistent AppContainer profile:
+  `vst-audio.worker` with no capabilities, or `vst-audio.worker.network` with
+  `internetClient`, `internetClientServer` and `privateNetworkClientServer` when
+  network is allowed. Windows blocks AppContainer loopback, so a network-allowed
+  worker reaches local licence services only after an administrator exempts that
+  profile (`CheckNetIsolation LoopbackExempt -a -n=vst-audio.worker.network`); the
+  separate profile keeps such an exemption away from network-denied workers.
+  Read/execute ACEs are added to the worker/plugin and containing directories
+  for sibling DLLs and resources; writable directories and private temporary
+  storage receive modify ACEs and inheritable Low integrity labels. Existing ALL
+  APPLICATION PACKAGES read/execute grants are reused. Added ACEs and labels are
+  **not removed**. Thus each fixed container SID shares grants across instances
+  and runs; previously allowed directories remain accessible. AppContainer's own
+  storage and paths already granting package access are OS exceptions, not an
+  exact per-instance filesystem allowlist. The worker verifies its own token:
+  AppContainer, and network capabilities exactly when the policy allows network.
+  A restricted Low-integrity token was tried for the network-allowed case and
+  abandoned: on Windows Server 2025 CI it could not read files whose DACL granted
+  the user. The one-active-process job blocks children when `processes` is false.
+  Inherited IPC handles retain their granted access. GUI, inherited-handle
+  behavior and ACL propagation are exercised by Windows CI.
 - **macOS:** uses the deprecated but available `sandbox_init` SBPL API. Reads
   remain unrestricted, IP outbound/bind and exec/fork are denied as requested,
   and writes outside canonical allowed paths and `/dev/null` are denied. The

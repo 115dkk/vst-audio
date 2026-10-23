@@ -30,32 +30,19 @@ run("cargo", "test", "--locked", "-p", "vst-audio", "--test", "embedding",
 
 # Reserve a loopback probe port and let the Rust test own the listener. A separate
 # environment keeps probe inputs out of unrelated worker tests.
-import shutil
 import socket
 import tempfile
-# GitHub's Windows runners deny Low-integrity reads on the D: work volume even for
-# unlabeled files whose DACL grants the user. Plugins are installed on the system
-# volume, so the sandbox fixtures and probe directory are staged there.
-staging = os.environ.get("LOCALAPPDATA") if os.name == "nt" else None
-with tempfile.TemporaryDirectory(prefix="vst-audio-probe-", dir=staging,
-                                 ignore_cleanup_errors=True) as directory:
-    sandbox_env = dict(env)
-    if staging:
-        stage = Path(directory) / "fixtures"
-        stage.mkdir()
-        for key in ("VST_AUDIO_WORKER", "VST_AUDIO_TEST_VST2", "VST_AUDIO_TEST_VST3"):
-            source = Path(env[key])
-            target = stage / source.name
-            if source.is_dir():
-                shutil.copytree(source, target)
-            else:
-                shutil.copy2(source, target)
-            sandbox_env[key] = str(target)
+with tempfile.TemporaryDirectory(prefix="vst-audio-probe-") as directory:
     with socket.socket() as reservation:
         reservation.bind(("127.0.0.1", 0))
         port = reservation.getsockname()[1]
-    probe_env = dict(sandbox_env, VST_AUDIO_PROBE_PORT=str(port),
+    probe_env = dict(env, VST_AUDIO_PROBE_PORT=str(port),
                      VST_AUDIO_PROBE_FILE=str(Path(directory) / "probe.txt"))
+    if os.name == "nt" and os.environ.get("GITHUB_ACTIONS"):
+        # Disposable CI runner only: let the network-allowed AppContainer reach the
+        # loopback probe, as an administrator would for a local licence service.
+        run("CheckNetIsolation.exe", "LoopbackExempt", "-a", "-n=vst-audio.worker.network")
+        probe_env["VST_AUDIO_LOOPBACK_EXEMPT"] = "1"
     run("cargo", "test", "--locked", "-p", "vst-audio", "--test", "sandbox",
         "--", "--ignored", "--nocapture", "--test-threads=1", env=probe_env)
 
