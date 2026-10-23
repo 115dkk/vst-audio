@@ -33,9 +33,12 @@ def main():
             log_path.parent.mkdir(parents=True, exist_ok=True)
             # Screenshots count fixture-colored pixels over the whole output, so
             # the desktop must not draw anything that changes: no panel clock,
-            # a solid background instead of the default gradient.
+            # a solid background instead of the default gradient, and no startup
+            # fade or window animations (a slow runner screenshotted the black
+            # startup fade still covering the first editor).
             config = Path(directory) / "weston.ini"
-            config.write_text("[shell]\npanel-position=none\nbackground-color=0xff000000\nlocking=false\n")
+            config.write_text("[shell]\npanel-position=none\nbackground-color=0xff000000\nlocking=false\n"
+                              "startup-animation=none\nanimation=none\nclose-animation=none\nfocus-animation=none\n")
             with log_path.open("w") as log:
                 weston = subprocess.Popen(["weston", "--backend=headless", "--renderer=pixman",
                     f"--config={config}", "--debug", "--socket=vst-audio-test", "--width=1280", "--height=800",
