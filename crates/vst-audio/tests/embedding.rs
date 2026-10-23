@@ -75,13 +75,16 @@ fn exercise(sandbox: bool) {
             ));
         }
         let opened = send(Command::OpenEditorIn(parent.handle()));
+        // Windows refuses an AppContainer child under the application's window.
         #[cfg(windows)]
-        if sandbox && let HostEvent::RequestFailed { reason, .. } = &opened {
+        if sandbox {
+            let HostEvent::RequestFailed { reason, .. } = &opened else {
+                panic!("sandboxed Windows embedding must be refused: {opened:?}")
+            };
             assert_eq!(
                 reason,
                 "parent window is not accessible from the sandboxed worker"
             );
-            eprintln!("{format:?}: sandbox embedding rejected: {reason}");
             continue;
         }
         assert!(matches!(opened, HostEvent::Completed { .. }), "{opened:?}");
