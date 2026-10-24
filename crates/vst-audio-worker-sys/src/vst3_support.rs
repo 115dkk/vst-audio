@@ -10,7 +10,7 @@ use std::{
     cell::Cell,
     collections::HashMap,
     ffi::{c_char, c_void},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Seek, SeekFrom, Write},
     rc::Rc,
     sync::{
         Arc, Mutex,
@@ -168,21 +168,43 @@ pub(crate) struct HostAttributeList(Mutex<AttributeStorage>);
 impl Class for HostAttributeList {
     type Interfaces = (IAttributeList,);
 }
-impl HostAttributeList {
-    unsafe fn key(id: IAttributeList_::AttrID) -> Result<Vec<u8>, tresult> {
-        if id.is_null() {
-            return Err(kInvalidArgument);
-        }
-        // SAFETY: the SDK contract requires AttrID to point to a terminated byte string.
-        let bytes = unsafe { std::ffi::CStr::from_ptr(id) }.to_bytes();
-        if bytes.len() > ATTRIBUTE_VALUE_LIMIT {
+/// Copies a plugin-supplied byte string, scanning at most `ATTRIBUTE_VALUE_LIMIT`
+/// bytes for its terminator so an unterminated string cannot run the scan past
+/// that bound.
+///
+/// # Safety
+/// `text` must point to readable bytes up to and including a NUL terminator, or
+/// to at least `ATTRIBUTE_VALUE_LIMIT + 1` readable bytes, for this synchronous
+/// call. The bound only limits how far a broken caller's string is read; it
+/// cannot validate an arbitrary pointer.
+unsafe fn bounded_bytes(text: *const c_char) -> Result<Vec<u8>, tresult> {
+    if text.is_null() {
+        return Err(kInvalidArgument);
+    }
+    let mut length = 0;
+    loop {
+        if length > ATTRIBUTE_VALUE_LIMIT {
             return Err(kOutOfMemory);
         }
-        let mut key = Vec::new();
-        key.try_reserve_exact(bytes.len())
-            .map_err(|_| kOutOfMemory)?;
-        key.extend_from_slice(bytes);
-        Ok(key)
+        // SAFETY: the caller guarantees this byte is readable: the terminator
+        // has not been seen yet and the scan is still within the documented bound.
+        if unsafe { text.wrapping_add(length).read() } == 0 {
+            break;
+        }
+        length += 1;
+    }
+    let mut copy = Vec::new();
+    copy.try_reserve_exact(length).map_err(|_| kOutOfMemory)?;
+    // SAFETY: the scan above read exactly these `length` non-NUL bytes.
+    copy.extend_from_slice(unsafe { std::slice::from_raw_parts(text.cast::<u8>(), length) });
+    Ok(copy)
+}
+
+impl HostAttributeList {
+    unsafe fn key(id: IAttributeList_::AttrID) -> Result<Vec<u8>, tresult> {
+        // SAFETY: the SDK contract requires AttrID to point to a terminated byte
+        // string that stays valid for this synchronous call.
+        unsafe { bounded_bytes(id) }
     }
 
     fn set(&self, key: Vec<u8>, value: AttributeValue) -> tresult {
@@ -429,13 +451,17 @@ impl IMessageTrait for HostMessage {
             *stored = None;
             return;
         }
-        // SAFETY: IMessage requires a terminated FIDString for this synchronous call.
-        let bytes = unsafe { std::ffi::CStr::from_ptr(id) }.to_bytes_with_nul();
+        // SAFETY: IMessage requires a terminated FIDString that stays valid for
+        // this synchronous call; the scan stops at the host's length bound.
+        let Ok(bytes) = (unsafe { bounded_bytes(id) }) else {
+            return;
+        };
         let mut copied = Vec::new();
-        if copied.try_reserve_exact(bytes.len()).is_err() {
+        if copied.try_reserve_exact(bytes.len() + 1).is_err() {
             return;
         }
         copied.extend(bytes.iter().map(|byte| *byte as c_char));
+        copied.push(0);
         *stored = Some(copied);
     }
 
@@ -626,19 +652,19 @@ impl IBStreamTrait for Stream {
         if count < 0 || (count > 0 && buffer.is_null()) {
             return kInvalidArgument;
         }
-        let mut empty = [];
-        let bytes = if count == 0 {
-            &mut empty[..]
-        } else {
-            // SAFETY: IBStream caller provides count writable bytes; used only in this call.
-            unsafe { std::slice::from_raw_parts_mut(buffer.cast::<u8>(), count as usize) }
-        };
         let Ok(mut stream) = self.0.try_lock() else {
             return kResultFalse;
         };
-        let Ok(n) = stream.read(bytes) else {
-            return kResultFalse;
-        };
+        // The caller's buffer may be uninitialized memory, so it is never viewed
+        // as a `&mut [u8]`: the bytes are copied in through the raw pointer.
+        let available = stream.remaining();
+        let n = available.len().min(count as usize);
+        if n > 0 {
+            // SAFETY: the IBStream caller provides `count` writable bytes that do
+            // not overlap this stream's private storage; n <= count.
+            unsafe { std::ptr::copy_nonoverlapping(available.as_ptr(), buffer.cast::<u8>(), n) };
+            stream.advance(n);
+        }
         if !actual.is_null() {
             // SAFETY: optional writable byte-count output supplied by the caller.
             unsafe { *actual = n as i32 };
