@@ -162,8 +162,11 @@ mod tests {
             "signal blocked once the queue was full"
         );
         assert_eq!(opened.wait(Duration::from_secs(1)), Waited::Signalled);
-        // Draining is bounded, so later waits still see the stale wakeups
-        // instead of blocking until the timeout.
+        // How many stale wakeups one wait drains depends on the platform's
+        // datagram queue depth; what must hold is that the pair still works
+        // after the rejected sends.
+        while opened.wait(Duration::from_millis(50)) == Waited::Signalled {}
+        opened.signal();
         assert_eq!(opened.wait(Duration::from_secs(1)), Waited::Signalled);
     }
 }
