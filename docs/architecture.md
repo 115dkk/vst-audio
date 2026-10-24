@@ -187,7 +187,9 @@ Queued work and notifications have bounded storage and explicit overflow.
 The wire ABI never contains Rust object layout or process-local pointers.
 
 Realtime blocks use preallocated shared memory, sequence numbers, configuration
-generations and sample positions. `BlockLane` is the ring-only client;
+generations and sample positions. The application creates the mapping, and on
+Linux seals its `memfd` so a worker holding the descriptor cannot resize it;
+see the macOS limitation in `support.md`. `BlockLane` is the ring-only client;
 `BlockEndpoint` adds instance recovery and reports a missed `k - depth` block for
 caller fallback; `AudioEndpoint` adds variable callback batching, events,
 transport and fallback. Each lane has 2, 4, 8 or 16 contiguous sample slots
