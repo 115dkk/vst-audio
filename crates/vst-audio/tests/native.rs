@@ -280,6 +280,45 @@ macro_rules! format_tests {
 
             #[test]
             #[ignore = "native fixtures and display required"]
+            #[cfg(target_os = "linux")]
+            fn scale_dropped_before_open_is_repeated() {
+                if $format != PluginFormat::Vst2 {
+                    return;
+                }
+                let _dpi = vst_audio_test_window::ResourceManager::set(Some("Xft.dpi: 192\n"));
+                let mut started = start(20);
+                let request = started
+                    .control
+                    .open_editor_with(None, EditorScaling::Auto)
+                    .unwrap();
+                assert_eq!(response(&mut started, request), Message::Ack);
+                let inspect = started
+                    .control
+                    .editor_action(vst_audio::EditorAction::Inspect)
+                    .unwrap();
+                let Message::EditorStatus(status) = response(&mut started, inspect) else {
+                    panic!("missing editor status")
+                };
+                assert_eq!(status.scaling, EditorScaling::Plugin);
+                assert_eq!((status.scale, status.width, status.height), (2.0, 640, 400));
+                let capture = started
+                    .control
+                    .editor_action(vst_audio::EditorAction::Capture)
+                    .unwrap();
+                let Message::EditorImage(image) = response(&mut started, capture) else {
+                    panic!("missing editor capture")
+                };
+                assert_eq!((image.width, image.height), (640, 400));
+                assert!(image
+                    .rgba
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .all(|pixel| *pixel == [32, 64, 128, 255]));
+            }
+
+            #[test]
+            #[ignore = "native fixtures and display required"]
             fn missing_display_dpi_uses_one() {
                 #[cfg(target_os = "linux")]
                 let _dpi = vst_audio_test_window::ResourceManager::set(None);

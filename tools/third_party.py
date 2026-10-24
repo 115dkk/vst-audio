@@ -145,12 +145,16 @@ def install_eapo(root) -> Path:
     assert (app / "Editor.exe").is_file() and (app / "Benchmark.exe").is_file()
     return app
 
-def linux_dpf_hidpi(root, worker, plugin, env):
-    """Open DPF's VST2 editor at two Xft DPI values through the public crate API."""
+def linux_vst2_hidpi(root, worker, plugins, env):
+    """Open VST2 editors at two Xft DPI values through the public crate API.
+
+    `plugins` is a list of (label, path); each editor must double its size at
+    192 DPI because the host's content scale request was accepted.
+    """
     consumer = root / "hidpi-consumer"
     (consumer / "src").mkdir(parents=True, exist_ok=True)
     (consumer / "Cargo.toml").write_text(f'''[package]
-name = "dpf-hidpi-consumer"
+name = "vst2-hidpi-consumer"
 version = "0.0.0"
 edition = "2024"
 
@@ -205,7 +209,7 @@ fn open(worker: &PathBuf, plugin: &PathBuf, dpi: u32) -> (f32, u32, u32) {
                 _ => {}
             }
         }
-        assert!(Instant::now() < deadline, "DPF editor open timed out");
+        assert!(Instant::now() < deadline, "editor open timed out");
         std::thread::sleep(Duration::from_millis(5));
     }
     let request = instance.controller().request(Command::Editor(vst_audio::EditorAction::Inspect)).unwrap();
@@ -215,28 +219,43 @@ fn open(worker: &PathBuf, plugin: &PathBuf, dpi: u32) -> (f32, u32, u32) {
                 assert_eq!(status.scaling, EditorScaling::Plugin);
                 return (status.scale, status.width, status.height);
             }
-        assert!(Instant::now() < deadline, "DPF editor status timed out");
+        assert!(Instant::now() < deadline, "editor status timed out");
         std::thread::sleep(Duration::from_millis(5));
     }
 }
 fn main() {
     let args: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
     let _display = x11rb::connect(None).unwrap().0;
-    let base = open(&args[0], &args[1], 96);
-    let high = open(&args[0], &args[1], 192);
-    assert_eq!(base.0, 1.0);
-    assert_eq!(high.0, 2.0);
-    assert_eq!((high.1, high.2), (base.1 * 2, base.2 * 2));
-    println!("DPF d_parameters VST2: 96dpi={base:?}, 192dpi={high:?}");
+    for pair in args[1..].chunks(2) {
+        let (label, plugin) = (pair[0].display(), &pair[1]);
+        let base = open(&args[0], plugin, 96);
+        let high = open(&args[0], plugin, 192);
+        assert_eq!(base.0, 1.0, "{label}");
+        assert_eq!(high.0, 2.0, "{label}");
+        assert_eq!((high.1, high.2), (base.1 * 2, base.2 * 2), "{label}");
+        println!("{label}: 96dpi={base:?}, 192dpi={high:?}");
+    }
 }
 ''', encoding="utf-8")
     result = subprocess.run(["cargo", "run", "--manifest-path", str(consumer / "Cargo.toml"),
         "--target-dir", str(Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "target")) / "third-party-consumer"),
-        "--", str(worker), str(plugin)], cwd=ROOT, env=env, capture_output=True, text=True, timeout=180)
+        "--", str(worker), *(str(item) for pair in plugins for item in pair)],
+        cwd=ROOT, env=env, capture_output=True, text=True, timeout=300)
     output = result.stdout + result.stderr
     print(output[-32768:], flush=True)
-    assert result.returncode == 0, "DPF HiDPI public consumer failed"
-    return result.stdout.strip().splitlines()[-1]
+    assert result.returncode == 0, "VST2 HiDPI public consumer failed"
+    return result.stdout.strip().splitlines()[-len(plugins):]
+
+# JUCE VST2 plugins from the distribution (the runner installs iem-plugin-suite-vst).
+# SimpleDecoder loads libX11 only when its editor opens and installs no X error
+# handler; StereoEncoder declares 64 outputs and reports a narrower current layout.
+IEM = Path("/usr/lib/x86_64-linux-gnu/iem-plugin-suite/vst")
+
+def iem_package():
+    fields = subprocess.run(["dpkg-query", "-W", "-f", "${Version}\t${Built-Using}", "iem-plugin-suite-vst"],
+        check=True, capture_output=True, text=True).stdout.split("\t")
+    assert "juce" in fields[1], "iem-plugin-suite-vst is expected to be built with JUCE"
+    return {"package": "iem-plugin-suite-vst", "version": fields[0], "built_using": fields[1]}
 
 
 def main():
@@ -265,7 +284,12 @@ def main():
                                          "directories": len(installed)}
         env = dict(os.environ, VST_AUDIO_WORKER=str(worker), **{f"VST_AUDIO_REAL_{key}": str(value) for key, value in paths.items()})
         if sys.platform.startswith("linux"):
-            report["dpf_hidpi"] = linux_dpf_hidpi(root, worker, paths["PARAMETERS_VST2"], env)
+            report["iem"] = iem_package()
+            report["vst2_hidpi"] = linux_vst2_hidpi(root, worker, [
+                ("DPF d_parameters VST2", paths["PARAMETERS_VST2"]),
+                ("JUCE IEM SimpleDecoder VST2", IEM / "libSimpleDecoder.so"),
+                ("JUCE IEM StereoEncoder VST2", IEM / "libStereoEncoder.so"),
+            ], env)
         if sys.platform == "win32":
             env["GALLIUM_DRIVER"] = "llvmpipe"
             app = install_eapo(root)
