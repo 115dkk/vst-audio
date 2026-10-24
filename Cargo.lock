@@ -547,7 +547,7 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "vst-audio"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "assert_no_alloc",
  "png",
@@ -562,7 +562,7 @@ dependencies = [
 
 [[package]]
 name = "vst-audio-protocol"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "thiserror",
  "vst-audio-ring",
@@ -571,14 +571,14 @@ dependencies = [
 
 [[package]]
 name = "vst-audio-ring"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "assert_no_alloc",
 ]
 
 [[package]]
 name = "vst-audio-test-advanced"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "vst-audio-ring",
  "vst-audio-worker-sys",
@@ -587,7 +587,7 @@ dependencies = [
 
 [[package]]
 name = "vst-audio-test-window"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "vst-audio-protocol",
  "windows",
@@ -596,7 +596,7 @@ dependencies = [
 
 [[package]]
 name = "vst-audio-testplugin"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "libc",
  "objc2",
@@ -612,7 +612,7 @@ dependencies = [
 
 [[package]]
 name = "vst-audio-transport-sys"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "libc",
  "tempfile",
@@ -623,7 +623,7 @@ dependencies = [
 
 [[package]]
 name = "vst-audio-worker"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "vst-audio-worker-runtime",
  "vst-audio-worker-sys",
@@ -631,7 +631,7 @@ dependencies = [
 
 [[package]]
 name = "vst-audio-worker-runtime"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "clap",
  "thiserror",
@@ -643,7 +643,7 @@ dependencies = [
 
 [[package]]
 name = "vst-audio-worker-sys"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "crossbeam-queue",
  "libc",
