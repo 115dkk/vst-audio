@@ -24,6 +24,16 @@ use vst_audio_transport_sys::{
     Event, SharedRegion,
     runtime::{self, ChildProcess, Pipe},
 };
+
+const FIRST_REQUEST: u32 = 6;
+
+fn following_request(request: u32) -> u32 {
+    if request == u32::MAX {
+        FIRST_REQUEST
+    } else {
+        request + 1
+    }
+}
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 pub struct StartError(pub String);
@@ -189,6 +199,10 @@ pub struct ProcessingOptions {
     pub sample_rate: u32,
     pub quantum: u32,
     pub slots: u32,
+    /// Sequence the ring starts from. Ordinary use is 0; tests set it near
+    /// `u32::MAX` to cross the 2^32 boundary with a real worker. The first
+    /// published sequence is `sequence_origin.wrapping_add(1)`.
+    pub sequence_origin: u32,
     pub sample_format: SampleFormat,
     pub offline: bool,
     pub sandbox: Option<crate::SandboxPolicy>,
@@ -204,6 +218,7 @@ impl Default for ProcessingOptions {
             sample_rate: 48000,
             quantum: 128,
             slots: 2,
+            sequence_origin: 0,
             sample_format: SampleFormat::F32,
             offline: false,
             sandbox: None,
@@ -319,10 +334,7 @@ impl PluginControl {
     }
     fn request(&mut self, message: Message, kind: RequestKind) -> Result<u32, StartError> {
         let id = self.next_request;
-        self.next_request = self
-            .next_request
-            .checked_add(1)
-            .ok_or_else(|| StartError("request number exhausted".into()))?;
+        self.next_request = following_request(id);
         self.transport.send(id, message)?;
         self.watch.request(self.now(), id, kind);
         Ok(id)
@@ -554,9 +566,9 @@ impl PluginProcess {
         options: &ProcessingOptions,
         state: Option<&[u8]>,
     ) -> Result<Started, StartError> {
-        if !(2..=MAX_SLOTS).contains(&options.slots) {
+        if options.slots > MAX_SLOTS || !options.slots.is_power_of_two() || options.slots < 2 {
             return Err(StartError(format!(
-                "ring slots must be 2..={MAX_SLOTS}, got {}",
+                "ring slots must be a power of two in 2..={MAX_SLOTS}, got {}",
                 options.slots
             )));
         }
@@ -652,7 +664,7 @@ impl PluginProcess {
                 .map_err(|e| error(format!("{e:?}")))?;
             let mut producer = Producer::new(view, [Some(&*work), None], &*ready);
             producer
-                .announce(geometry, std::process::id())
+                .announce_at(geometry, std::process::id(), options.sequence_origin)
                 .map_err(|e| error(format!("{e:?}")))?;
             transport.send(3, Message::Prepare(setup.clone()))?;
             expect_ack(transport.response(3, Duration::from_secs(10))?)?;
@@ -681,7 +693,7 @@ impl PluginProcess {
             region: region.clone(),
             work: work.clone(),
             watch,
-            next_request: 6,
+            next_request: FIRST_REQUEST,
             origin,
             clock_base: 0,
             exit_seen: false,
@@ -954,6 +966,14 @@ mod tests {
                 .0
                 .starts_with("bus selection:")
         );
+    }
+
+    #[test]
+    fn request_numbers_wrap_to_the_first_application_request() {
+        assert_eq!(following_request(FIRST_REQUEST), FIRST_REQUEST + 1);
+        assert_eq!(following_request(u32::MAX - 1), u32::MAX);
+        assert_eq!(following_request(u32::MAX), FIRST_REQUEST);
+        assert!((0..FIRST_REQUEST).all(|reserved| following_request(u32::MAX) != reserved));
     }
 
     #[test]

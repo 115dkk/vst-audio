@@ -6,7 +6,7 @@ use std::{
 };
 use vst_audio::{ControlEvent, EditorScaling, PluginFormat, PluginProcess, Started};
 use vst_audio_protocol::{Action, HostWatch, Message, Received, StateHistory};
-use vst_audio_ring::{Publish, SlotReader, SlotWriter, Wait};
+use vst_audio_ring::{Publish, SlotReader, SlotWriter, Wait, sequence_at_least};
 
 /// Publishes `sequence` through the host's ring as the engine does: the
 /// publisher on the region the host owns, waking it with its work event.
@@ -60,6 +60,23 @@ macro_rules! format_tests {
                 PluginProcess::start(&exe, &plugin, $format, None, 48000, Some(&state(mode)))
                     .expect("start test plugin")
             }
+            fn start_at(mode: u8, sequence_origin: u32) -> Started {
+                let (exe, plugin) = paths();
+                PluginProcess::start_configured(
+                    &exe,
+                    &plugin,
+                    $format,
+                    None,
+                    &vst_audio::ProcessingOptions {
+                        sample_rate: 48_000,
+                        quantum: 480,
+                        sequence_origin,
+                        ..Default::default()
+                    },
+                    Some(&state(mode)),
+                )
+                .expect("start test plugin")
+            }
             fn publish(started: &Started, sequence: u32) {
                 assert_eq!(
                     try_publish(started, sequence, |slot| {
@@ -73,7 +90,7 @@ macro_rules! format_tests {
             }
             fn complete(started: &Started, sequence: u32) {
                 let deadline = Instant::now() + Duration::from_secs(5);
-                while completed(started) < sequence {
+                while !sequence_at_least(completed(started), sequence) {
                     assert!(
                         Instant::now() < deadline,
                         "host failed to complete sequence {sequence}"
@@ -96,6 +113,37 @@ macro_rules! format_tests {
                 }
             }
 
+            fn verify_output(started: &Started, sequence: u32, first_sequence: u32) {
+                assert!(try_read(started, sequence, |slot| {
+                    for frame in 0..slot.frames() {
+                        let previous = if frame >= 64 {
+                            Some(frame - 64)
+                        } else if sequence != first_sequence {
+                            Some(slot.frames() + frame - 64)
+                        } else {
+                            None
+                        };
+                        let (left, right) = previous.map_or((0.0, 0.0), |index| {
+                            (
+                                (index as f32 * 0.17).sin() * 0.25,
+                                (index as f32 * 0.23).cos() * 0.25,
+                            )
+                        });
+                        let expected = [
+                            left,
+                            right,
+                            0.5 * (left + right),
+                            0.5 * (left + right),
+                            0.5 * left,
+                            0.5 * right,
+                        ];
+                        for (channel, expected) in expected.into_iter().enumerate() {
+                            assert!((slot.read(channel, frame) - expected).abs() < 1e-6);
+                        }
+                    }
+                }));
+            }
+
             #[test]
             #[ignore = "needs vst-audio-worker and the test plugin; run by the plughost CI job"]
             fn start_and_process_matrix_with_latency() {
@@ -105,34 +153,23 @@ macro_rules! format_tests {
                 for sequence in 1..=3 {
                     publish(&started, sequence);
                     complete(&started, sequence);
-                    assert!(try_read(&started, sequence, |slot| {
-                        for frame in 0..slot.frames() {
-                            let previous = if frame >= 64 {
-                                Some(frame - 64)
-                            } else if sequence > 1 {
-                                Some(slot.frames() + frame - 64)
-                            } else {
-                                None
-                            };
-                            let (left, right) = previous.map_or((0.0, 0.0), |index| {
-                                (
-                                    (index as f32 * 0.17).sin() * 0.25,
-                                    (index as f32 * 0.23).cos() * 0.25,
-                                )
-                            });
-                            let expected = [
-                                left,
-                                right,
-                                0.5 * (left + right),
-                                0.5 * (left + right),
-                                0.5 * left,
-                                0.5 * right,
-                            ];
-                            for (channel, expected) in expected.into_iter().enumerate() {
-                                assert!((slot.read(channel, frame) - expected).abs() < 1e-6);
-                            }
-                        }
-                    }));
+                    verify_output(&started, sequence, 1);
+                }
+            }
+
+            #[test]
+            #[ignore = "needs vst-audio-worker and the test plugin; run by the plughost CI job"]
+            fn real_worker_sequences_cross_u32_boundary() {
+                let origin = u32::MAX - 100;
+                let started = start_at(0, origin);
+                assert_eq!(started.latency_frames, 64);
+                assert_eq!(started.output_wave_bits, [1, 2, 4, 8, 16, 32]);
+                let first_sequence = origin.wrapping_add(1);
+                for distance in 1..=300 {
+                    let sequence = origin.wrapping_add(distance);
+                    publish(&started, sequence);
+                    complete(&started, sequence);
+                    verify_output(&started, sequence, first_sequence);
                 }
             }
             #[test]

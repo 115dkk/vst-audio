@@ -1,5 +1,7 @@
 //! Variable callback adapter. Only bounded copies/atomics run in this module.
-use crate::{BlockEndpoint, BlockStatus, Fallback, StartError, api::Shared};
+#[cfg(test)]
+use crate::BlockStatus;
+use crate::{BlockEndpoint, Fallback, StartError, api::Shared};
 use std::sync::Arc;
 use vst_audio_protocol::{Capabilities, ProcessingSetup};
 use vst_audio_ring::{
@@ -23,7 +25,6 @@ pub enum AudioStatus {
     Fallback,
     InvalidBuffer,
     InvalidEvents,
-    CounterExhausted,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProcessReport {
@@ -384,9 +385,7 @@ impl AudioEndpoint {
             self.stream_position = self.stream_position.saturating_add(segment as u64);
             frame += segment;
             if self.fill == q {
-                if !self.finish_quantum() {
-                    report.status = AudioStatus::CounterExhausted;
-                }
+                self.finish_quantum();
                 self.fill = 0;
                 self.output_at = 0;
             }
@@ -395,7 +394,7 @@ impl AudioEndpoint {
         report.generation = self.blocks.generation();
         report
     }
-    fn finish_quantum(&mut self) -> bool {
+    fn finish_quantum(&mut self) {
         // Never release the last Arc or a heap buffer on this thread.
         if self.blocks.adopt() {
             self.pending.clear();
@@ -442,7 +441,6 @@ impl AudioEndpoint {
             self.delivered.sort_by_offset();
         }
         self.pending.clear();
-        status != BlockStatus::CounterExhausted
     }
 }
 trait Sample: Copy {
@@ -602,6 +600,7 @@ struct AudioTestRig {
     endpoint: AudioEndpoint,
     consumer: vst_audio_ring::Consumer<'static>,
     shared: Arc<Shared>,
+    sequence_origin: u32,
 }
 
 #[cfg(test)]
@@ -616,6 +615,7 @@ fn audio_test_rig(
     outputs: u32,
     plugin_latency: u32,
     latency_bound_frames: u32,
+    sequence_origin: u32,
 ) -> AudioTestRig {
     use vst_audio_protocol::{Bus, BusConfiguration};
     use vst_audio_ring::{Consumer, Producer};
@@ -636,7 +636,7 @@ fn audio_test_rig(
     let consumer_ready = Arc::new(Event::create().unwrap());
     let publisher = {
         let mut producer = Producer::new(view, [Some(&*work), None], &*consumer_ready);
-        producer.announce(geometry, 1).unwrap();
+        producer.announce_at(geometry, 1, sequence_origin).unwrap();
         producer.publisher().unwrap()
     };
     let consumer_region: &'static Arc<SharedRegion> = Box::leak(Box::new(region.clone()));
@@ -696,6 +696,7 @@ fn audio_test_rig(
         endpoint,
         consumer,
         shared,
+        sequence_origin,
     }
 }
 
@@ -718,14 +719,14 @@ mod golden {
         ("F32-Silence-q128-m128-6to2-p0-b64", 0x3c4df9776db30149),
         ("F32-Silence-q128-m128-6to2-p64-b64", 0x10f75eb12b76ec09),
         ("F32-Silence-q128-m128-6to2-p64-b128", 0x10f75eb12b76ec09),
-        ("F32-Silence-q128-m480-2to6-p0-b0", 0xc3db69334176cc1c),
-        ("F32-Silence-q128-m480-2to6-p0-b64", 0xc3db69334176cc1c),
-        ("F32-Silence-q128-m480-2to6-p64-b64", 0x6e9a63c3b20f0e5c),
-        ("F32-Silence-q128-m480-2to6-p64-b128", 0x6e9a63c3b20f0e5c),
-        ("F32-Silence-q128-m480-6to2-p0-b0", 0xb8a7d109bc5c32ec),
-        ("F32-Silence-q128-m480-6to2-p0-b64", 0xb8a7d109bc5c32ec),
-        ("F32-Silence-q128-m480-6to2-p64-b64", 0x40a40bf131d4712c),
-        ("F32-Silence-q128-m480-6to2-p64-b128", 0x40a40bf131d4712c),
+        ("F32-Silence-q128-m480-2to6-p0-b0", 0xd1a56451f76fe40e),
+        ("F32-Silence-q128-m480-2to6-p0-b64", 0xd1a56451f76fe40e),
+        ("F32-Silence-q128-m480-2to6-p64-b64", 0x5617f64b02735b4e),
+        ("F32-Silence-q128-m480-2to6-p64-b128", 0x5617f64b02735b4e),
+        ("F32-Silence-q128-m480-6to2-p0-b0", 0x44d0873cccdfb962),
+        ("F32-Silence-q128-m480-6to2-p0-b64", 0x44d0873cccdfb962),
+        ("F32-Silence-q128-m480-6to2-p64-b64", 0x66da111651261022),
+        ("F32-Silence-q128-m480-6to2-p64-b128", 0x66da111651261022),
         ("F32-Silence-q480-m480-2to6-p0-b0", 0x903df8655256ed03),
         ("F32-Silence-q480-m480-2to6-p0-b64", 0x903df8655256ed03),
         ("F32-Silence-q480-m480-2to6-p64-b64", 0xca706bed2c38cc22),
@@ -754,25 +755,25 @@ mod golden {
             "F32-DelayedInput-q128-m128-6to2-p64-b128",
             0x836a2e81184f91b1,
         ),
-        ("F32-DelayedInput-q128-m480-2to6-p0-b0", 0xddee823541853a8d),
-        ("F32-DelayedInput-q128-m480-2to6-p0-b64", 0xddee823541853a8d),
+        ("F32-DelayedInput-q128-m480-2to6-p0-b0", 0x5592054970c76a08),
+        ("F32-DelayedInput-q128-m480-2to6-p0-b64", 0x5592054970c76a08),
         (
             "F32-DelayedInput-q128-m480-2to6-p64-b64",
-            0xa85b5be7125f9ae2,
+            0xa7c9ea3cc78265d7,
         ),
         (
             "F32-DelayedInput-q128-m480-2to6-p64-b128",
-            0xa85b5be7125f9ae2,
+            0xa7c9ea3cc78265d7,
         ),
-        ("F32-DelayedInput-q128-m480-6to2-p0-b0", 0x5b9384a6677c718d),
-        ("F32-DelayedInput-q128-m480-6to2-p0-b64", 0x5b9384a6677c718d),
+        ("F32-DelayedInput-q128-m480-6to2-p0-b0", 0x9a2d81ac41cb384c),
+        ("F32-DelayedInput-q128-m480-6to2-p0-b64", 0x9a2d81ac41cb384c),
         (
             "F32-DelayedInput-q128-m480-6to2-p64-b64",
-            0x1ce6aeec4f3b47c1,
+            0xf20caf7530899cf9,
         ),
         (
             "F32-DelayedInput-q128-m480-6to2-p64-b128",
-            0x1ce6aeec4f3b47c1,
+            0xf20caf7530899cf9,
         ),
         ("F32-DelayedInput-q480-m480-2to6-p0-b0", 0xd00baf3103e91327),
         ("F32-DelayedInput-q480-m480-2to6-p0-b64", 0xd00baf3103e91327),
@@ -802,14 +803,14 @@ mod golden {
         ("F64-Silence-q128-m128-6to2-p0-b64", 0xcd0ac7efdd0d904b),
         ("F64-Silence-q128-m128-6to2-p64-b64", 0x109287c4211c858b),
         ("F64-Silence-q128-m128-6to2-p64-b128", 0x109287c4211c858b),
-        ("F64-Silence-q128-m480-2to6-p0-b0", 0x2e29eadd6cd0061a),
-        ("F64-Silence-q128-m480-2to6-p0-b64", 0x2e29eadd6cd0061a),
-        ("F64-Silence-q128-m480-2to6-p64-b64", 0xb4bbf77b7e71cfda),
-        ("F64-Silence-q128-m480-2to6-p64-b128", 0xb4bbf77b7e71cfda),
-        ("F64-Silence-q128-m480-6to2-p0-b0", 0x25d2298602d16fa6),
-        ("F64-Silence-q128-m480-6to2-p0-b64", 0x25d2298602d16fa6),
-        ("F64-Silence-q128-m480-6to2-p64-b64", 0x6e573d56fec4bee6),
-        ("F64-Silence-q128-m480-6to2-p64-b128", 0x6e573d56fec4bee6),
+        ("F64-Silence-q128-m480-2to6-p0-b0", 0x8c3af4440d5f07d7),
+        ("F64-Silence-q128-m480-2to6-p0-b64", 0x8c3af4440d5f07d7),
+        ("F64-Silence-q128-m480-2to6-p64-b64", 0xe3df5497b1549517),
+        ("F64-Silence-q128-m480-2to6-p64-b128", 0xe3df5497b1549517),
+        ("F64-Silence-q128-m480-6to2-p0-b0", 0xb225a527e0e51077),
+        ("F64-Silence-q128-m480-6to2-p0-b64", 0xb225a527e0e51077),
+        ("F64-Silence-q128-m480-6to2-p64-b64", 0x13e4e6cbc912f4b7),
+        ("F64-Silence-q128-m480-6to2-p64-b128", 0x13e4e6cbc912f4b7),
         ("F64-Silence-q480-m480-2to6-p0-b0", 0x4b9f7b70bc01093a),
         ("F64-Silence-q480-m480-2to6-p0-b64", 0x4b9f7b70bc01093a),
         ("F64-Silence-q480-m480-2to6-p64-b64", 0x966b6ff78658aae3),
@@ -838,25 +839,25 @@ mod golden {
             "F64-DelayedInput-q128-m128-6to2-p64-b128",
             0xe632a880026d4a6e,
         ),
-        ("F64-DelayedInput-q128-m480-2to6-p0-b0", 0x528e39f2ffa5ef03),
-        ("F64-DelayedInput-q128-m480-2to6-p0-b64", 0x528e39f2ffa5ef03),
+        ("F64-DelayedInput-q128-m480-2to6-p0-b0", 0x4b0e753c2ebd7f38),
+        ("F64-DelayedInput-q128-m480-2to6-p0-b64", 0x4b0e753c2ebd7f38),
         (
             "F64-DelayedInput-q128-m480-2to6-p64-b64",
-            0x5c65729cc29e1e95,
+            0x77f5f4584a7827b1,
         ),
         (
             "F64-DelayedInput-q128-m480-2to6-p64-b128",
-            0x5c65729cc29e1e95,
+            0x77f5f4584a7827b1,
         ),
-        ("F64-DelayedInput-q128-m480-6to2-p0-b0", 0x2e6afb13f26f948e),
-        ("F64-DelayedInput-q128-m480-6to2-p0-b64", 0x2e6afb13f26f948e),
+        ("F64-DelayedInput-q128-m480-6to2-p0-b0", 0x4c6bdfe4fc78ca08),
+        ("F64-DelayedInput-q128-m480-6to2-p0-b64", 0x4c6bdfe4fc78ca08),
         (
             "F64-DelayedInput-q128-m480-6to2-p64-b64",
-            0xd66e7a85526dcf22,
+            0x5fed323c731e3ba6,
         ),
         (
             "F64-DelayedInput-q128-m480-6to2-p64-b128",
-            0xd66e7a85526dcf22,
+            0x5fed323c731e3ba6,
         ),
         ("F64-DelayedInput-q480-m480-2to6-p0-b0", 0x74d88039e6c27642),
         ("F64-DelayedInput-q480-m480-2to6-p0-b64", 0x74d88039e6c27642),
@@ -1023,7 +1024,6 @@ mod golden {
             AudioStatus::Fallback => 1,
             AudioStatus::InvalidBuffer => 2,
             AudioStatus::InvalidEvents => 3,
-            AudioStatus::CounterExhausted => 4,
         };
         hash.u32(status);
         hash.u64(report.events_written as u64);
@@ -1039,15 +1039,16 @@ mod golden {
             let Some(sequence) = consumer.next_published(0) else {
                 break;
             };
+            let logical_sequence = sequence.wrapping_sub(rig.sequence_origin);
             let mut input_events = EventBuffer::default();
             let mut transport = Transport::default();
             assert!(consumer.input_packet(0, sequence, &mut transport, &mut input_events));
             let mut output_events = EventBuffer::default();
             for mut event in input_events.as_slice().iter().copied() {
-                event.sample_offset =
-                    (event.sample_offset + sequence % 3).min(geometry.max_frames.saturating_sub(1));
+                event.sample_offset = (event.sample_offset + logical_sequence % 3)
+                    .min(geometry.max_frames.saturating_sub(1));
                 if let EventData::Midi(mut bytes) = event.data {
-                    bytes[2] = bytes[2].wrapping_add(sequence as u8) & 0x7f;
+                    bytes[2] = bytes[2].wrapping_add(logical_sequence as u8) & 0x7f;
                     event.data = EventData::Midi(bytes);
                 }
                 output_events.push(event);
@@ -1063,14 +1064,15 @@ mod golden {
                             let input = original[(channel % geometry.input_channels as usize)
                                 * geometry.max_frames as usize
                                 + frame];
-                            samples[channel * geometry.max_frames as usize + frame] =
-                                input * (0.5 + 0.125 * channel as f32) + sequence as f32 * 1.0e-4;
+                            samples[channel * geometry.max_frames as usize + frame] = input
+                                * (0.5 + 0.125 * channel as f32)
+                                + logical_sequence as f32 * 1.0e-4;
                         }
                     }
-                    let frame = sequence as usize % geometry.max_frames as usize;
+                    let frame = logical_sequence as usize % geometry.max_frames as usize;
                     samples[(geometry.output_channels as usize - 1)
                         * geometry.max_frames as usize
-                        + frame] = if sequence.is_multiple_of(2) {
+                        + frame] = if logical_sequence.is_multiple_of(2) {
                         f32::NAN
                     } else {
                         f32::INFINITY
@@ -1086,14 +1088,15 @@ mod golden {
                             let input = original[(channel % geometry.input_channels as usize)
                                 * geometry.max_frames as usize
                                 + frame];
-                            samples[channel * geometry.max_frames as usize + frame] =
-                                input * (0.5 + 0.125 * channel as f64) + sequence as f64 * 1.0e-4;
+                            samples[channel * geometry.max_frames as usize + frame] = input
+                                * (0.5 + 0.125 * channel as f64)
+                                + logical_sequence as f64 * 1.0e-4;
                         }
                     }
-                    let frame = sequence as usize % geometry.max_frames as usize;
+                    let frame = logical_sequence as usize % geometry.max_frames as usize;
                     samples[(geometry.output_channels as usize - 1)
                         * geometry.max_frames as usize
-                        + frame] = if sequence.is_multiple_of(2) {
+                        + frame] = if logical_sequence.is_multiple_of(2) {
                         f64::NAN
                     } else {
                         f64::INFINITY
@@ -1160,18 +1163,19 @@ mod golden {
         )
     }
 
-    fn run_scenario<T: GoldenSample>(scenario: Scenario) -> (String, u64) {
+    fn run_scenario<T: GoldenSample>(scenario: Scenario, sequence_origin: u32) -> (String, u64) {
         let depth = scenario.maximum.div_ceil(scenario.quantum);
         let mut rig = audio_test_rig(
             T::FORMAT,
             scenario.fallback,
             scenario.quantum,
             scenario.maximum,
-            depth + 1,
+            (depth + 1).next_power_of_two(),
             scenario.inputs,
             scenario.outputs,
             scenario.plugin_latency,
             scenario.latency_bound,
+            sequence_origin,
         );
         let name = scenario_name::<T>(scenario);
         let mut hash = Hash::new();
@@ -1257,22 +1261,25 @@ mod golden {
         (name, hash.0)
     }
 
-    fn all_scenarios<T: GoldenSample>() -> Vec<(String, u64)> {
+    fn all_scenarios<T: GoldenSample>(sequence_origin: u32) -> Vec<(String, u64)> {
         let mut results = Vec::new();
         for fallback in [Fallback::Silence, Fallback::DelayedInput] {
             for (quantum, maximum) in [(128, 128), (128, 480), (480, 480)] {
                 for (inputs, outputs) in [(2, 6), (6, 2)] {
                     for plugin_latency in [0, 64] {
                         for latency_bound in [plugin_latency, plugin_latency + 64] {
-                            results.push(run_scenario::<T>(Scenario {
-                                quantum,
-                                maximum,
-                                inputs,
-                                outputs,
-                                fallback,
-                                plugin_latency,
-                                latency_bound,
-                            }));
+                            results.push(run_scenario::<T>(
+                                Scenario {
+                                    quantum,
+                                    maximum,
+                                    inputs,
+                                    outputs,
+                                    fallback,
+                                    plugin_latency,
+                                    latency_bound,
+                                },
+                                sequence_origin,
+                            ));
                         }
                     }
                 }
@@ -1283,18 +1290,22 @@ mod golden {
 
     #[test]
     fn golden_outputs_are_unchanged() {
-        let mut actual = all_scenarios::<f32>();
-        actual.extend(all_scenarios::<f64>());
-        for (name, hash) in &actual {
+        let mut baseline = all_scenarios::<f32>(0);
+        baseline.extend(all_scenarios::<f64>(0));
+        for (name, hash) in &baseline {
             println!("(\"{name}\", 0x{hash:016x}),");
         }
         if !EXPECTED.is_empty() {
-            assert_eq!(actual.len(), EXPECTED.len());
-            for ((name, hash), (expected_name, expected_hash)) in actual.iter().zip(EXPECTED) {
+            assert_eq!(baseline.len(), EXPECTED.len());
+            for ((name, hash), (expected_name, expected_hash)) in baseline.iter().zip(EXPECTED) {
                 assert_eq!(name, expected_name);
                 assert_eq!(hash, expected_hash, "golden mismatch for {name}");
             }
         }
+
+        let mut wrapped = all_scenarios::<f32>(u32::MAX - 3);
+        wrapped.extend(all_scenarios::<f64>(u32::MAX - 3));
+        assert_eq!(wrapped, baseline, "sequence origin changed golden output");
     }
 
     fn step_block_consumer(
@@ -1321,56 +1332,70 @@ mod golden {
     #[test]
     fn block_endpoint_returns_block_k_minus_depth_and_restarts() {
         for depth in [1, 7] {
-            let rig = audio_test_rig(SampleFormat::F32, Fallback::Silence, 4, 4, 8, 1, 2, 0, 0);
-            let AudioTestRig {
-                endpoint,
-                consumer,
-                shared,
-            } = rig;
-            shared.status.store(0, Ordering::Release);
-            shared.generation.store(1, Ordering::Release);
-            let mut endpoint = endpoint.into_blocks();
-            endpoint.restart(depth).unwrap();
-            let mut output = vec![99.0f32; 8];
-            let mut expected_sequence = 1;
-            for block in 0..depth + 4 {
-                let input = vec![block as f32; 4];
-                let status = endpoint.process(&input, &mut output);
-                assert_eq!(endpoint.active.lane.next_block(), u64::from(block + 1));
-                if block < depth {
-                    assert_eq!(status, BlockStatus::Missed);
-                    assert_eq!(output, vec![99.0; 8]);
-                } else {
-                    assert_eq!(status, BlockStatus::Delivered);
-                    assert_eq!(&output[..4], &vec![(block - depth) as f32; 4]);
-                    assert_eq!(&output[4..], &vec![(block - depth) as f32 + 1000.0; 4]);
-                }
-                step_block_consumer(&consumer, depth, block, expected_sequence);
-                expected_sequence += 1;
-            }
-            endpoint.restart(depth).unwrap();
-            output.fill(77.0);
-            for block in 0..depth {
-                assert_eq!(
-                    endpoint.process(&[block as f32; 4], &mut output),
-                    BlockStatus::Missed
+            for origin in [0, u32::MAX - 3] {
+                let rig = audio_test_rig(
+                    SampleFormat::F32,
+                    Fallback::Silence,
+                    4,
+                    4,
+                    8,
+                    1,
+                    2,
+                    0,
+                    0,
+                    origin,
                 );
-                assert_eq!(output, vec![77.0; 8]);
-                step_block_consumer(&consumer, depth, block, expected_sequence);
-                expected_sequence += 1;
+                let AudioTestRig {
+                    endpoint,
+                    consumer,
+                    shared,
+                    ..
+                } = rig;
+                shared.status.store(0, Ordering::Release);
+                shared.generation.store(1, Ordering::Release);
+                let mut endpoint = endpoint.into_blocks();
+                endpoint.restart(depth).unwrap();
+                let mut output = vec![99.0f32; 8];
+                let mut expected_sequence = origin.wrapping_add(1);
+                for block in 0..depth + 4 {
+                    let input = vec![block as f32; 4];
+                    let status = endpoint.process(&input, &mut output);
+                    assert_eq!(endpoint.active.lane.next_block(), u64::from(block + 1));
+                    if block < depth {
+                        assert_eq!(status, BlockStatus::Missed);
+                        assert_eq!(output, vec![99.0; 8]);
+                    } else {
+                        assert_eq!(status, BlockStatus::Delivered);
+                        assert_eq!(&output[..4], &vec![(block - depth) as f32; 4]);
+                        assert_eq!(&output[4..], &vec![(block - depth) as f32 + 1000.0; 4]);
+                    }
+                    step_block_consumer(&consumer, depth, block, expected_sequence);
+                    expected_sequence = expected_sequence.wrapping_add(1);
+                }
+                endpoint.restart(depth).unwrap();
+                output.fill(77.0);
+                for block in 0..depth {
+                    assert_eq!(
+                        endpoint.process(&[block as f32; 4], &mut output),
+                        BlockStatus::Missed
+                    );
+                    assert_eq!(output, vec![77.0; 8]);
+                    step_block_consumer(&consumer, depth, block, expected_sequence);
+                    expected_sequence = expected_sequence.wrapping_add(1);
+                }
+                assert_eq!(
+                    endpoint.process(&[0.0; 3], &mut output),
+                    BlockStatus::InvalidBuffer
+                );
+                assert_eq!(
+                    endpoint.process(&[0.0; 4], &mut [0.0; 7]),
+                    BlockStatus::InvalidBuffer
+                );
+                assert_eq!(
+                    endpoint.process_f64(&[0.0; 4], &mut [0.0; 8]),
+                    BlockStatus::InvalidBuffer
+                );
             }
-            assert_eq!(
-                endpoint.process(&[0.0; 3], &mut output),
-                BlockStatus::InvalidBuffer
-            );
-            assert_eq!(
-                endpoint.process(&[0.0; 4], &mut [0.0; 7]),
-                BlockStatus::InvalidBuffer
-            );
-            assert_eq!(
-                endpoint.process_f64(&[0.0; 4], &mut [0.0; 8]),
-                BlockStatus::InvalidBuffer
-            );
         }
     }
 
@@ -1384,11 +1409,12 @@ mod golden {
             Fallback::DelayedInput,
             quantum,
             maximum,
-            maximum.div_ceil(quantum) + 1,
+            (maximum.div_ceil(quantum) + 1).next_power_of_two(),
             1,
             1,
             latency,
             latency,
+            0,
         );
         rig.shared.status.store(1, Ordering::Release);
         let delay = rig.endpoint.latency_frames();
@@ -1426,11 +1452,12 @@ mod golden {
             fallback,
             quantum,
             maximum,
-            depth + 1,
+            (depth + 1).next_power_of_two(),
             2,
             6,
             64,
             128,
+            0,
         );
         let mut rig = rig;
         let inputs = [

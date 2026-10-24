@@ -25,7 +25,7 @@ fn geometry(lanes: u32) -> Geometry {
 #[test]
 fn header_layout_is_pinned() {
     assert_eq!(vst_audio_ring::MAGIC.to_le_bytes(), *b"SSRR");
-    assert_eq!(vst_audio_ring::LAYOUT_VERSION, 3);
+    assert_eq!(vst_audio_ring::LAYOUT_VERSION, 4);
     assert_eq!(vst_audio_ring::HEADER_BYTES, 512);
     assert_eq!(geometry(1).total_bytes().unwrap(), 299_008);
     assert_eq!(geometry(2).total_bytes().unwrap(), 597_376);
@@ -33,7 +33,7 @@ fn header_layout_is_pinned() {
 
 #[test]
 fn slot_bounds_are_validated() {
-    for slots in [2, 16] {
+    for slots in [2, 4, 8, 16] {
         assert!(
             Geometry {
                 slots,
@@ -43,7 +43,7 @@ fn slot_bounds_are_validated() {
             .is_ok()
         );
     }
-    for slots in [1, 17] {
+    for slots in [0, 1, 3, 5, 6, 7, 9, 15, 17, u32::MAX] {
         assert_eq!(
             Geometry {
                 slots,
@@ -262,8 +262,11 @@ fn hostile_headers_are_rejected() {
             1,
             HeaderError::Geometry(vst_audio_ring::GeometryError::Slots),
         ),
-        // Three slots is valid geometry, but disagrees with this two-slot region.
-        (14, 3, HeaderError::TotalBytes),
+        (
+            14,
+            3,
+            HeaderError::Geometry(vst_audio_ring::GeometryError::Slots),
+        ),
         (16, 0, HeaderError::LaneGeometry),
         (17, 512, HeaderError::LaneGeometry),
         (18, 3, HeaderError::LaneGeometry),
@@ -354,7 +357,7 @@ fn corrupt_and_truncated_regions_are_rejected_at_boundary() {
 #[test]
 fn deeper_ring_reuses_only_completed_slots_and_rejects_overwritten_reads() {
     let g = Geometry {
-        slots: 5,
+        slots: 4,
         ..geometry(1)
     };
     let storage = RegionBuf::new(g).unwrap();
@@ -363,16 +366,77 @@ fn deeper_ring_reuses_only_completed_slots_and_rejects_overwritten_reads() {
     producer.announce(g, 1).unwrap();
     let mut consumer = Consumer::new(storage.region(), &event, [None, None]);
     consumer.validate_and_ready(2).unwrap();
-    for sequence in 1..=5 {
+    for sequence in 1..=4 {
         assert_eq!(
             producer.try_publish(0, sequence, |_| {}),
             Publish::Published
         );
     }
-    assert_eq!(producer.try_publish(0, 6, |_| {}), Publish::Dropped);
+    assert_eq!(producer.try_publish(0, 5, |_| {}), Publish::Dropped);
     consumer.complete(0, 1);
-    assert_eq!(producer.try_publish(0, 6, |_| {}), Publish::Published);
+    assert_eq!(producer.try_publish(0, 5, |_| {}), Publish::Published);
     assert!(!producer.try_read(0, 1, |_| {}));
+}
+
+#[test]
+fn wrapping_sequences_round_trip_for_every_geometry_and_origin() {
+    for slots in [2, 4, 8, 16] {
+        for origin in [u32::MAX - 40, u32::MAX - 1, u32::MAX] {
+            let g = Geometry {
+                slots,
+                ..geometry(1)
+            };
+            let storage = RegionBuf::new(g).unwrap();
+            let event = InProcessEvent::new();
+            let mut producer = Producer::new(storage.region(), [None, None], &event);
+            producer.announce_at(g, 1, origin).unwrap();
+            let mut consumer = Consumer::new(storage.region(), &event, [None, None]);
+            consumer.validate_and_ready(2).unwrap();
+            for distance in 1..=64u32 {
+                let sequence = origin.wrapping_add(distance);
+                assert_eq!(
+                    producer.try_publish(0, sequence, |slot| {
+                        slot.write(0, 0, distance as f32);
+                    }),
+                    Publish::Published
+                );
+                assert_eq!(consumer.next_published(0), Some(sequence));
+                let mut buffer = vec![0.0; g.samples_per_slot()];
+                assert!(consumer.slot_mut(0, sequence, &mut buffer, |_| {}));
+                assert_eq!(buffer[0], distance as f32);
+                consumer.complete(0, sequence);
+                let old = sequence.wrapping_sub(slots);
+                assert!(!producer.try_read(0, old, |_| {}));
+            }
+        }
+    }
+}
+
+#[test]
+fn wrapping_reuse_waits_for_the_completed_slot() {
+    let g = Geometry {
+        slots: 4,
+        ..geometry(1)
+    };
+    let storage = RegionBuf::new(g).unwrap();
+    let event = InProcessEvent::new();
+    let mut producer = Producer::new(storage.region(), [None, None], &event);
+    let origin = u32::MAX - 2;
+    producer.announce_at(g, 1, origin).unwrap();
+    let mut consumer = Consumer::new(storage.region(), &event, [None, None]);
+    consumer.validate_and_ready(2).unwrap();
+
+    for distance in 1..=g.slots {
+        let sequence = origin.wrapping_add(distance);
+        assert_eq!(
+            producer.try_publish(0, sequence, |_| {}),
+            Publish::Published
+        );
+    }
+    let reuse = origin.wrapping_add(g.slots + 1);
+    assert_eq!(producer.try_publish(0, reuse, |_| {}), Publish::Dropped);
+    consumer.complete(0, reuse.wrapping_sub(g.slots));
+    assert_eq!(producer.try_publish(0, reuse, |_| {}), Publish::Published);
 }
 
 #[test]

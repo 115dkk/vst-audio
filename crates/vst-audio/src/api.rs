@@ -25,7 +25,9 @@ pub struct Configuration {
     /// quanta could not be processed in time. Latency is
     /// `(ceil(max_callback_frames / quantum) + 1) * quantum + plugin latency`.
     pub max_callback_frames: Option<u32>,
-    /// Ring slots per lane; `None` uses callback depth + 1.
+    /// Ring slots per lane. Allowed values are 2, 4, 8, and 16, and the value
+    /// must be at least callback depth + 1. `None` uses the next allowed power
+    /// of two at or above callback depth + 1.
     pub slots: Option<u32>,
     pub fallback: Fallback,
     pub recovery: RecoveryPolicy,
@@ -104,10 +106,12 @@ impl Configuration {
         }
         let depth = maximum / self.quantum + u32::from(!maximum.is_multiple_of(self.quantum));
         let required = depth.saturating_add(1);
-        let slots = self.slots.unwrap_or(required);
-        if slots < required || slots > crate::MAX_SLOTS {
+        let slots = self
+            .slots
+            .unwrap_or_else(|| required.checked_next_power_of_two().unwrap_or(u32::MAX));
+        if slots < required || slots > crate::MAX_SLOTS || !slots.is_power_of_two() {
             return Err(StartError(format!(
-                "max_callback_frames {maximum} with quantum {} requires at least {required} slots; slots {slots} must not exceed MAX_SLOTS ({})",
+                "max_callback_frames {maximum} with quantum {} requires at least {required} slots; slots {slots} must be a power of two and not exceed MAX_SLOTS ({})",
                 self.quantum,
                 crate::MAX_SLOTS
             )));
@@ -124,6 +128,7 @@ impl Configuration {
             sample_rate: self.sample_rate,
             quantum: self.quantum,
             slots,
+            sequence_origin: 0,
             sample_format: self.sample_format,
             offline: self.offline,
             sandbox: self.sandbox.clone(),
@@ -468,6 +473,28 @@ fn status(shared: &Shared) -> Status {
         1 => Status::Failed,
         3 | 4 => Status::Recovering,
         _ => Status::Stopped,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn callback_slots_are_power_of_two_and_cover_depth_plus_one() {
+        let config = Configuration {
+            quantum: 128,
+            max_callback_frames: Some(256),
+            ..Default::default()
+        };
+        assert_eq!(config.callback_geometry().unwrap(), (256, 2, 4));
+
+        let invalid = Configuration {
+            slots: Some(5),
+            ..Default::default()
+        };
+        let error = invalid.callback_geometry().unwrap_err();
+        assert!(error.0.contains("must be a power of two"));
     }
 }
 

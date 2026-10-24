@@ -190,9 +190,12 @@ Realtime blocks use preallocated shared memory, sequence numbers, configuration
 generations and sample positions. `BlockLane` is the ring-only client;
 `BlockEndpoint` adds instance recovery and reports a missed `k - depth` block for
 caller fallback; `AudioEndpoint` adds variable callback batching, events,
-transport and fallback. Each lane has 2 to 16 contiguous sample slots selected by
-`Configuration::slots` (default callback depth plus one). The parent trusts its
-own validated geometry. Plugin processing receives private scratch buffers,
+transport and fallback. Each lane has 2, 4, 8 or 16 contiguous sample slots
+selected by `Configuration::slots` (default the next power of two at or above
+callback depth plus one). Sequence counters are modulo-2^32 serial numbers and
+may wrap without reannouncing the ring. The parent trusts its own validated
+geometry. See [ADR 0005](adr/0005-serial-sequences.md). Plugin processing
+receives private scratch buffers,
 never the shared mapping. Late outputs cannot be substituted for a different
 sample interval. The callback does not allocate, block or perform synchronous
 control I/O. `BlockEndpoint` reports `depth * quantum + plugin latency`; the
