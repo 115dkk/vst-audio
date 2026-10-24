@@ -1,5 +1,9 @@
 #![allow(unsafe_code)]
 //! Selected descriptor inheritance. No plugin code runs here.
+//!
+//! A worker receives only the descriptors named at spawn: macOS spawns with
+//! `POSIX_SPAWN_CLOEXEC_DEFAULT`, Linux marks every other descriptor
+//! close-on-exec in the fork child before clearing the flag on the selection.
 use std::{
     ffi::OsString,
     fs::File,
@@ -44,29 +48,11 @@ pub fn inherited_file(value: usize) -> io::Result<File> {
     Ok(duplicate_value(value, false)?.into())
 }
 
-pub(crate) fn pipe(nonblocking: bool) -> io::Result<(OwnedFd, OwnedFd)> {
-    let mut fds = [-1; 2];
-    // SAFETY: writable array of two descriptors.
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: pipe returned two distinct newly owned descriptors.
-    let read = unsafe { OwnedFd::from_raw_fd(fds[0]) };
-    // SAFETY: second descriptor is independent of the read end.
-    let write = unsafe { OwnedFd::from_raw_fd(fds[1]) };
-    for fd in [&read, &write] {
-        // SAFETY: fd is live; setting descriptor flags has no pointer payload.
-        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if nonblocking {
-            // SAFETY: pipe descriptor is owned, setting O_NONBLOCK is valid.
-            if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) } < 0 {
-                return Err(io::Error::last_os_error());
-            }
-        }
-    }
-    Ok((read, write))
+/// Both ends are created close-on-exec atomically (`pipe2` on Linux), so a
+/// spawn racing on another thread cannot inherit them.
+pub(crate) fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+    let (read, write) = io::pipe()?;
+    Ok((read.into(), write.into()))
 }
 
 #[derive(Debug)]
@@ -76,7 +62,7 @@ pub struct ParentHandle {
 }
 
 pub fn parent_handle() -> io::Result<ParentHandle> {
-    let (read, write) = pipe(false)?;
+    let (read, write) = pipe()?;
     Ok(ParentHandle {
         read,
         _write: write,
@@ -105,7 +91,7 @@ pub struct Pipe {
 }
 impl Pipe {
     pub fn create(parent_reads: bool) -> io::Result<Self> {
-        let (read, write) = pipe(false)?;
+        let (read, write) = pipe()?;
         let (parent, child) = if parent_reads {
             (read, write)
         } else {
@@ -471,13 +457,7 @@ pub fn spawn_handles(
             if unsafe { libc::setpgid(0, 0) } != 0 {
                 return Err(io::Error::last_os_error());
             }
-            for fd in &descriptors {
-                // SAFETY: selected inherited descriptor, no allocation or pointer access.
-                if unsafe { libc::fcntl(*fd, libc::F_SETFD, 0) } < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-            }
-            Ok(())
+            inherit_only(&descriptors)
         };
         // SAFETY: prepare uses only async-signal-safe syscalls and preallocated data.
         unsafe { command.pre_exec(prepare) };
@@ -488,6 +468,56 @@ pub fn spawn_handles(
             _sandbox: sandbox,
         })
     }
+}
+
+/// Marks every descriptor from 3 upwards close-on-exec, then clears the flag on
+/// the selection. Nothing is closed before exec, so std's own error pipe and the
+/// selected descriptors stay valid. Runs in the fork child: raw syscalls only.
+#[cfg(not(target_os = "macos"))]
+fn inherit_only(descriptors: &[i32]) -> io::Result<()> {
+    if !mark_all_cloexec() {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: writable initialized rlimit record; no allocation.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // Kernels without close_range (before 5.11) walk the table instead. The
+        // cap keeps an unlimited soft limit from turning this into a long loop.
+        let end = limit.rlim_cur.min(1 << 20) as i32;
+        for fd in 3..end {
+            // SAFETY: flag-only operation; a closed descriptor merely yields EBADF.
+            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+        }
+    }
+    for fd in descriptors {
+        // SAFETY: selected inherited descriptor, no allocation or pointer access.
+        if unsafe { libc::fcntl(*fd, libc::F_SETFD, 0) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn mark_all_cloexec() -> bool {
+    // SAFETY: scalar-only syscall; CLOSE_RANGE_CLOEXEC changes flags and closes nothing.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_close_range,
+            3u32,
+            u32::MAX,
+            libc::CLOSE_RANGE_CLOEXEC,
+        )
+    };
+    result == 0
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn mark_all_cloexec() -> bool {
+    false
 }
 
 impl ChildProcess {
@@ -540,7 +570,10 @@ impl ChildProcess {
             }
             // SAFETY: spawn put this owned, unreaped child in its own process group.
             // Holding the lock prevents another thread reaping/reusing its PID.
-            let result = unsafe { libc::kill(-child.pid, libc::SIGKILL) };
+            let _ = unsafe { libc::kill(-child.pid, libc::SIGKILL) };
+            // SAFETY: the same owned, unreaped child, whatever process group it has
+            // joined since; a worker cannot escape a signal addressed to its PID.
+            let result = unsafe { libc::kill(child.pid, libc::SIGKILL) };
             if result != 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -552,9 +585,13 @@ impl ChildProcess {
             if child.try_wait()?.is_some() {
                 return Ok(());
             }
+            let pid = child.id() as i32;
             // SAFETY: spawn put this owned, unreaped child in its own process group.
             // Holding the lock prevents another thread reaping/reusing its PID.
-            let result = unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+            let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
+            // SAFETY: the same owned, unreaped child, whatever process group it has
+            // joined since; a worker cannot escape a signal addressed to its PID.
+            let result = unsafe { libc::kill(pid, libc::SIGKILL) };
             if result != 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -587,5 +624,43 @@ pub struct Mmcss;
 impl Mmcss {
     pub fn pro_audio() -> io::Result<Self> {
         Ok(Self)
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    fn shell_exit(script: &str, values: &[u64]) -> u32 {
+        let sandbox = crate::sandbox::SandboxLaunch::new(None, Path::new("/bin/sh")).unwrap();
+        let args: Vec<OsString> = ["-c", script].map(OsString::from).into();
+        let child = spawn_handles(
+            Path::new("/bin/sh"),
+            &args,
+            values,
+            parent_handle().unwrap(),
+            sandbox,
+        )
+        .unwrap();
+        assert!(child.wait(Duration::from_secs(10)), "shell did not exit");
+        child.exit_code().unwrap().unwrap()
+    }
+
+    #[test]
+    fn only_selected_descriptors_reach_the_child() {
+        let file = File::open("/dev/null").unwrap();
+        // Leave it inheritable, like a descriptor a foreign library opened.
+        // SAFETY: owned descriptor; clearing FD_CLOEXEC has no pointer payload.
+        let cleared = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, 0) };
+        assert_eq!(cleared, 0);
+        let fd = file.as_raw_fd();
+        let probe = format!("test -e /proc/self/fd/{fd}");
+        assert_ne!(shell_exit(&probe, &[]), 0, "unselected descriptor leaked");
+        assert_eq!(
+            shell_exit(&probe, &[fd as u64]),
+            0,
+            "selected descriptor missing"
+        );
     }
 }

@@ -302,11 +302,26 @@ pub fn apply_worker(policy: &SandboxPolicy, _: &Path) -> io::Result<SandboxRepor
         )
     }
     .map_err(io::Error::other)?;
-    // SAFETY: successful TokenCapabilities query initialized TOKEN_GROUPS in aligned storage.
-    let groups = unsafe { &*buffer.as_ptr().cast::<TOKEN_GROUPS>() };
-    // SAFETY: GroupCount entries follow the header inside the live query buffer.
-    let groups =
-        unsafe { std::slice::from_raw_parts(groups.Groups.as_ptr(), groups.GroupCount as usize) };
+    // TOKEN_GROUPS declares a one-element array that the OS extends in place, so
+    // the entries are addressed through the whole buffer, never through a
+    // reference to the one-element declaration.
+    let base = buffer.as_ptr().cast::<u8>();
+    // SAFETY: the successful query initialized the aligned GroupCount at the buffer start.
+    let count = unsafe { base.cast::<u32>().read() } as usize;
+    let offset = std::mem::offset_of!(TOKEN_GROUPS, Groups);
+    let available = (bytes as usize)
+        .min(size_of_val(&buffer))
+        .saturating_sub(offset)
+        / size_of::<SID_AND_ATTRIBUTES>();
+    if count > available {
+        return Err(io::Error::other(
+            "token capability list exceeds the query buffer",
+        ));
+    }
+    let entries = base.wrapping_add(offset).cast::<SID_AND_ATTRIBUTES>();
+    // SAFETY: entries start at the flexible array's offset inside the aligned
+    // buffer, and the checked count keeps the slice within the bytes the query wrote.
+    let groups = unsafe { std::slice::from_raw_parts(entries, count) };
     let mut internet = well_known(WinCapabilityInternetClientSid).map_err(io::Error::other)?;
     let internet = PSID(internet.as_mut_ptr().cast());
     // SAFETY: both SIDs are valid for the duration of the comparison.
