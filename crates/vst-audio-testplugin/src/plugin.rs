@@ -154,6 +154,12 @@ unsafe extern "C" fn dispatch(
         drop(unsafe { Box::from_raw(effect.cast::<Instance>()) });
         return 1;
     }
+    // processEvents (25) arrives on the audio thread while the control thread may
+    // hold the UI state below; this fixture ignores events, so it returns before
+    // borrowing anything the control thread owns.
+    if opcode == 25 {
+        return 0;
+    }
     let raw = effect.cast::<Instance>();
     // SAFETY: control dispatcher calls occur on one thread; audio never accesses this field.
     let control = unsafe { (*raw).control.get() };

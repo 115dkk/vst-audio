@@ -1,7 +1,7 @@
 //! Versioned VST 3 state envelope. VST 2 chunks retain their native representation.
 use crate::PluginError;
 const MAGIC: &[u8; 5] = b"SSV3\x01";
-const LIMIT: usize = 64 * 1024 * 1024 - 8;
+const LIMIT: usize = crate::MAX_STATE_BODY_BYTES;
 
 pub fn encode(component: &[u8], controller: &[u8]) -> Result<Vec<u8>, PluginError> {
     if component

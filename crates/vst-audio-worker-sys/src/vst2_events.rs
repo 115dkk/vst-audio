@@ -165,25 +165,37 @@ impl CallbackEvents {
         if pointer.is_null() {
             return 0;
         }
-        // SAFETY: VST processEvents provides a readable list header.
-        let list = unsafe { &*pointer.cast::<Events<0>>() };
-        if !(0..=MAX_EVENTS as i32).contains(&list.count) {
+        let list = pointer.cast::<Events<0>>();
+        if !list.is_aligned() {
             self.dropped.fetch_add(1, Ordering::Relaxed);
             return 0;
         }
+        let count = list
+            .wrapping_byte_add(std::mem::offset_of!(Events<0>, count))
+            .cast::<i32>();
+        // SAFETY: VST processEvents provides a readable, aligned list header.
+        let count = unsafe { count.read() };
+        if !(0..=MAX_EVENTS as i32).contains(&count) {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            return 0;
+        }
+        // The inline pointer array is addressed from the plugin's own pointer,
+        // never through a reference to the zero-length header type, whose extent
+        // would not cover it.
+        let first = list
+            .wrapping_byte_add(std::mem::offset_of!(Events<0>, events))
+            .cast::<*const c_void>();
         // SAFETY: the ABI list stores count inline pointers after the aligned header.
-        let pointers = unsafe {
-            std::slice::from_raw_parts(
-                std::ptr::addr_of!(list.events).cast::<*const c_void>(),
-                list.count as usize,
-            )
-        };
+        let pointers = unsafe { std::slice::from_raw_parts(first, count as usize) };
         for pointer in pointers {
-            if pointer.is_null() {
+            if pointer.is_null() || !pointer.cast::<i32>().is_aligned() {
                 continue;
             }
             // SAFETY: each event has the common 16-byte header, live during callback.
             let kind = unsafe { *pointer.cast::<i32>() };
+            // SAFETY: the declared byte size sits second in that common header.
+            let size = unsafe { pointer.cast::<i32>().wrapping_add(1).read() };
+            let declared = usize::try_from(size).unwrap_or(0);
             let event = match kind {
                 1 => {
                     // SAFETY: MIDI event tag denotes the fixed MIDI layout.
@@ -199,27 +211,53 @@ impl CallbackEvents {
                     )
                 }
                 6 => {
-                    // SAFETY: SysEx event tag denotes the pointer-bearing SysEx layout.
-                    let raw = unsafe { &*pointer.cast::<SysExEvent>() };
-                    if raw.offset < 0
-                        || raw.dump_bytes <= 0
-                        || raw.dump_bytes as usize > MAX_SYSEX_BYTES
-                        || raw.data.is_null()
+                    // Only the fields through `data` are read, and only once the
+                    // plugin's declared size says they exist; no reference to the
+                    // whole record is formed.
+                    let raw = pointer.cast::<SysExEvent>();
+                    let needed = std::mem::offset_of!(SysExEvent, data) + size_of::<*mut u8>();
+                    if !raw.is_aligned() || declared < needed {
+                        self.dropped.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    let field = |offset: usize| raw.wrapping_byte_add(offset);
+                    // SAFETY: aligned SysEx record whose declared size covers `offset`.
+                    let offset = unsafe {
+                        field(std::mem::offset_of!(SysExEvent, offset))
+                            .cast::<i32>()
+                            .read()
+                    };
+                    // SAFETY: the declared size covers `dump_bytes`.
+                    let dump_bytes = unsafe {
+                        field(std::mem::offset_of!(SysExEvent, dump_bytes))
+                            .cast::<i32>()
+                            .read()
+                    };
+                    // SAFETY: the declared size covers `data`.
+                    let data = unsafe {
+                        field(std::mem::offset_of!(SysExEvent, data))
+                            .cast::<*mut u8>()
+                            .read()
+                    };
+                    if offset < 0
+                        || dump_bytes <= 0
+                        || dump_bytes as usize > MAX_SYSEX_BYTES
+                        || data.is_null()
                     {
                         self.dropped.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
                     let mut bytes = [0; MAX_SYSEX_BYTES];
                     // SAFETY: callback supplies dump_bytes readable bytes; copy before returning.
-                    bytes[..raw.dump_bytes as usize].copy_from_slice(unsafe {
-                        std::slice::from_raw_parts(raw.data, raw.dump_bytes as usize)
+                    bytes[..dump_bytes as usize].copy_from_slice(unsafe {
+                        std::slice::from_raw_parts(data, dump_bytes as usize)
                     });
                     Event {
-                        sample_offset: (raw.offset as u32)
+                        sample_offset: (offset as u32)
                             .saturating_add(self.base.load(Ordering::Relaxed)),
                         bus: 0,
                         data: EventData::SysEx {
-                            len: raw.dump_bytes as u16,
+                            len: dump_bytes as u16,
                             bytes,
                         },
                     }

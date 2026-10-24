@@ -187,7 +187,7 @@ impl AudioBuffer {
             let mut processed = false;
             let mut context = vst_audio_ring::Transport::default();
             if !consumer.input_packet(0, sequence, &mut context, &mut self.input) {
-                consumer.fault(2);
+                consumer.fault(vst_audio_ring::Fault::EngineFailed as u32);
                 break;
             }
             self.output.clear();
@@ -233,7 +233,7 @@ impl AudioBuffer {
                 consumer.set_last_error(non_finite as u64);
             }
             if !consumer.output_packet(0, sequence, &self.output) {
-                consumer.fault(3);
+                consumer.fault(vst_audio_ring::Fault::EngineFailed as u32);
                 break;
             }
             consumer.complete(0, sequence);

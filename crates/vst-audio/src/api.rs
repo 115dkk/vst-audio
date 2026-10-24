@@ -414,10 +414,49 @@ pub enum Status {
     Stopped,
 }
 
+/// Where the plugin session stands, as the supervisor and the audio thread
+/// agree on it. Stored in `Shared.status`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum Lifecycle {
+    Running = 0,
+    Failed = 1,
+    Stopped = 2,
+    /// A replacement worker's resources were handed to the audio thread; audio
+    /// keeps processing (the old generation until it adopts the new one).
+    Replacing = 3,
+    /// The worker is gone and recovery is pending or scheduled; audio must not process.
+    Recovering = 4,
+}
+impl Lifecycle {
+    fn from_wire(value: u8) -> Self {
+        match value {
+            0 => Self::Running,
+            1 => Self::Failed,
+            2 => Self::Stopped,
+            3 => Self::Replacing,
+            4 => Self::Recovering,
+            _ => Self::Stopped,
+        }
+    }
+    /// Audio may process and deliver blocks in this state.
+    pub(crate) fn processing_allowed(self) -> bool {
+        matches!(self, Self::Running | Self::Replacing)
+    }
+    pub(crate) fn status(self) -> Status {
+        match self {
+            Self::Running => Status::Running,
+            Self::Failed => Status::Failed,
+            Self::Replacing | Self::Recovering => Status::Recovering,
+            Self::Stopped => Status::Stopped,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct Shared {
     pub(crate) stop: Arc<AtomicBool>,
-    pub(crate) status: AtomicU8,
+    lifecycle: AtomicU8,
     pub(crate) worker_pid: AtomicU32,
     pub(crate) overflow: AtomicBool,
     next_request: AtomicU64,
@@ -425,6 +464,14 @@ pub(crate) struct Shared {
     pub(crate) applied_generation: AtomicU64,
     pub(crate) processed_generation: AtomicU64,
     pub(crate) history: Mutex<vst_audio_protocol::StateHistory>,
+}
+impl Shared {
+    pub(crate) fn set_lifecycle(&self, lifecycle: Lifecycle) {
+        self.lifecycle.store(lifecycle as u8, Ordering::Release);
+    }
+    pub(crate) fn lifecycle(&self) -> Lifecycle {
+        Lifecycle::from_wire(self.lifecycle.load(Ordering::Acquire))
+    }
 }
 #[derive(Clone, Debug)]
 pub struct Controller {
@@ -436,7 +483,7 @@ impl Controller {
     /// some commands own state allocations.
     pub fn request(&self, command: Command) -> Result<RequestId, StartError> {
         if let Command::RestoreState(state) = &command
-            && state.len() > vst_audio_protocol::MAX_STATE_BYTES - 8
+            && state.len() > vst_audio_protocol::MAX_STATE_BODY_BYTES
         {
             return Err(StartError("state too large".into()));
         }
@@ -468,12 +515,7 @@ impl Controller {
     }
 }
 fn status(shared: &Shared) -> Status {
-    match shared.status.load(Ordering::Acquire) {
-        0 => Status::Running,
-        1 => Status::Failed,
-        3 | 4 => Status::Recovering,
-        _ => Status::Stopped,
-    }
+    shared.lifecycle().status()
 }
 
 #[cfg(test)]
@@ -496,6 +538,28 @@ mod tests {
         let error = invalid.callback_geometry().unwrap_err();
         assert!(error.0.contains("must be a power of two"));
     }
+
+    #[test]
+    fn lifecycle_preserves_status_and_processing_rules() {
+        let cases = [
+            (Lifecycle::Running, Status::Running, true),
+            (Lifecycle::Failed, Status::Failed, false),
+            (Lifecycle::Stopped, Status::Stopped, false),
+            (Lifecycle::Replacing, Status::Recovering, true),
+            (Lifecycle::Recovering, Status::Recovering, false),
+        ];
+        for (lifecycle, status, processing_allowed) in cases {
+            assert_eq!(lifecycle.status(), status);
+            assert_eq!(lifecycle.processing_allowed(), processing_allowed);
+            assert_eq!(Lifecycle::from_wire(lifecycle as u8), lifecycle);
+        }
+    }
+
+    #[test]
+    fn lifecycle_treats_unknown_values_as_stopped() {
+        assert_eq!(Lifecycle::from_wire(5), Lifecycle::Stopped);
+        assert_eq!(Lifecycle::from_wire(u8::MAX), Lifecycle::Stopped);
+    }
 }
 
 #[cfg(test)]
@@ -503,7 +567,7 @@ impl Shared {
     pub(crate) fn for_audio_test() -> Arc<Self> {
         Arc::new(Self {
             stop: Arc::new(AtomicBool::new(false)),
-            status: AtomicU8::new(0),
+            lifecycle: AtomicU8::new(Lifecycle::Running as u8),
             worker_pid: AtomicU32::new(1),
             overflow: AtomicBool::new(false),
             next_request: AtomicU64::new(1),
@@ -534,7 +598,7 @@ impl Instance {
     ) -> Result<Self, StartError> {
         let shared = Arc::new(Shared {
             stop: cancel,
-            status: AtomicU8::new(0),
+            lifecycle: AtomicU8::new(Lifecycle::Running as u8),
             worker_pid: AtomicU32::new(started.control.pid()),
             overflow: AtomicBool::new(false),
             next_request: AtomicU64::new(1),
@@ -543,32 +607,13 @@ impl Instance {
             processed_generation: AtomicU64::new(0),
             history: Mutex::new(started.control.state_history()),
         });
-        let Started {
-            control,
-            region,
-            work,
-            publisher,
-            geometry,
-            latency_frames,
-            setup,
-            capabilities,
-            ..
-        } = started;
         let recovery = crate::supervision::RecoveryConfig {
             launch,
-            geometry,
-            setup: setup.clone(),
+            geometry: started.geometry,
+            setup: started.setup.clone(),
         };
-        let lane = vst_audio_ring::BlockLane::new(region, work, publisher, 0, 1)
+        let (prepared, control) = PreparedAudio::from_started(started, 1)
             .map_err(|error| StartError(format!("invalid block lane: {error:?}")))?;
-        let prepared = PreparedAudio {
-            lane,
-            geometry,
-            latency: latency_frames,
-            setup,
-            capabilities,
-            generation: 1,
-        };
         let (updates, next) = rtrb::RingBuffer::new(2);
         let (retired, retirements) = rtrb::RingBuffer::new(2);
         let audio = AudioEndpoint::new(

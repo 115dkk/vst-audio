@@ -5,16 +5,19 @@
     clippy::undocumented_unsafe_blocks
 )]
 //! Host-owned COM objects. Controller callbacks are UI-thread-only (SDK threading model).
-use crate::{editor::EditorWindow, state_buffer::StateBuffer};
+use crate::{
+    editor::EditorWindow,
+    notifications::{EditPhase, Notifications, ParameterEdit},
+    state_buffer::StateBuffer,
+};
 use std::{
-    cell::Cell,
     collections::HashMap,
     ffi::{c_char, c_void},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Seek, SeekFrom, Write},
     rc::Rc,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
     },
 };
 use vst3::{Class, ComRef, ComWrapper, Steinberg::Vst::*, Steinberg::*};
@@ -23,33 +26,13 @@ use vst3::{Class, ComRef, ComWrapper, Steinberg::Vst::*, Steinberg::*};
 use vst3::{wl_display, wl_surface, xdg_surface, xdg_toplevel};
 
 pub(crate) const CAPACITY: usize = 256;
-pub(crate) const NOTIFICATION_CAPACITY: usize = 1024;
-thread_local! {
-    static SUPPRESS_NOTIFICATIONS: Cell<u32> = const { Cell::new(0) };
-}
-pub(crate) struct NotificationGuard;
-impl NotificationGuard {
-    pub(crate) fn enter() -> Self {
-        SUPPRESS_NOTIFICATIONS.set(SUPPRESS_NOTIFICATIONS.get() + 1);
-        Self
-    }
-}
-impl Drop for NotificationGuard {
-    fn drop(&mut self) {
-        SUPPRESS_NOTIFICATIONS.set(SUPPRESS_NOTIFICATIONS.get() - 1);
-    }
-}
-fn notifications_suppressed() -> bool {
-    SUPPRESS_NOTIFICATIONS.get() != 0
-}
 
 pub(crate) struct Edits {
     slots: [(AtomicU32, AtomicU64); CAPACITY],
     read: AtomicUsize,
     write: AtomicUsize,
     pub flags: AtomicU32,
-    notifications: crossbeam_queue::ArrayQueue<(u32, u8, f64)>,
-    overflow: AtomicBool,
+    pub notifications: Notifications,
     // Editor edits that did not fit the processor queue, latest value per ID.
     // Main thread only; flushed in order before newer edits are queued.
     deferred: Mutex<Vec<(u32, f64)>>,
@@ -61,8 +44,7 @@ impl Edits {
             read: AtomicUsize::new(0),
             write: AtomicUsize::new(0),
             flags: AtomicU32::new(0),
-            notifications: crossbeam_queue::ArrayQueue::new(NOTIFICATION_CAPACITY),
-            overflow: AtomicBool::new(false),
+            notifications: Notifications::new(),
             deferred: Mutex::new(Vec::new()),
         }
     }
@@ -105,23 +87,6 @@ impl Edits {
         slot.1.store(value.to_bits(), Ordering::Relaxed);
         self.write.store(write.wrapping_add(1), Ordering::Release);
         true
-    }
-    pub fn notify(&self, id: u32, phase: u8, value: f64) {
-        if notifications_suppressed() {
-            return;
-        }
-        let edit = (id, phase, value);
-        if self.notifications.push(edit).is_err() {
-            self.overflow.store(true, Ordering::Release);
-            let _ = self.notifications.pop();
-            let _ = self.notifications.push(edit);
-        }
-    }
-    pub fn pop_notification(&self) -> Option<(u32, u8, f64)> {
-        self.notifications.pop()
-    }
-    pub fn take_overflow(&self) -> bool {
-        self.overflow.swap(false, Ordering::AcqRel)
     }
     pub fn pop(&self) -> Option<(u32, f64)> {
         let read = self.read.load(Ordering::Relaxed);
@@ -168,21 +133,43 @@ pub(crate) struct HostAttributeList(Mutex<AttributeStorage>);
 impl Class for HostAttributeList {
     type Interfaces = (IAttributeList,);
 }
-impl HostAttributeList {
-    unsafe fn key(id: IAttributeList_::AttrID) -> Result<Vec<u8>, tresult> {
-        if id.is_null() {
-            return Err(kInvalidArgument);
-        }
-        // SAFETY: the SDK contract requires AttrID to point to a terminated byte string.
-        let bytes = unsafe { std::ffi::CStr::from_ptr(id) }.to_bytes();
-        if bytes.len() > ATTRIBUTE_VALUE_LIMIT {
+/// Copies a plugin-supplied byte string, scanning at most `ATTRIBUTE_VALUE_LIMIT`
+/// bytes for its terminator so an unterminated string cannot run the scan past
+/// that bound.
+///
+/// # Safety
+/// `text` must point to readable bytes up to and including a NUL terminator, or
+/// to at least `ATTRIBUTE_VALUE_LIMIT + 1` readable bytes, for this synchronous
+/// call. The bound only limits how far a broken caller's string is read; it
+/// cannot validate an arbitrary pointer.
+unsafe fn bounded_bytes(text: *const c_char) -> Result<Vec<u8>, tresult> {
+    if text.is_null() {
+        return Err(kInvalidArgument);
+    }
+    let mut length = 0;
+    loop {
+        if length > ATTRIBUTE_VALUE_LIMIT {
             return Err(kOutOfMemory);
         }
-        let mut key = Vec::new();
-        key.try_reserve_exact(bytes.len())
-            .map_err(|_| kOutOfMemory)?;
-        key.extend_from_slice(bytes);
-        Ok(key)
+        // SAFETY: the caller guarantees this byte is readable: the terminator
+        // has not been seen yet and the scan is still within the documented bound.
+        if unsafe { text.wrapping_add(length).read() } == 0 {
+            break;
+        }
+        length += 1;
+    }
+    let mut copy = Vec::new();
+    copy.try_reserve_exact(length).map_err(|_| kOutOfMemory)?;
+    // SAFETY: the scan above read exactly these `length` non-NUL bytes.
+    copy.extend_from_slice(unsafe { std::slice::from_raw_parts(text.cast::<u8>(), length) });
+    Ok(copy)
+}
+
+impl HostAttributeList {
+    unsafe fn key(id: IAttributeList_::AttrID) -> Result<Vec<u8>, tresult> {
+        // SAFETY: the SDK contract requires AttrID to point to a terminated byte
+        // string that stays valid for this synchronous call.
+        unsafe { bounded_bytes(id) }
     }
 
     fn set(&self, key: Vec<u8>, value: AttributeValue) -> tresult {
@@ -429,13 +416,17 @@ impl IMessageTrait for HostMessage {
             *stored = None;
             return;
         }
-        // SAFETY: IMessage requires a terminated FIDString for this synchronous call.
-        let bytes = unsafe { std::ffi::CStr::from_ptr(id) }.to_bytes_with_nul();
+        // SAFETY: IMessage requires a terminated FIDString that stays valid for
+        // this synchronous call; the scan stops at the host's length bound.
+        let Ok(bytes) = (unsafe { bounded_bytes(id) }) else {
+            return;
+        };
         let mut copied = Vec::new();
-        if copied.try_reserve_exact(bytes.len()).is_err() {
+        if copied.try_reserve_exact(bytes.len() + 1).is_err() {
             return;
         }
         copied.extend(bytes.iter().map(|byte| *byte as c_char));
+        copied.push(0);
         *stored = Some(copied);
     }
 
@@ -573,7 +564,11 @@ impl Class for Handler {
 }
 impl IComponentHandlerTrait for Handler {
     unsafe fn beginEdit(&self, id: u32) -> tresult {
-        self.0.notify(id, 0, 0.0);
+        self.0.notifications.push(ParameterEdit {
+            id,
+            phase: EditPhase::Begin,
+            value: 0.0,
+        });
         kResultOk
     }
     unsafe fn performEdit(&self, id: u32, value: f64) -> tresult {
@@ -581,7 +576,11 @@ impl IComponentHandlerTrait for Handler {
             self.0.flags.fetch_or(1, Ordering::Release);
             return kInvalidArgument;
         }
-        self.0.notify(id, 1, value);
+        self.0.notifications.push(ParameterEdit {
+            id,
+            phase: EditPhase::Perform,
+            value,
+        });
         // Test only: never enable __test-drop-editor-edits in distribution builds.
         if !cfg!(feature = "__test-drop-editor-edits") {
             self.0.push_edit(id, value);
@@ -589,7 +588,11 @@ impl IComponentHandlerTrait for Handler {
         kResultOk
     }
     unsafe fn endEdit(&self, id: u32) -> tresult {
-        self.0.notify(id, 2, 0.0);
+        self.0.notifications.push(ParameterEdit {
+            id,
+            phase: EditPhase::End,
+            value: 0.0,
+        });
         kResultOk
     }
     unsafe fn restartComponent(&self, flags: i32) -> tresult {
@@ -626,19 +629,19 @@ impl IBStreamTrait for Stream {
         if count < 0 || (count > 0 && buffer.is_null()) {
             return kInvalidArgument;
         }
-        let mut empty = [];
-        let bytes = if count == 0 {
-            &mut empty[..]
-        } else {
-            // SAFETY: IBStream caller provides count writable bytes; used only in this call.
-            unsafe { std::slice::from_raw_parts_mut(buffer.cast::<u8>(), count as usize) }
-        };
         let Ok(mut stream) = self.0.try_lock() else {
             return kResultFalse;
         };
-        let Ok(n) = stream.read(bytes) else {
-            return kResultFalse;
-        };
+        // The caller's buffer may be uninitialized memory, so it is never viewed
+        // as a `&mut [u8]`: the bytes are copied in through the raw pointer.
+        let available = stream.remaining();
+        let n = available.len().min(count as usize);
+        if n > 0 {
+            // SAFETY: the IBStream caller provides `count` writable bytes that do
+            // not overlap this stream's private storage; n <= count.
+            unsafe { std::ptr::copy_nonoverlapping(available.as_ptr(), buffer.cast::<u8>(), n) };
+            stream.advance(n);
+        }
         if !actual.is_null() {
             // SAFETY: optional writable byte-count output supplied by the caller.
             unsafe { *actual = n as i32 };

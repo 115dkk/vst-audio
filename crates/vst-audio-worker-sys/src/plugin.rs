@@ -2,7 +2,13 @@
 //! VST 2 lifecycle calls close a non-waiting audio admission gate. UI and
 //! parameter calls may overlap DSP, using copied ABI function pointers rather
 //! than Rust references to foreign mutable storage. Callbacks use atomics/TLS.
-use crate::{editor::EditorWindow, editor_scaling, library::Library, vst2::*};
+use crate::{
+    editor::EditorWindow,
+    editor_scaling,
+    library::Library,
+    notifications::{EditPhase, Notifications, ParameterEdit, PluginEvents, SuppressNotifications},
+    vst2::*,
+};
 use std::{
     cell::Cell,
     ffi::{CStr, CString, c_void},
@@ -28,15 +34,6 @@ pub struct Info {
     pub input_types: Option<Vec<i32>>,
     pub output_types: Option<Vec<i32>>,
 }
-#[derive(Clone, Debug, Default)]
-pub struct Events {
-    pub params: bool,
-    pub parameter_edits: Vec<(u32, u8, f64)>,
-    pub latency: bool,
-    pub closed: bool,
-    pub resized: Option<(u32, u32)>,
-    pub fault: bool,
-}
 #[derive(Debug)]
 struct CallbackState {
     flags: AtomicU32,
@@ -50,8 +47,7 @@ struct CallbackState {
     events: crate::vst2_events::CallbackEvents,
     offline: AtomicBool,
     parameter_count: AtomicU32,
-    parameter_edits: crossbeam_queue::ArrayQueue<(u32, u8, f64)>,
-    parameter_edits_overflow: AtomicBool,
+    notifications: Notifications,
 }
 #[derive(Debug)]
 struct Shared {
@@ -193,18 +189,26 @@ impl Vst2Plugin {
         // SAFETY: entry uses the validated ABI and static callback.
         let effect = unsafe { entry(callback) };
         CURRENT_ID.set(previous);
-        if effect.is_null() {
-            return Err(PluginError("null plugin instance".into()));
+        if effect.is_null() || !effect.is_aligned() {
+            return Err(PluginError("null or misaligned plugin instance".into()));
         }
-        // SAFETY: successful entry returns an AEffect that remains live until CLOSE.
+        // SAFETY: successful entry returns an aligned AEffect that remains live until CLOSE.
         let fields = unsafe { effect.read() };
-        if fields.magic != MAGIC
-            || fields.dispatcher.is_none()
+        let conforming = fields.magic == MAGIC && fields.dispatcher.is_some();
+        if !conforming
             || (fields.process_replacing.is_none() && fields.process_double.is_none())
             || !(0..=64).contains(&fields.num_inputs)
             || !(0..=64).contains(&fields.num_outputs)
             || !(0..=16384).contains(&fields.num_params)
         {
+            if conforming && let Some(close) = fields.dispatcher {
+                // A real instance outside this host's limits is released before
+                // its module unloads; a thread it started must not keep running
+                // unloaded code.
+                // SAFETY: a conforming entry returned a live instance and nothing
+                // else was called on it; CLOSE is its final dispatcher call.
+                unsafe { close(effect, CLOSE, 0, 0, std::ptr::null_mut(), 0.0) };
+            }
             return Err(PluginError("invalid plugin ABI or channel count".into()));
         }
         let directory = plugin_directory(path);
@@ -227,8 +231,7 @@ impl Vst2Plugin {
                 events: crate::vst2_events::CallbackEvents::default(),
                 offline: AtomicBool::new(false),
                 parameter_count: AtomicU32::new(fields.num_params as u32),
-                parameter_edits: crossbeam_queue::ArrayQueue::new(1024),
-                parameter_edits_overflow: AtomicBool::new(false),
+                notifications: Notifications::new(),
             }),
             _library: library,
         });
@@ -268,7 +271,10 @@ impl Vst2Plugin {
                 if arrangements == 0 || pointer.is_null() {
                     return Ok(None);
                 }
-                // SAFETY: successful arrangement query returns its live header.
+                if !pointer.is_aligned() {
+                    return Err(PluginError("misaligned speaker arrangement".into()));
+                }
+                // SAFETY: successful arrangement query returns its live, aligned header.
                 let channels = unsafe { (*pointer).channels };
                 // JUCE declares its widest supported channel count in
                 // numInputs/numOutputs and reports the current, possibly
@@ -280,7 +286,9 @@ impl Vst2Plugin {
                 // SAFETY: address of the first speaker only; do not reference a fixed-size
                 // struct since third-party plugins may allocate exactly channels entries.
                 let first = unsafe { std::ptr::addr_of!((*pointer).speakers).cast::<Speaker>() };
-                // SAFETY: validated count <= 32; query guarantees that many live speaker records.
+                // SAFETY: count <= 64 was validated after OPEN and equals `channels`,
+                // so the plugin's arrangement holds that many initialized, aligned
+                // Speaker records in one readable allocation, live through this copy.
                 let speakers = unsafe { std::slice::from_raw_parts(first, count as usize) };
                 Ok(Some(speakers.iter().map(|speaker| speaker.kind).collect()))
             };
@@ -491,7 +499,7 @@ impl Vst2Plugin {
             .effect()
             .set_parameter
             .ok_or_else(|| PluginError("no parameter setter".into()))?;
-        let _notifications = NotificationGuard::enter();
+        let _notifications = SuppressNotifications::enter();
         // SAFETY: validated index/value; the VST2 plugin synchronizes parameter writes with DSP.
         unsafe { set(self.shared.effect(), id, value as f32) };
         Ok(())
@@ -533,7 +541,7 @@ impl Vst2Plugin {
             return Err(PluginError("state too large".into()));
         }
         let control = self.shared.control();
-        let _notifications = NotificationGuard::enter();
+        let _notifications = SuppressNotifications::enter();
         if control.effect().flags & PROGRAM_CHUNKS != 0 {
             let mut blob = blob.to_vec();
             control.call(
@@ -661,7 +669,10 @@ impl Vst2Plugin {
             (&mut rect as *mut *const Rect).cast(),
             0.0,
         );
-        // SAFETY: `rect` is still `&fallback`, or null, or the plugin's
+        if !rect.is_aligned() {
+            return Err(PluginError("misaligned editor rectangle".into()));
+        }
+        // SAFETY: `rect` is still `&fallback`, or null, or the plugin's aligned
         // rectangle, which stays valid until the next dispatcher call.
         let rect = unsafe { rect.as_ref() }.copied().unwrap_or(fallback);
         let (width, height) = (
@@ -689,8 +700,8 @@ impl Vst2Plugin {
             (&mut after as *mut *const Rect).cast(),
             0.0,
         );
-        if !after.is_null() {
-            // SAFETY: plugin owns the rectangle until its next dispatcher call; copy now.
+        if !after.is_null() && after.is_aligned() {
+            // SAFETY: plugin owns the aligned rectangle until its next dispatcher call; copy now.
             let after = unsafe { after.read() };
             let w = i32::from(after.right) - i32::from(after.left);
             let h = i32::from(after.bottom) - i32::from(after.top);
@@ -860,28 +871,24 @@ impl Vst2Plugin {
             }
         }
     }
-    pub fn take_events(&mut self) -> Events {
+    pub fn take_events(&mut self) -> PluginEvents {
         if self.shared.callback.io_pending.load(Ordering::Acquire) {
             let control = self.shared.control();
             refresh(&self.shared, &control, &mut self.info, self.parameter_count);
         }
         let flags = self.shared.callback.flags.swap(0, Ordering::AcqRel);
-        let mut parameter_edits = Vec::new();
-        while let Some(edit) = self.shared.callback.parameter_edits.pop() {
-            parameter_edits.push(edit);
-        }
-        Events {
-            params: flags & 1 != 0
-                || self
-                    .shared
-                    .callback
-                    .parameter_edits_overflow
-                    .swap(false, Ordering::AcqRel),
-            parameter_edits,
-            latency: flags & 2 != 0,
-            closed: std::mem::take(&mut self.closed),
-            resized: self.resized.take(),
-            fault: self.shared.callback.invalid.load(Ordering::Acquire),
+        PluginEvents {
+            params_changed: flags & 1 != 0 || self.shared.callback.notifications.take_overflow(),
+            parameter_edits: self.shared.callback.notifications.drain(),
+            latency_changed: (flags & 2 != 0).then_some(self.info.latency),
+            editor_closed: std::mem::take(&mut self.closed),
+            editor_resized: self.resized.take(),
+            fault: self
+                .shared
+                .callback
+                .invalid
+                .load(Ordering::Acquire)
+                .then_some(RESTART_REQUIRED),
         }
     }
 }
@@ -903,7 +910,10 @@ fn resize_vst2(control: &Control<'_>, window: &EditorWindow) -> Result<(), Plugi
     if rect.is_null() {
         return Err(PluginError("plugin returned no editor rectangle".into()));
     }
-    // SAFETY: plugin-owned rectangle is valid until the next foreign dispatcher call.
+    if !rect.is_aligned() {
+        return Err(PluginError("misaligned editor rectangle".into()));
+    }
+    // SAFETY: plugin-owned aligned rectangle is valid until the next foreign dispatcher call.
     let rect = unsafe { rect.read() };
     let width = i32::from(rect.right) - i32::from(rect.left);
     let height = i32::from(rect.bottom) - i32::from(rect.top);
@@ -1024,7 +1034,7 @@ impl Vst2Processor {
                                 continue;
                             }
                             let set = set.expect("validated setter");
-                            let _notifications = NotificationGuard::enter();
+                            let _notifications = SuppressNotifications::enter();
                             // SAFETY: admitted instance, validated parameter index and normalized value.
                             unsafe { set(self.shared.effect(), id, value as f32) };
                         }
@@ -1105,12 +1115,21 @@ impl Vst2Processor {
                 }
                 let mut inputs = [std::ptr::null(); 64];
                 let mut outputs = [std::ptr::null_mut(); 64];
-                for (pointer, plane) in inputs.iter_mut().zip(planes.iter()).take(self.inputs) {
-                    *pointer = plane.as_ptr().wrapping_add(start);
-                }
-                for (pointer, plane) in outputs.iter_mut().zip(planes.iter_mut()).take(self.outputs)
+                // One pointer per plane serves both arrays. Deriving the input
+                // pointer from a shared borrow and then reborrowing the same plane
+                // mutably would invalidate it before the plugin reads through it.
+                for (channel, plane) in planes
+                    .iter_mut()
+                    .enumerate()
+                    .take(self.inputs.max(self.outputs))
                 {
-                    *pointer = plane.as_mut_ptr().wrapping_add(start);
+                    let pointer = plane.as_mut_ptr().wrapping_add(start);
+                    if channel < self.inputs {
+                        inputs[channel] = pointer.cast_const();
+                    }
+                    if channel < self.outputs {
+                        outputs[channel] = pointer;
+                    }
                 }
                 if self.shared.callback.io_pending.load(Ordering::Acquire) {
                     return false;
@@ -1193,13 +1212,22 @@ unsafe extern "C" fn callback(
             1
         }
         43 | 44 => {
-            notify_parameter_edit(state, index, if opcode == 43 { 0 } else { 2 }, 0.0);
+            notify_parameter_edit(
+                state,
+                index,
+                if opcode == 43 {
+                    EditPhase::Begin
+                } else {
+                    EditPhase::End
+                },
+                0.0,
+            );
             1
         }
         MASTER_SAMPLE_RATE => state.rate.load(Ordering::Relaxed) as isize,
         MASTER_BLOCK_SIZE => state.frames.load(Ordering::Relaxed) as isize,
         MASTER_AUTOMATE => {
-            notify_parameter_edit(state, index, 1, f64::from(option));
+            notify_parameter_edit(state, index, EditPhase::Perform, f64::from(option));
             1
         }
         MASTER_IO_CHANGED => {
@@ -1222,10 +1250,7 @@ unsafe extern "C" fn callback(
     }
 }
 
-fn notify_parameter_edit(state: &CallbackState, index: i32, phase: u8, value: f64) {
-    if SUPPRESS_NOTIFICATIONS.get() != 0 {
-        return;
-    }
+fn notify_parameter_edit(state: &CallbackState, index: i32, phase: EditPhase, value: f64) {
     if index < 0
         || index as u32 >= state.parameter_count.load(Ordering::Relaxed)
         || !value.is_finite()
@@ -1234,33 +1259,17 @@ fn notify_parameter_edit(state: &CallbackState, index: i32, phase: u8, value: f6
         state.flags.fetch_or(1, Ordering::Release);
         return;
     }
-    let edit = (index as u32, phase, value);
-    if state.parameter_edits.push(edit).is_err() {
-        state
-            .parameter_edits_overflow
-            .store(true, Ordering::Release);
-        let _ = state.parameter_edits.pop();
-        let _ = state.parameter_edits.push(edit);
-    }
+    state.notifications.push(ParameterEdit {
+        id: index as u32,
+        phase,
+        value,
+    });
 }
 
 const RESTART_REQUIRED: &str = "plugin changed its channel or parameter count; restart required";
 thread_local! {
     static CURRENT_ID: Cell<i32> = const { Cell::new(0) };
     static PROCESS_LEVEL: Cell<isize> = const { Cell::new(1) };
-    static SUPPRESS_NOTIFICATIONS: Cell<u32> = const { Cell::new(0) };
-}
-struct NotificationGuard;
-impl NotificationGuard {
-    fn enter() -> Self {
-        SUPPRESS_NOTIFICATIONS.set(SUPPRESS_NOTIFICATIONS.get() + 1);
-        Self
-    }
-}
-impl Drop for NotificationGuard {
-    fn drop(&mut self) {
-        SUPPRESS_NOTIFICATIONS.set(SUPPRESS_NOTIFICATIONS.get() - 1);
-    }
 }
 struct ProcessingThread(isize);
 impl ProcessingThread {

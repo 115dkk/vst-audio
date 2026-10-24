@@ -222,6 +222,15 @@ These policies are defense in depth, not a guarantee that arbitrary hostile
 native code cannot interact with the user's session. They deliberately retain
 GUI IPC and read access and do not replace stronger per-app isolation.
 
+The shared audio mapping is created by the application and the worker receives
+a writable descriptor to it, with or without a sandbox. On Linux that file is a
+`memfd` sealed against shrinking and growing, so a compromised worker cannot
+remove pages under the application's view. Windows pagefile-backed sections
+have a fixed size. macOS has no file seals: a compromised worker that truncates
+the private temporary backing file faults the application (`SIGBUS`) the next
+time it touches the mapping. This is a known macOS limitation of the current
+transport, not something the sandbox policy prevents.
+
 Run `xvfb-run -a python3 tools/native_tests.py` for the sandbox probes. The tests
 first prove the unsandboxed fixture can connect/write/execute, then assert the
 default, network-allowed and directory-allowed outcomes while numeric audio and

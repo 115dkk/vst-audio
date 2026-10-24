@@ -92,9 +92,13 @@ unsafe extern "C" fn x11_error_handler(_display: *mut c_void, error: *mut XError
     if !error.is_null() {
         // SAFETY: Xlib invokes the handler synchronously with a readable XErrorEvent.
         let error = unsafe { &*error };
-        eprintln!(
-            "X11 protocol error: code={} request={}.{} resource={:#x}",
-            error.error_code, error.request_code, error.minor_code, error._resource_id
+        // A failed stderr write must not panic inside this C callback.
+        let _ = std::io::Write::write_fmt(
+            &mut std::io::stderr().lock(),
+            format_args!(
+                "X11 protocol error: code={} request={}.{} resource={:#x}\n",
+                error.error_code, error.request_code, error.minor_code, error._resource_id
+            ),
         );
     }
     0

@@ -1,6 +1,6 @@
 //! Bounded seekable storage used by the main-thread VST 3 IBStream adapter.
 use std::io::{self, Read, Seek, SeekFrom, Write};
-const LIMIT: u64 = 64 * 1024 * 1024 - 8;
+const LIMIT: u64 = vst_audio_protocol::MAX_STATE_BODY_BYTES as u64;
 #[derive(Debug, Default)]
 pub struct StateBuffer(std::io::Cursor<Vec<u8>>);
 impl StateBuffer {
@@ -24,6 +24,17 @@ impl StateBuffer {
     }
     pub fn position(&self) -> u64 {
         self.0.position()
+    }
+    /// The bytes from the current position to the end; empty past the end.
+    pub fn remaining(&self) -> &[u8] {
+        let bytes = self.0.get_ref();
+        let start = usize::try_from(self.position()).unwrap_or(usize::MAX);
+        bytes.get(start..).unwrap_or(&[])
+    }
+    /// Moves the position forward by `count` bytes already consumed via `remaining`.
+    pub fn advance(&mut self, count: usize) {
+        let position = self.position().saturating_add(count as u64);
+        self.0.set_position(position);
     }
 }
 impl Read for StateBuffer {
@@ -80,6 +91,19 @@ mod tests {
         assert!(stream.seek(SeekFrom::Start(LIMIT + 1)).is_err());
         stream.seek(SeekFrom::Start(LIMIT)).unwrap();
         assert!(stream.write(&[1]).is_err());
+    }
+
+    #[test]
+    fn remaining_and_advance_follow_the_cursor() {
+        let mut stream = StateBuffer::new(vec![1, 2, 3]);
+        assert_eq!(stream.remaining(), [1, 2, 3]);
+        stream.advance(2);
+        assert_eq!(stream.remaining(), [3]);
+        assert_eq!(stream.position(), 2);
+        stream.advance(5);
+        assert!(stream.remaining().is_empty());
+        let mut bytes = [0; 1];
+        assert_eq!(stream.read(&mut bytes).unwrap(), 0);
     }
 
     #[test]

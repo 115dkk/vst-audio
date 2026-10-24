@@ -16,10 +16,11 @@ fuzz_target!(|data: &[u8]| {
         sample_rate: 48000,
         latency_bound_frames: 256,
     };
-    let words: Vec<_> = (0..geometry.total_bytes().unwrap() / 4 - 32)
+    let total = geometry.total_bytes().unwrap();
+    let words: Vec<_> = (0..geometry.mapping_split(total).unwrap() / 4)
         .map(|_| AtomicU32::new(0))
         .collect();
-    let counters: Vec<_> = (0..16).map(|_| AtomicU64::new(0)).collect();
+    let counters: Vec<_> = (0..COUNTER_WORDS).map(|_| AtomicU64::new(0)).collect();
     let region = Region::new(&words, &counters);
     let event = InProcessEvent::new();
     let mut producer = Producer::new(region, [None, None], &event);

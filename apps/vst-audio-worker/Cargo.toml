@@ -1,6 +1,8 @@
 [package]
 name = "vst-audio-worker"
 description = "Isolated VST2 and VST3 worker executable for vst-audio"
+keywords = ["vst", "vst3", "audio", "plugin-host", "sandbox"]
+categories = ["multimedia::audio", "command-line-utilities"]
 readme.workspace = true
 version.workspace = true
 edition.workspace = true

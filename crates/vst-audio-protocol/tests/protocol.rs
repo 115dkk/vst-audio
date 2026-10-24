@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeSet;
 use std::io::Cursor;
 
 use vst_audio_protocol::{
@@ -64,8 +65,7 @@ fn round_trip(message: Message) {
     );
 }
 
-#[test]
-fn codec_round_trips_every_message() {
+fn every_message() -> Vec<Message> {
     let id = [9; 16];
     let buses = vec![BusInfo {
         layout: Bus {
@@ -76,7 +76,7 @@ fn codec_round_trips_every_message() {
         name: "Sidechain".into(),
         default_active: false,
     }];
-    for message in [
+    vec![
         Message::hello(),
         Message::Sandboxed {
             mechanism: "landlock-abi-7+seccomp".into(),
@@ -92,6 +92,35 @@ fn codec_round_trips_every_message() {
             in_channels: 2,
             out_channels: 6,
         },
+        Message::Prepare(vst_audio_protocol::ProcessingSetup {
+            sample_rate: 48_000,
+            quantum: 480,
+            sample_format: vst_audio_protocol::SampleFormat::F64,
+            offline: true,
+            inputs: vec![vst_audio_protocol::BusConfiguration {
+                layout: Bus {
+                    channels: 2,
+                    arrangement: 3,
+                },
+                active: true,
+            }],
+            outputs: vec![vst_audio_protocol::BusConfiguration {
+                layout: Bus {
+                    channels: 6,
+                    arrangement: 0x3f,
+                },
+                active: true,
+            }],
+        }),
+        Message::Describe,
+        Message::Features(vst_audio_protocol::Capabilities {
+            f64: true,
+            input_event_buses: 1,
+            output_event_buses: 2,
+            editor: true,
+            sysex: true,
+            sample_accurate_parameters: true,
+        }),
         Message::Activate,
         Message::SetState {
             blob: vec![1, 2, 3],
@@ -101,13 +130,13 @@ fn codec_round_trips_every_message() {
             scaling: vst_audio_protocol::EditorScaling::Auto,
         },
         Message::OpenEditorIn {
-            parent: vst_audio_protocol::ParentWindow::Win32 { hwnd: u64::MAX },
-            scaling: vst_audio_protocol::EditorScaling::Stretch,
-        },
-        Message::OpenEditorIn {
             parent: vst_audio_protocol::ParentWindow::X11 { window: 0x12345678 },
             scaling: vst_audio_protocol::EditorScaling::Off,
         },
+        Message::Editor(vst_audio_protocol::EditorAction::Resize {
+            width: 640,
+            height: 480,
+        }),
         Message::EditorStatus(vst_audio_protocol::EditorStatus {
             platform: vst_audio_protocol::EditorPlatform::Wayland,
             scaling: vst_audio_protocol::EditorScaling::Plugin,
@@ -119,7 +148,32 @@ fn codec_round_trips_every_message() {
             resize_supported: true,
             scale_supported: false,
         }),
+        Message::EditorImage(vst_audio_protocol::EditorImage {
+            width: 2,
+            height: 1,
+            rgba: vec![255, 0, 0, 255, 0, 255, 0, 255],
+        }),
         Message::CloseEditor,
+        Message::ListParameters { start: 3, count: 4 },
+        Message::Parameters {
+            total: 1,
+            entries: vec![vst_audio_protocol::Parameter {
+                id: 7,
+                name: "Gain".into(),
+                unit: "dB".into(),
+                value: 0.5,
+                default: Some(0.25),
+                steps: Some(100),
+                automatable: true,
+                read_only: false,
+                hidden: false,
+            }],
+        },
+        Message::SetParameter { id: 7, value: 0.75 },
+        Message::RequestError {
+            code: 17,
+            text: "unsupported".into(),
+        },
         Message::Shutdown,
         Message::Scan {
             path: "plugin.dll".into(),
@@ -159,11 +213,44 @@ fn codec_round_trips_every_message() {
             phase: EditPhase::Perform,
             value: 0.5,
         },
-        Message::Scan {
-            path: "C:\\".to_owned() + &"a".repeat(MAX_STRING_BYTES - 3),
-        },
-    ] {
+    ]
+}
+
+#[test]
+fn codec_round_trips_every_message() {
+    for message in every_message() {
         round_trip(message);
+    }
+    // Edge cases of kinds already in the list above: the other parent window
+    // encoding and a string at the length bound.
+    round_trip(Message::OpenEditorIn {
+        parent: vst_audio_protocol::ParentWindow::Win32 { hwnd: u64::MAX },
+        scaling: vst_audio_protocol::EditorScaling::Stretch,
+    });
+    round_trip(Message::Scan {
+        path: "C:\\".to_owned() + &"a".repeat(MAX_STRING_BYTES - 3),
+    });
+}
+
+#[test]
+fn message_kinds_are_complete_unique_and_round_trip() {
+    let messages = every_message();
+    let kinds: BTreeSet<_> = messages.iter().map(Message::kind).collect();
+    assert_eq!(messages.len(), kinds.len());
+    assert_eq!(kinds, (1..=32).collect());
+
+    for message in messages {
+        let kind = message.kind();
+        let frame = Frame {
+            flags: 0,
+            request: kind.into(),
+            message,
+        };
+        let encoded = encode_frame(&frame).unwrap();
+        let DecodedFrame::Known(decoded) = decode_frame(&encoded).unwrap() else {
+            panic!("known kind decoded as unknown");
+        };
+        assert_eq!(decoded.message.kind(), kind);
     }
 }
 

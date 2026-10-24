@@ -329,7 +329,10 @@ impl IAudioProcessorTrait for Matrix {
                     let value = if channel == 0 {
                         0.123456789012345 * gate * gain
                     } else {
-                        (context.projectTimeSamples + frame as i64) as f64 * 0.000001 * gate
+                        // Hosts may legitimately report positions near i64::MAX; saturate like the ring does.
+                        context.projectTimeSamples.saturating_add(frame as i64) as f64
+                            * 0.000001
+                            * gate
                     };
                     // SAFETY: fixture declares one stereo output; helper validates bus/channel presence.
                     unsafe { write_sample(data, 0, channel, frame, value) };

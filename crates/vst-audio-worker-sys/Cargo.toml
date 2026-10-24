@@ -1,6 +1,8 @@
 [package]
 name = "vst-audio-worker-sys"
 description = "Internal native plugin ABI and editor implementation for vst-audio workers"
+keywords = ["vst", "vst3", "audio", "plugin", "ffi"]
+categories = ["multimedia::audio", "external-ffi-bindings"]
 readme.workspace = true
 version.workspace = true
 edition.workspace = true

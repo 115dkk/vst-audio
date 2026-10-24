@@ -169,8 +169,7 @@ impl BlockEndpoint {
     }
 
     pub(crate) fn running(&self) -> bool {
-        matches!(self.shared.status.load(Ordering::Acquire), 0 | 3)
-            && self.shared.generation.load(Ordering::Acquire) == self.active.generation
+        self.gate_open()
     }
 
     pub(crate) fn process_slots_after_adopt<W, R>(&mut self, write: W, read: R) -> BlockStatus
@@ -181,14 +180,17 @@ impl BlockEndpoint {
         self.process_ready(write, read)
     }
 
+    fn gate_open(&self) -> bool {
+        self.shared.lifecycle().processing_allowed()
+            && self.shared.generation.load(Ordering::Acquire) == self.active.generation
+    }
+
     fn process_ready<W, R>(&mut self, write: W, read: R) -> BlockStatus
     where
         W: FnOnce(&mut SlotWriter<'_>),
         R: FnOnce(SlotReader<'_>),
     {
-        if !matches!(self.shared.status.load(Ordering::Acquire), 0 | 3)
-            || self.shared.generation.load(Ordering::Acquire) != self.active.generation
-        {
+        if !self.gate_open() {
             self.active.lane.skip();
             return BlockStatus::Missed;
         }

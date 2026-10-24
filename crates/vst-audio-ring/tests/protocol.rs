@@ -27,8 +27,23 @@ fn header_layout_is_pinned() {
     assert_eq!(vst_audio_ring::MAGIC.to_le_bytes(), *b"SSRR");
     assert_eq!(vst_audio_ring::LAYOUT_VERSION, 4);
     assert_eq!(vst_audio_ring::HEADER_BYTES, 512);
+    assert_eq!(vst_audio_ring::MIN_REGION_BYTES, 640);
+    assert_eq!(vst_audio_ring::LATENCY_BOUND_OFFSET, 32);
     assert_eq!(geometry(1).total_bytes().unwrap(), 299_008);
     assert_eq!(geometry(2).total_bytes().unwrap(), 597_376);
+}
+
+#[test]
+fn mapping_split_is_aligned_and_bounded() {
+    let geometry = geometry(1);
+    let total = geometry.total_bytes().unwrap();
+    let split = geometry.mapping_split(total).unwrap();
+    assert_eq!(split, total - vst_audio_ring::COUNTER_BYTES);
+    assert_eq!(split % vst_audio_ring::CACHE_LINE, 0);
+    assert_eq!(
+        geometry.mapping_split(total - 1),
+        Err(vst_audio_ring::GeometryError::RegionTooLarge)
+    );
 }
 
 #[test]
@@ -272,10 +287,11 @@ fn hostile_headers_are_rejected() {
         (18, 3, HeaderError::LaneGeometry),
     ];
     for &(index, value, expected) in cases {
-        let prefix: Vec<_> = (0..geometry(1).total_bytes().unwrap() / 4 - 32)
+        let total = geometry(1).total_bytes().unwrap();
+        let prefix: Vec<_> = (0..geometry(1).mapping_split(total).unwrap() / 4)
             .map(|_| std::sync::atomic::AtomicU32::new(0))
             .collect();
-        let counters: Vec<_> = (0..16)
+        let counters: Vec<_> = (0..vst_audio_ring::COUNTER_WORDS)
             .map(|_| std::sync::atomic::AtomicU64::new(0))
             .collect();
         let event = InProcessEvent::new();
@@ -290,10 +306,11 @@ fn hostile_headers_are_rejected() {
 
 #[test]
 fn cached_geometry_ignores_later_header_mutation() {
-    let prefix: Vec<_> = (0..geometry(1).total_bytes().unwrap() / 4 - 32)
+    let total = geometry(1).total_bytes().unwrap();
+    let prefix: Vec<_> = (0..geometry(1).mapping_split(total).unwrap() / 4)
         .map(|_| std::sync::atomic::AtomicU32::new(0))
         .collect();
-    let counters: Vec<_> = (0..16)
+    let counters: Vec<_> = (0..vst_audio_ring::COUNTER_WORDS)
         .map(|_| std::sync::atomic::AtomicU64::new(0))
         .collect();
     let event = InProcessEvent::new();
@@ -341,7 +358,7 @@ fn corrupt_and_truncated_regions_are_rejected_at_boundary() {
     let prefix: Vec<_> = (0..128)
         .map(|_| std::sync::atomic::AtomicU32::new(0))
         .collect();
-    let counters: Vec<_> = (0..16)
+    let counters: Vec<_> = (0..vst_audio_ring::COUNTER_WORDS)
         .map(|_| std::sync::atomic::AtomicU64::new(0))
         .collect();
     let region = Region::new(&prefix, &counters);

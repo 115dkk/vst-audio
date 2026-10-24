@@ -1,6 +1,6 @@
 //! Executes foreign calls exclusively inside the worker.
 use crate::{
-    Plugin, PluginError, PluginEvents, PluginInfo, Processor,
+    EditPhase, ParameterEdit, Plugin, PluginError, PluginEvents, PluginInfo, Processor,
     host::{Args, AudioBuffer},
     layout::{default_arrangement, vst2_arrangement},
 };
@@ -31,6 +31,13 @@ fn error(error: impl std::fmt::Display) -> StartError {
 }
 fn plugin_error(error: impl std::fmt::Display) -> PluginError {
     PluginError(error.to_string())
+}
+fn loaded<'a>(
+    plugin: &'a mut Option<Box<dyn Plugin>>,
+) -> Result<&'a mut (dyn Plugin + 'static), StartError> {
+    plugin
+        .as_deref_mut()
+        .ok_or_else(|| StartError("Load required".into()))
 }
 
 #[derive(Debug)]
@@ -245,18 +252,7 @@ impl Plugin for Vst2 {
         self.inner.idle();
     }
     fn take_events(&mut self) -> PluginEvents {
-        let events = self.inner.take_events();
-        self.info.latency_frames = self.inner.info().latency;
-        PluginEvents {
-            params_changed: events.params,
-            parameter_edits: events.parameter_edits,
-            latency_changed: events.latency.then_some(self.info.latency_frames),
-            editor_closed: events.closed,
-            editor_resized: events.resized,
-            fault: events
-                .fault
-                .then_some("plugin changed its channel or parameter count; restart required"),
-        }
+        self.inner.take_events()
     }
 }
 
@@ -365,6 +361,7 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
     let mut plugin: Option<Box<dyn Plugin>> = None;
     let mut configured = false;
     let mut failed = false;
+    let mut reported_latency: Option<u32> = None;
     // Always join audio before lifecycle teardown, including malformed frames
     // and broken control pipes (early ? returns must not detach the audio thread).
     let result = (|| -> Result<(), StartError> {
@@ -463,6 +460,7 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
                                 ),
                             };
                             let info = loaded.info();
+                            reported_latency = Some(info.latency_frames);
                             plugin = Some(loaded);
                             Ok(Message::Loaded {
                                 name: info.name,
@@ -472,12 +470,9 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
                                 outputs: info.outputs,
                             })
                         }
-                        Message::Describe => Ok(Message::Features(
-                            plugin
-                                .as_ref()
-                                .ok_or_else(|| StartError("Load required".into()))?
-                                .capabilities(),
-                        )),
+                        Message::Describe => {
+                            Ok(Message::Features(loaded(&mut plugin)?.capabilities()))
+                        }
                         Message::Prepare(setup) if !configured => {
                             if !setup.valid() {
                                 return Err(StartError("invalid audio configuration".into()));
@@ -488,13 +483,10 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
                                 vst_audio_protocol::ProcessingSetup::channels(&setup.inputs);
                             let out_channels =
                                 vst_audio_protocol::ProcessingSetup::channels(&setup.outputs);
-                            let plugin = plugin
-                                .as_mut()
-                                .ok_or_else(|| StartError("Load required".into()))?;
-                            let previous_latency = plugin.info().latency_frames;
+                            let plugin = loaded(&mut plugin)?;
                             plugin.configure_audio(&setup).map_err(error)?;
                             let latency = plugin.info().latency_frames;
-                            if latency != previous_latency {
+                            if Some(latency) != reported_latency {
                                 write_frame(
                                     &mut output,
                                     &Frame {
@@ -504,6 +496,7 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
                                     },
                                 )
                                 .map_err(error)?;
+                                reported_latency = Some(latency);
                             }
                             let geometry = Geometry {
                                 sample_format: setup.sample_format,
@@ -536,7 +529,7 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
                                 let valid = result == Ok(geometry);
                                 let _ = validated.send(valid);
                                 if !valid {
-                                    consumer.fault(1);
+                                    consumer.fault(vst_audio_ring::Fault::LayoutMismatch as u32);
                                     return;
                                 }
                                 while !stop.load(Ordering::Acquire) {
@@ -569,45 +562,28 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
                             Ok(Message::Ack)
                         }
                         Message::SetState { blob } => {
-                            plugin
-                                .as_mut()
-                                .ok_or_else(|| StartError("Load required".into()))?
-                                .set_state(&blob)
-                                .map_err(error)?;
+                            loaded(&mut plugin)?.set_state(&blob).map_err(error)?;
                             Ok(Message::Ack)
                         }
                         Message::GetState => Ok(Message::State {
-                            blob: plugin
-                                .as_mut()
-                                .ok_or_else(|| StartError("Load required".into()))?
-                                .get_state()
-                                .map_err(error)?,
+                            blob: loaded(&mut plugin)?.get_state().map_err(error)?,
                         }),
-                        Message::Editor(action) => match plugin
-                            .as_mut()
-                            .ok_or_else(|| StartError("Load required".into()))?
-                            .editor_action(action)
-                            .map_err(error)?
-                        {
-                            vst_audio_protocol::EditorReply::Status(s) => {
-                                Ok(Message::EditorStatus(s))
+                        Message::Editor(action) => {
+                            match loaded(&mut plugin)?.editor_action(action).map_err(error)? {
+                                vst_audio_protocol::EditorReply::Status(s) => {
+                                    Ok(Message::EditorStatus(s))
+                                }
+                                vst_audio_protocol::EditorReply::Image(i) => {
+                                    Ok(Message::EditorImage(i))
+                                }
                             }
-                            vst_audio_protocol::EditorReply::Image(i) => {
-                                Ok(Message::EditorImage(i))
-                            }
-                        },
+                        }
                         Message::OpenEditor { scaling } => {
-                            plugin
-                                .as_mut()
-                                .ok_or_else(|| StartError("Load required".into()))?
-                                .open_editor(scaling)
-                                .map_err(error)?;
+                            loaded(&mut plugin)?.open_editor(scaling).map_err(error)?;
                             Ok(Message::Ack)
                         }
                         Message::OpenEditorIn { parent, scaling } => {
-                            let plugin = plugin
-                                .as_mut()
-                                .ok_or_else(|| StartError("Load required".into()))?;
+                            let plugin = loaded(&mut plugin)?;
                             plugin.open_editor_in(parent, scaling).map_err(|failure| {
                                 // Windows may refuse a Low-integrity child of a higher
                                 // parent; the native error stays in diagnostics.
@@ -626,25 +602,17 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
                             Ok(Message::Ack)
                         }
                         Message::CloseEditor => {
-                            plugin
-                                .as_mut()
-                                .ok_or_else(|| StartError("Load required".into()))?
-                                .close_editor()
-                                .map_err(error)?;
+                            loaded(&mut plugin)?.close_editor().map_err(error)?;
                             Ok(Message::Ack)
                         }
                         Message::ListParameters { start, count } => {
-                            let (total, entries) = plugin
-                                .as_mut()
-                                .ok_or_else(|| StartError("Load required".into()))?
+                            let (total, entries) = loaded(&mut plugin)?
                                 .parameters(start, count)
                                 .map_err(error)?;
                             Ok(Message::Parameters { total, entries })
                         }
                         Message::SetParameter { id, value } => {
-                            plugin
-                                .as_mut()
-                                .ok_or_else(|| StartError("Load required".into()))?
+                            loaded(&mut plugin)?
                                 .set_parameter(id, value)
                                 .map_err(error)?;
                             Ok(Message::Ack)
@@ -721,45 +689,46 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
                     failed = true;
                     break;
                 }
-                let mut pending_perform: Option<(u32, f64)> = None;
-                for (id, phase, value) in events.parameter_edits {
-                    if phase == 1 && pending_perform.is_some_and(|(pending, _)| pending == id) {
-                        pending_perform = Some((id, value));
+                let mut pending_perform: Option<ParameterEdit> = None;
+                for edit in events.parameter_edits {
+                    if edit.phase == EditPhase::Perform
+                        && pending_perform.is_some_and(|pending| pending.id == edit.id)
+                    {
+                        pending_perform = Some(edit);
                         continue;
                     }
-                    if let Some((id, value)) = pending_perform.take() {
+                    if let Some(pending) = pending_perform.take() {
                         send(Message::ParameterEdit {
-                            id,
-                            phase: vst_audio_protocol::EditPhase::Perform,
-                            value,
+                            id: pending.id,
+                            phase: pending.phase,
+                            value: pending.value,
                         })?;
                     }
-                    if phase == 1 {
-                        pending_perform = Some((id, value));
+                    if edit.phase == EditPhase::Perform {
+                        pending_perform = Some(edit);
                     } else {
                         send(Message::ParameterEdit {
-                            id,
-                            phase: if phase == 0 {
-                                vst_audio_protocol::EditPhase::Begin
-                            } else {
-                                vst_audio_protocol::EditPhase::End
-                            },
-                            value,
+                            id: edit.id,
+                            phase: edit.phase,
+                            value: edit.value,
                         })?;
                     }
                 }
-                if let Some((id, value)) = pending_perform {
+                if let Some(pending) = pending_perform {
                     send(Message::ParameterEdit {
-                        id,
-                        phase: vst_audio_protocol::EditPhase::Perform,
-                        value,
+                        id: pending.id,
+                        phase: pending.phase,
+                        value: pending.value,
                     })?;
                 }
                 if events.params_changed {
                     send(Message::ParamsChanged)?;
                 }
-                if let Some(frames) = events.latency_changed {
+                if let Some(frames) = events.latency_changed
+                    && Some(frames) != reported_latency
+                {
                     send(Message::LatencyChanged { frames })?;
+                    reported_latency = Some(frames);
                 }
                 if let Some((width, height)) = events.editor_resized {
                     send(Message::EditorResized { width, height })?;

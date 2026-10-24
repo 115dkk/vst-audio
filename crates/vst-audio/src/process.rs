@@ -1,5 +1,5 @@
 //! Application-side process proxy. Never calls a plugin ABI.
-use crate::watch::ControlWatch;
+use crate::watch::{ControlWatch, elapsed_ms};
 use std::{
     ffi::OsString,
     io::{Read, Write},
@@ -329,8 +329,7 @@ impl PluginControl {
         self.watch.states.clone()
     }
     fn now(&self) -> u64 {
-        self.clock_base
-            .saturating_add(self.origin.elapsed().as_millis().min(u128::from(u64::MAX)) as u64)
+        elapsed_ms(self.clock_base, self.origin)
     }
     fn request(&mut self, message: Message, kind: RequestKind) -> Result<u32, StartError> {
         let id = self.next_request;
@@ -358,7 +357,7 @@ impl PluginControl {
         self.request(Message::GetState, RequestKind::StateSave)
     }
     pub fn set_state(&mut self, blob: &[u8]) -> Result<u32, StartError> {
-        if blob.len() > vst_audio_protocol::MAX_STATE_BYTES - 8 {
+        if blob.len() > vst_audio_protocol::MAX_STATE_BODY_BYTES {
             return Err(StartError("state too large".into()));
         }
         self.request(
@@ -486,6 +485,7 @@ impl PluginControl {
         std::mem::replace(&mut self.watch, ControlWatch::new(now))
     }
     /// `now_ms` uses the same caller-owned clock as subsequent `poll` calls.
+    /// Replays the restored watch's latency into its new running state.
     pub fn restore_watch(&mut self, mut watch: ControlWatch, now_ms: u64) {
         let hello = Frame {
             flags: 0,
@@ -493,6 +493,7 @@ impl PluginControl {
             message: Message::hello(),
         };
         watch.received(now_ms, &hello);
+        let latency_frames = watch.latency();
         watch.received(
             now_ms,
             &Frame {
@@ -501,7 +502,7 @@ impl PluginControl {
                 message: Message::Loaded {
                     name: String::new(),
                     vendor: String::new(),
-                    latency_frames: self.latency(),
+                    latency_frames,
                     inputs: vec![],
                     outputs: vec![],
                 },

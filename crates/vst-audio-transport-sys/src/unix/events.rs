@@ -1,11 +1,22 @@
 #![allow(unsafe_code)]
-//! Bounded nonblocking pipe wakeups; counts are hints, ring sequences are truth.
+//! Bounded nonblocking wakeups; counts are hints, ring sequences are truth.
+//!
+//! A wakeup is a one-byte datagram on a connected Unix socket pair, sent and
+//! received with a per-call `MSG_DONTWAIT`. The worker shares these open file
+//! descriptions, so a flag it could change (`O_NONBLOCK`) must never decide
+//! whether the application's realtime thread blocks.
 use std::{
     io,
-    os::fd::{AsRawFd, OwnedFd},
+    os::{
+        fd::{AsRawFd, OwnedFd},
+        unix::net::UnixDatagram,
+    },
     sync::Arc,
     time::Duration,
 };
+
+/// Stale wakeups drained per wait; a flooding peer cannot keep this looping.
+const DRAIN_LIMIT: usize = 64;
 use vst_audio_ring::{Signal, Wait, Waited};
 
 #[derive(Debug)]
@@ -16,10 +27,10 @@ pub struct Event {
 }
 impl Event {
     pub fn create() -> io::Result<Self> {
-        let (read, write) = crate::runtime::pipe(true)?;
+        let (read, write) = UnixDatagram::pair()?;
         Ok(Self {
-            read,
-            write,
+            read: read.into(),
+            write: write.into(),
             peer: None,
         })
     }
@@ -41,9 +52,17 @@ impl Event {
 impl Signal for Event {
     fn signal(&self) {
         let byte = 1u8;
-        // SAFETY: live nonblocking pipe descriptor and one readable stack byte.
-        // A full pipe already represents a wakeup; EAGAIN is intentionally ignored.
-        unsafe { libc::write(self.write.as_raw_fd(), (&byte as *const u8).cast(), 1) };
+        // SAFETY: owned connected socket and one readable stack byte. MSG_DONTWAIT
+        // keeps the call nonblocking whatever the shared O_NONBLOCK flag says; a
+        // full queue (EAGAIN) already represents a pending wakeup.
+        unsafe {
+            libc::send(
+                self.write.as_raw_fd(),
+                (&byte as *const u8).cast(),
+                1,
+                libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+            )
+        };
     }
 }
 impl Wait for Event {
@@ -82,15 +101,22 @@ impl Wait for Event {
             return Waited::PeerGone;
         }
         if fds[0].revents & libc::POLLIN != 0 {
-            let mut bytes = [0u8; 256];
-            // SAFETY: writable stack buffer; read is nonblocking and bounded.
-            unsafe {
-                libc::read(
-                    self.read.as_raw_fd(),
-                    bytes.as_mut_ptr().cast(),
-                    bytes.len(),
-                )
-            };
+            let mut bytes = [0u8; 16];
+            for _ in 0..DRAIN_LIMIT {
+                // SAFETY: writable stack buffer; MSG_DONTWAIT bounds the call
+                // whatever the shared O_NONBLOCK flag says.
+                let received = unsafe {
+                    libc::recv(
+                        self.read.as_raw_fd(),
+                        bytes.as_mut_ptr().cast(),
+                        bytes.len(),
+                        libc::MSG_DONTWAIT,
+                    )
+                };
+                if received <= 0 {
+                    break;
+                }
+            }
             Waited::Signalled
         } else {
             Waited::PeerGone
@@ -113,6 +139,35 @@ mod tests {
         opened.signal();
         assert_eq!(event.wait(Duration::from_secs(1)), Waited::Signalled);
         assert!(Event::open(u64::MAX).is_err());
+    }
+
+    #[test]
+    fn signal_never_blocks_after_the_worker_clears_nonblocking() {
+        let event = Event::create().unwrap();
+        // The worker's duplicates share both open file descriptions.
+        let opened = Event::open(event.handle_value()).unwrap();
+        for fd in [opened.read.as_raw_fd(), opened.write.as_raw_fd()] {
+            // SAFETY: owned descriptor; clearing status flags has no pointer payload.
+            assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFL, 0) }, 0);
+        }
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for _ in 0..100_000 {
+                event.signal();
+            }
+            sender.send(()).unwrap();
+        });
+        assert!(
+            receiver.recv_timeout(Duration::from_secs(20)).is_ok(),
+            "signal blocked once the queue was full"
+        );
+        assert_eq!(opened.wait(Duration::from_secs(1)), Waited::Signalled);
+        // How many stale wakeups one wait drains depends on the platform's
+        // datagram queue depth; what must hold is that the pair still works
+        // after the rejected sends.
+        while opened.wait(Duration::from_millis(50)) == Waited::Signalled {}
+        opened.signal();
+        assert_eq!(opened.wait(Duration::from_secs(1)), Waited::Signalled);
     }
 }
 
