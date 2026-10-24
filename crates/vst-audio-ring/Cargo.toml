@@ -1,6 +1,8 @@
 [package]
 name = "vst-audio-ring"
 description = "Bounded atomic shared-memory audio block ring for isolated plugin workers"
+keywords = ["audio", "ring-buffer", "shared-memory", "lock-free", "ipc"]
+categories = ["multimedia::audio", "concurrency", "data-structures"]
 readme.workspace = true
 version.workspace = true
 edition.workspace = true

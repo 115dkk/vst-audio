@@ -1,6 +1,8 @@
 [package]
 name = "vst-audio-protocol"
 description = "Bounded control protocol and supervision state machines for vst-audio"
+keywords = ["vst", "audio", "ipc", "protocol", "plugin-host"]
+categories = ["multimedia::audio", "encoding"]
 readme.workspace = true
 version.workspace = true
 edition.workspace = true

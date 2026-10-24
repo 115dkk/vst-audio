@@ -1,6 +1,8 @@
 [package]
 name = "vst-audio-transport-sys"
 description = "Platform process and shared-memory ownership for vst-audio"
+keywords = ["ipc", "shared-memory", "sandbox", "process", "audio"]
+categories = ["os", "os::unix-apis", "os::windows-apis", "multimedia::audio"]
 readme.workspace = true
 version.workspace = true
 edition.workspace = true
