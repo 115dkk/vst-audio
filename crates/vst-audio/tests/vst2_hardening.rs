@@ -287,6 +287,23 @@ fn shell_child_limit() {
 
 #[test]
 #[ignore = "native fixtures required"]
+fn narrow_arrangement_keeps_declared_channels() {
+    if std::env::var_os("VST_AUDIO_TEST_NARROW_ARRANGEMENT").is_none() {
+        return;
+    }
+    let s = start(0);
+    let output = &s.declared_outputs[0].layout;
+    assert_eq!(output.channels, 6);
+    assert_eq!(
+        output.arrangement,
+        vst_audio_protocol::layout::default_arrangement(6).unwrap()
+    );
+    assert_eq!(block(&s, 1), 1.0);
+    println!("stereo arrangement on 6 declared outputs: 6 channels, types unknown");
+}
+
+#[test]
+#[ignore = "native fixtures required"]
 fn zero_program_parameter_state() {
     if std::env::var_os("VST_AUDIO_TEST_NO_CHUNKS").is_none() {
         return;

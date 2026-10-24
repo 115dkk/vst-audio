@@ -15,6 +15,10 @@ Pinned sources:
 - [VST3 SDK 3cdf9c](https://github.com/steinbergmedia/vst3sdk/tree/3cdf9ca5d1f5b1b21e0a86832aa4abe55607bd96):
   ADelay and mda DX10. SDK submodule commits are resolved from this pinned tree.
 
+On Linux the job also installs the distribution's `iem-plugin-suite-vst`, whose
+VST2 plugins are built with JUCE (Ubuntu 24.04: 1.14.1 with JUCE 7.0.5). The
+summary records the package version and the JUCE build it names.
+
 | Plugin | Required semantic assertion |
 |---|---|
 | DPF MIDI Through | All 16 MIDI channels; 96 note, pressure, CC and pitch-bend events retain type, values, bus and sample offset |
@@ -27,6 +31,7 @@ Pinned sources:
 | ADelay | Mismatched input/output arrangements are rejected |
 | mda DX10 | Program change plus note on/off reaches the real synth; the prefix before the note offset is silent and subsequent audio is finite and nonzero |
 | mda DX10 | Two fresh instances with identical events produce matching audio |
+| DPF Parameters, IEM SimpleDecoder, IEM StereoEncoder (Linux) | VST2 editors open at 96 and 192 `Xft.dpi`; the content scale request is accepted and the editor is exactly twice as large at 192. SimpleDecoder loads libX11 only when its editor opens and installs no X error handler; StereoEncoder declares 64 outputs and reports a narrower current speaker arrangement |
 
 Measurements record expected and observed values. A successful load or a
 non-crashing process is never sufficient to pass these tests. The suite proves

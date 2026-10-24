@@ -44,7 +44,8 @@ for variable, test in [("VST_AUDIO_TEST_CONFIGURE_LATENCY", "callbacks_time_late
                        ("VST_AUDIO_TEST_SHELL", "shell_children"),
                        ("VST_AUDIO_TEST_VST3_RESIZE", "resize_reaches_application_floating_and_embedded"),
                        ("VST_AUDIO_TEST_NO_CHUNKS", "zero_program_parameter_state"),
-                       ("VST_AUDIO_TEST_OPEN_COUNTS", "callbacks_time_latency_and_opaque_state")]:
+                       ("VST_AUDIO_TEST_OPEN_COUNTS", "callbacks_time_latency_and_opaque_state"),
+                       ("VST_AUDIO_TEST_NARROW_ARRANGEMENT", "narrow_arrangement_keeps_declared_channels")]:
     run("cargo", "test", "--locked", "-p", "vst-audio", "--test", "vst2_hardening", test,
         "--", "--ignored", "--nocapture", "--test-threads=1", env=dict(env, **{variable: "1"}))
 for count in (1024, 1025):

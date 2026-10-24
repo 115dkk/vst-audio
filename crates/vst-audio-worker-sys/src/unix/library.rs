@@ -28,6 +28,8 @@ impl Library {
         if path.is_dir() {
             return Self::load_bundle(&name);
         }
+        #[cfg(target_os = "linux")]
+        install_x11_error_handler();
         // SAFETY: terminated absolute path. Foreign initializers run exclusively
         // in the disposable worker; they are not assumed memory-safe.
         let handle = unsafe { libc::dlopen(name.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
@@ -47,8 +49,6 @@ impl Library {
                 path.display()
             )));
         }
-        #[cfg(target_os = "linux")]
-        install_x11_error_handler();
         Ok(Self {
             handle,
             #[cfg(target_os = "macos")]
@@ -100,26 +100,33 @@ unsafe extern "C" fn x11_error_handler(_display: *mut c_void, error: *mut XError
     0
 }
 
+/// Xlib's default error handler exits the process. A plugin that is not a
+/// standalone application leaves error handling to its host, and JUCE also loads
+/// libX11 itself only when its editor first needs it, after the plugin module is
+/// loaded. Load libX11 first and keep it loaded, so this handler is in place
+/// however the plugin reaches Xlib. Without libX11 no plugin can use X11.
 #[cfg(target_os = "linux")]
 fn install_x11_error_handler() {
-    // SAFETY: RTLD_NOLOAD only looks up an existing process handle and does not load libX11.
-    let x11 = unsafe { libc::dlopen(c"libX11.so.6".as_ptr(), libc::RTLD_NOW | libc::RTLD_NOLOAD) };
+    static X11: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let x11 = *X11.get_or_init(|| {
+        // SAFETY: loads the system Xlib by soname; the handle is never closed,
+        // because unloading libX11 would forget the registered handler.
+        unsafe { libc::dlopen(c"libX11.so.6".as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) as usize }
+    }) as *mut c_void;
     if x11.is_null() {
         return;
     }
-    // SAFETY: retained NOLOAD handle and terminated symbol name.
+    // SAFETY: retained libX11 handle and terminated symbol name.
     let symbol = unsafe { libc::dlsym(x11, c"XSetErrorHandler".as_ptr()) };
     if !symbol.is_null() {
         type SetErrorHandler = unsafe extern "C" fn(
             Option<unsafe extern "C" fn(*mut c_void, *mut XErrorEvent) -> i32>,
         ) -> *mut c_void;
-        // SAFETY: dlsym returned XSetErrorHandler from the already-loaded libX11.
+        // SAFETY: dlsym returned XSetErrorHandler from the retained libX11.
         let set_handler: SetErrorHandler = unsafe { std::mem::transmute(symbol) };
         // SAFETY: handler has Xlib's required calling convention and static lifetime.
         unsafe { set_handler(Some(x11_error_handler)) };
     }
-    // SAFETY: balance the RTLD_NOLOAD reference; libX11 remains loaded by its original owner.
-    unsafe { libc::dlclose(x11) };
 }
 
 impl Drop for Library {

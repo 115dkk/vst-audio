@@ -39,8 +39,9 @@ no plugin scale request. macOS retains its existing Retina behavior for all mode
 VST2 has no standard scale opcode, but plugins advertising
 `supportsViewDpiScaling` accept the de-facto vendor request: opcode 50,
 index `PreS` (`0x50726553`), value `AeCs` (`0x41654373`), null pointer and scale
-in `opt`. Send it before the first `effEditGetRect`, and reread the rectangle
-after later scale requests. Host-driven VST2 resize remains unsupported.
+in `opt`. Send it before the first `effEditGetRect`, repeat it once after
+`effEditOpen` because JUCE 6.0.0 to 6.1.2 apply it only to an open editor, and
+reread the rectangle after later scale requests. Host-driven VST2 resize remains unsupported.
 VST3 uses its optional content-scale interface before attachment and only
 reports plugin scaling when the request succeeds.
 

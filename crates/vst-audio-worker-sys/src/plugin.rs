@@ -270,8 +270,12 @@ impl Vst2Plugin {
                 }
                 // SAFETY: successful arrangement query returns its live header.
                 let channels = unsafe { (*pointer).channels };
+                // JUCE declares its widest supported channel count in
+                // numInputs/numOutputs and reports the current, possibly
+                // narrower, layout here. Buffers follow the declared counts,
+                // so a different arrangement leaves the speaker types unknown.
                 if channels != i32::from(count) {
-                    return Err(PluginError("speaker arrangement count mismatch".into()));
+                    return Ok(None);
                 }
                 // SAFETY: address of the first speaker only; do not reference a fixed-size
                 // struct since third-party plugins may allocate exactly channels entries.
@@ -672,6 +676,11 @@ impl Vst2Plugin {
             .editor_open
             .store(true, Ordering::Release);
         let opened = control.call(EDIT_OPEN, 0, 0, editor.handle_value() as *mut c_void, 0.0);
+        // JUCE 6.0.0 to 6.1.2 drop a scale that arrives before the editor
+        // exists. Repeat it; the rectangle read below picks up the new size.
+        if request && self.editor_scale != 1.0 {
+            set_vst2_scale(&control, self.editor_scale);
+        }
         let mut after = std::ptr::null::<Rect>();
         control.call(
             EDIT_GET_RECT,

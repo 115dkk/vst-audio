@@ -74,8 +74,17 @@ Use `Command::OpenEditorWith { parent, scaling }` or
 macOS retains its existing Retina behavior for every mode. Its status is `Off`
 unless the VST3 view has accepted a content-scale request.
 VST2 support requires `effCanDo("supportsViewDpiScaling") == 1`. The host sends
-`effVendorSpecific` with `PreS` / `AeCs` before the first editor rectangle query;
-explicit `EditorAction::Scale` uses the same request and rereads the rectangle.
+`effVendorSpecific` with `PreS` / `AeCs` before the first editor rectangle query
+and once more after `effEditOpen`, then rereads the rectangle; explicit
+`EditorAction::Scale` uses the same request and rereads the rectangle.
+JUCE answers the canDo from 5.3 on. Its VST2 wrapper keeps a scale received
+before the editor exists in 5.3 to 5.4 and from 6.1.3 on, but 6.0.0 to 6.1.2
+drop it and apply only a request made while the editor is open, which is why the
+request is repeated. JUCE on macOS ignores the request, and JUCE plugins on Linux
+do not follow `Xft.dpi` themselves, so without the request their editors stay
+at scale 1. These facts come from the JUCE sources of each release; plugins
+built with JUCE 6.0.7, 6.1.3 and 7.0.5 were also measured at 96 and 192 DPI
+under Xvfb. iPlug2 does not advertise `supportsViewDpiScaling`.
 A plugin-scaled VST2 editor is reset to scale 1 during teardown so a subsequent
 unscaled open does not inherit the old factor. An explicit scale request on a
 stretched Windows editor recreates the window in plugin-scaling mode.
@@ -103,8 +112,15 @@ editor opens, including embedded editors. The factor is DPI / 96, without
 rounding, clamped to 0.5–4.0; missing or invalid values use 1.0. Native Wayland
 continues to use compositor integer output scale for `Auto` and `Plugin`;
 `Off` skips plugin content-scale requests. X11 tests cover fixture sizes and
-pixels at 96 and 192 DPI; the independent DPF Parameters VST2 check compares
-its sizes at both DPIs through the public API.
+pixels at 96 and 192 DPI, including a fixture mode that drops a scale received
+before the editor exists; the independent DPF Parameters and JUCE (IEM) VST2
+checks compare their sizes at both DPIs through the public API.
+
+On Linux the worker loads libX11 before the plugin, when the library is
+installed, and registers an Xlib error handler that logs protocol errors.
+Xlib's default handler exits the process, a plugin that is not a standalone
+application leaves error handling to its host, and JUCE loads libX11 itself
+only when its editor first opens, so the handler has to be in place first.
 
 Run `python3 tools/wayland_tests.py`: Weston is required, not silently skipped.
 The native Wayland fixture is tested without `DISPLAY`; scale-2 captures show a

@@ -201,8 +201,9 @@ jobs:
           shared-key: independent
       - if: runner.os == 'Linux'
         # DPF editors need X11 and OpenGL to build; Xvfb with Mesa runs them
-        # and its XTEST extension delivers the synthetic mouse input.
-        run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update -qq && sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y cmake build-essential pkg-config libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxinerama-dev libgl1-mesa-dev libglu1-mesa-dev libgl1-mesa-dri xvfb xauth
+        # and its XTEST extension delivers the synthetic mouse input. The IEM
+        # suite supplies JUCE-built VST2 editors for the HiDPI check.
+        run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update -qq && sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y cmake build-essential pkg-config libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxinerama-dev libgl1-mesa-dev libglu1-mesa-dev libgl1-mesa-dri xvfb xauth iem-plugin-suite-vst
       - name: Build pinned upstreams; assert MIDI, DSP, negotiation and real editor input (Windows, macOS)
         if: runner.os != 'Linux'
         run: python tools/third_party.py

@@ -49,6 +49,8 @@ pub extern "C" fn VSTPluginMain(host: Callback) -> *mut AEffect {
     let child = unsafe { host(std::ptr::null_mut(), 2, 0, 0, std::ptr::null_mut(), 0.0) } as i32;
     let no_chunks = std::env::var_os("VST_AUDIO_TEST_NO_CHUNKS").is_some();
     let open_counts = std::env::var_os("VST_AUDIO_TEST_OPEN_COUNTS").is_some();
+    // JUCE declares its widest channel count and reports a narrower current layout.
+    let narrow = std::env::var_os("VST_AUDIO_TEST_NARROW_ARRANGEMENT").is_some();
     let instance = Box::new(Instance {
         effect: AEffect {
             dispatcher: Some(dispatch),
@@ -89,7 +91,11 @@ pub extern "C" fn VSTPluginMain(host: Callback) -> *mut AEffect {
         control: UnsafeCell::new(Control {
             chunk: [0; 128],
             input: Arrangement::new(ARR_STEREO, &[1, 2]),
-            output: Arrangement::new(ARR_51, &[1, 2, 3, 4, 5, 6]),
+            output: if narrow {
+                Arrangement::new(ARR_STEREO, &[1, 2])
+            } else {
+                Arrangement::new(ARR_51, &[1, 2, 3, 4, 5, 6])
+            },
             rect: Rect {
                 top: 0,
                 left: 0,
@@ -291,6 +297,11 @@ unsafe extern "C" fn dispatch(
             if !option.is_finite() || option <= 0.0 {
                 return 0;
             }
+            // Mode 20 behaves like JUCE 6.0.0 to 6.1.2: a scale that arrives
+            // before the editor exists is acknowledged and dropped.
+            if mode.load(Ordering::Relaxed) == 20 && control.canvas.is_none() {
+                return 1;
+            }
             let scale = f64::from(option);
             let width = (320.0 * scale).round().clamp(1.0, f64::from(i16::MAX)) as i16;
             let height = (200.0 * scale).round().clamp(1.0, f64::from(i16::MAX)) as i16;
@@ -391,7 +402,7 @@ unsafe extern "C" fn dispatch(
                 mode.store(12, Ordering::Relaxed);
                 return 1;
             }
-            if chunk[0] != 1 || chunk[1] > 19 {
+            if chunk[0] != 1 || chunk[1] > 20 {
                 return 0;
             }
             if chunk[1] == 5 {
