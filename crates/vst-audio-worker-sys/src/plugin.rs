@@ -193,18 +193,26 @@ impl Vst2Plugin {
         // SAFETY: entry uses the validated ABI and static callback.
         let effect = unsafe { entry(callback) };
         CURRENT_ID.set(previous);
-        if effect.is_null() {
-            return Err(PluginError("null plugin instance".into()));
+        if effect.is_null() || !effect.is_aligned() {
+            return Err(PluginError("null or misaligned plugin instance".into()));
         }
-        // SAFETY: successful entry returns an AEffect that remains live until CLOSE.
+        // SAFETY: successful entry returns an aligned AEffect that remains live until CLOSE.
         let fields = unsafe { effect.read() };
-        if fields.magic != MAGIC
-            || fields.dispatcher.is_none()
+        let conforming = fields.magic == MAGIC && fields.dispatcher.is_some();
+        if !conforming
             || (fields.process_replacing.is_none() && fields.process_double.is_none())
             || !(0..=64).contains(&fields.num_inputs)
             || !(0..=64).contains(&fields.num_outputs)
             || !(0..=16384).contains(&fields.num_params)
         {
+            if conforming && let Some(close) = fields.dispatcher {
+                // A real instance outside this host's limits is released before
+                // its module unloads; a thread it started must not keep running
+                // unloaded code.
+                // SAFETY: a conforming entry returned a live instance and nothing
+                // else was called on it; CLOSE is its final dispatcher call.
+                unsafe { close(effect, CLOSE, 0, 0, std::ptr::null_mut(), 0.0) };
+            }
             return Err(PluginError("invalid plugin ABI or channel count".into()));
         }
         let directory = plugin_directory(path);
@@ -268,7 +276,10 @@ impl Vst2Plugin {
                 if arrangements == 0 || pointer.is_null() {
                     return Ok(None);
                 }
-                // SAFETY: successful arrangement query returns its live header.
+                if !pointer.is_aligned() {
+                    return Err(PluginError("misaligned speaker arrangement".into()));
+                }
+                // SAFETY: successful arrangement query returns its live, aligned header.
                 let channels = unsafe { (*pointer).channels };
                 // JUCE declares its widest supported channel count in
                 // numInputs/numOutputs and reports the current, possibly
@@ -280,7 +291,9 @@ impl Vst2Plugin {
                 // SAFETY: address of the first speaker only; do not reference a fixed-size
                 // struct since third-party plugins may allocate exactly channels entries.
                 let first = unsafe { std::ptr::addr_of!((*pointer).speakers).cast::<Speaker>() };
-                // SAFETY: validated count <= 32; query guarantees that many live speaker records.
+                // SAFETY: count <= 64 was validated after OPEN and equals `channels`,
+                // so the plugin's arrangement holds that many initialized, aligned
+                // Speaker records in one readable allocation, live through this copy.
                 let speakers = unsafe { std::slice::from_raw_parts(first, count as usize) };
                 Ok(Some(speakers.iter().map(|speaker| speaker.kind).collect()))
             };
@@ -661,7 +674,10 @@ impl Vst2Plugin {
             (&mut rect as *mut *const Rect).cast(),
             0.0,
         );
-        // SAFETY: `rect` is still `&fallback`, or null, or the plugin's
+        if !rect.is_aligned() {
+            return Err(PluginError("misaligned editor rectangle".into()));
+        }
+        // SAFETY: `rect` is still `&fallback`, or null, or the plugin's aligned
         // rectangle, which stays valid until the next dispatcher call.
         let rect = unsafe { rect.as_ref() }.copied().unwrap_or(fallback);
         let (width, height) = (
@@ -689,8 +705,8 @@ impl Vst2Plugin {
             (&mut after as *mut *const Rect).cast(),
             0.0,
         );
-        if !after.is_null() {
-            // SAFETY: plugin owns the rectangle until its next dispatcher call; copy now.
+        if !after.is_null() && after.is_aligned() {
+            // SAFETY: plugin owns the aligned rectangle until its next dispatcher call; copy now.
             let after = unsafe { after.read() };
             let w = i32::from(after.right) - i32::from(after.left);
             let h = i32::from(after.bottom) - i32::from(after.top);
@@ -903,7 +919,10 @@ fn resize_vst2(control: &Control<'_>, window: &EditorWindow) -> Result<(), Plugi
     if rect.is_null() {
         return Err(PluginError("plugin returned no editor rectangle".into()));
     }
-    // SAFETY: plugin-owned rectangle is valid until the next foreign dispatcher call.
+    if !rect.is_aligned() {
+        return Err(PluginError("misaligned editor rectangle".into()));
+    }
+    // SAFETY: plugin-owned aligned rectangle is valid until the next foreign dispatcher call.
     let rect = unsafe { rect.read() };
     let width = i32::from(rect.right) - i32::from(rect.left);
     let height = i32::from(rect.bottom) - i32::from(rect.top);
@@ -1105,12 +1124,21 @@ impl Vst2Processor {
                 }
                 let mut inputs = [std::ptr::null(); 64];
                 let mut outputs = [std::ptr::null_mut(); 64];
-                for (pointer, plane) in inputs.iter_mut().zip(planes.iter()).take(self.inputs) {
-                    *pointer = plane.as_ptr().wrapping_add(start);
-                }
-                for (pointer, plane) in outputs.iter_mut().zip(planes.iter_mut()).take(self.outputs)
+                // One pointer per plane serves both arrays. Deriving the input
+                // pointer from a shared borrow and then reborrowing the same plane
+                // mutably would invalidate it before the plugin reads through it.
+                for (channel, plane) in planes
+                    .iter_mut()
+                    .enumerate()
+                    .take(self.inputs.max(self.outputs))
                 {
-                    *pointer = plane.as_mut_ptr().wrapping_add(start);
+                    let pointer = plane.as_mut_ptr().wrapping_add(start);
+                    if channel < self.inputs {
+                        inputs[channel] = pointer.cast_const();
+                    }
+                    if channel < self.outputs {
+                        outputs[channel] = pointer;
+                    }
                 }
                 if self.shared.callback.io_pending.load(Ordering::Acquire) {
                     return false;
