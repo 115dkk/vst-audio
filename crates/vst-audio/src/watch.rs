@@ -1,5 +1,10 @@
 //! Deterministic glue between decoded control messages and process supervision.
+use std::time::Instant;
 use vst_audio_protocol::{Action, Frame, HostWatch, Message, Received, RequestKind, StateHistory};
+
+pub(crate) fn elapsed_ms(base_ms: u64, since: Instant) -> u64 {
+    base_ms.saturating_add(since.elapsed().as_millis().min(u128::from(u64::MAX)) as u64)
+}
 
 #[derive(Debug)]
 pub struct ControlWatch {
@@ -153,5 +158,40 @@ mod tests {
         assert!(watch.poll(2, 1, Some(0)).is_empty());
         assert!(watch.poll(10000, 1, None).is_empty());
         assert_eq!(watch.state(), WatchState::Stopped);
+    }
+
+    #[test]
+    fn replaying_loaded_preserves_latency() {
+        let mut watch = ControlWatch::new(0);
+        watch.received(
+            0,
+            &Frame {
+                flags: 0,
+                request: 0,
+                message: Message::Loaded {
+                    name: String::new(),
+                    vendor: String::new(),
+                    latency_frames: 7,
+                    inputs: vec![],
+                    outputs: vec![],
+                },
+            },
+        );
+        let latency = watch.latency();
+        watch.received(
+            1,
+            &Frame {
+                flags: 0,
+                request: 0,
+                message: Message::Loaded {
+                    name: String::new(),
+                    vendor: String::new(),
+                    latency_frames: latency,
+                    inputs: vec![],
+                    outputs: vec![],
+                },
+            },
+        );
+        assert_eq!(watch.latency(), 7);
     }
 }

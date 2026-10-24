@@ -1,7 +1,7 @@
 //! Variable callback adapter. Only bounded copies/atomics run in this module.
+use crate::{BlockEndpoint, Fallback, PluginControl, StartError, Started, api::Shared};
 #[cfg(test)]
-use crate::BlockStatus;
-use crate::{BlockEndpoint, Fallback, StartError, api::Shared};
+use crate::{BlockStatus, api::Lifecycle};
 use std::sync::Arc;
 use vst_audio_protocol::{Capabilities, ProcessingSetup};
 use vst_audio_ring::{
@@ -18,6 +18,38 @@ pub(crate) struct PreparedAudio {
     pub setup: ProcessingSetup,
     pub capabilities: Capabilities,
     pub generation: u64,
+}
+impl PreparedAudio {
+    /// Builds the audio-thread half of a started worker for `generation`.
+    /// Returns the control half untouched.
+    pub(crate) fn from_started(
+        started: Started,
+        generation: u64,
+    ) -> Result<(Self, PluginControl), vst_audio_ring::BlockError> {
+        let Started {
+            control,
+            region,
+            work,
+            publisher,
+            geometry,
+            latency_frames,
+            setup,
+            capabilities,
+            ..
+        } = started;
+        let lane = BlockLane::new(region, work, publisher, 0, 1)?;
+        Ok((
+            Self {
+                lane,
+                geometry,
+                latency: latency_frames,
+                setup,
+                capabilities,
+                generation,
+            },
+            control,
+        ))
+    }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AudioStatus {
@@ -1191,13 +1223,12 @@ mod golden {
                     step_consumer(&rig, usize::MAX);
                 }
             }
-            rig.shared.status.store(
+            rig.shared.set_lifecycle(
                 if (96..101).contains(&callback) || (303..307).contains(&callback) {
-                    1
+                    Lifecycle::Failed
                 } else {
-                    0
+                    Lifecycle::Running
                 },
-                Ordering::Release,
             );
             let too_long = callback == 149;
             let frames = if too_long {
@@ -1351,7 +1382,7 @@ mod golden {
                     shared,
                     ..
                 } = rig;
-                shared.status.store(0, Ordering::Release);
+                shared.set_lifecycle(Lifecycle::Running);
                 shared.generation.store(1, Ordering::Release);
                 let mut endpoint = endpoint.into_blocks();
                 endpoint.restart(depth).unwrap();
@@ -1416,7 +1447,7 @@ mod golden {
             latency,
             0,
         );
-        rig.shared.status.store(1, Ordering::Release);
+        rig.shared.set_lifecycle(Lifecycle::Failed);
         let delay = rig.endpoint.latency_frames();
         let mut source = Vec::new();
         let mut actual = Vec::new();

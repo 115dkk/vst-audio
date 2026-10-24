@@ -1,7 +1,7 @@
 //! Control-thread recovery. Prepared resources cross to audio; reclamation returns.
 use crate::{
     Command, ControlEvent, HostEvent, PluginControl, RequestId, Started,
-    api::{Launch, RecoveryPolicy, Shared},
+    api::{Launch, Lifecycle, RecoveryPolicy, Shared},
     audio::PreparedAudio,
     watch::ControlWatch,
 };
@@ -39,12 +39,7 @@ impl OrphanedWatch {
     }
 
     fn now_ms(&self) -> u64 {
-        self.base_ms.saturating_add(
-            self.taken_at
-                .elapsed()
-                .as_millis()
-                .min(u128::from(u64::MAX)) as u64,
-        )
+        crate::watch::elapsed_ms(self.base_ms, self.taken_at)
     }
 }
 
@@ -68,32 +63,14 @@ fn prepare_audio_handover(
         .load(Ordering::Acquire)
         .checked_add(1)
         .ok_or_else(|| "recovery generation exhausted".to_string())?;
-    let Started {
-        control,
-        region,
-        work,
-        publisher,
-        geometry,
-        latency_frames,
-        setup,
-        capabilities,
-        ..
-    } = started;
-    let lane = vst_audio_ring::BlockLane::new(region, work, publisher, 0, 1)
+    let latency_frames = started.latency_frames;
+    let (prepared, control) = PreparedAudio::from_started(started, generation)
         .map_err(|error| format!("recovery ring lane is invalid: {error:?}"))?;
-    let prepared = PreparedAudio {
-        lane,
-        geometry,
-        latency: latency_frames,
-        setup,
-        capabilities,
-        generation,
-    };
     updates
         .push(prepared)
         .map_err(|_| "recovery audio boundary became unavailable".to_string())?;
     shared.generation.store(generation, Ordering::Release);
-    shared.status.store(3, Ordering::Release);
+    shared.set_lifecycle(Lifecycle::Replacing);
     shared.worker_pid.store(control.pid(), Ordering::Release);
     // The application sized its delays for the old worker's plugin latency.
     if latency_frames != *latency {
@@ -150,7 +127,7 @@ pub(crate) fn supervise(
         if let Some(generation) = prepared_generation
             && shared.applied_generation.load(Ordering::Acquire) == generation
         {
-            shared.status.store(0, Ordering::Release);
+            shared.set_lifecycle(Lifecycle::Running);
             emit(&events, &shared, HostEvent::Recovered { generation });
             prepared_generation = None;
         }
@@ -169,7 +146,7 @@ pub(crate) fn supervise(
             orphaned_watch = None;
         }
         if stopping && control.is_none() {
-            shared.status.store(2, Ordering::Release);
+            shared.set_lifecycle(Lifecycle::Stopped);
             emit(&events, &shared, HostEvent::Stopped);
             return;
         }
@@ -178,7 +155,7 @@ pub(crate) fn supervise(
                 break;
             };
             if let Command::Recover { use_previous } = command {
-                let watch_pending = watch_policy && shared.status.load(Ordering::Acquire) == 4;
+                let watch_pending = watch_policy && shared.lifecycle() == Lifecycle::Recovering;
                 if stopping
                     || recovery.is_some()
                     || orphaned_watch.is_some()
@@ -196,7 +173,7 @@ pub(crate) fn supervise(
                     continue;
                 }
                 recovery = Some((Instant::now(), use_previous, Some(id)));
-                shared.status.store(4, Ordering::Release);
+                shared.set_lifecycle(Lifecycle::Recovering);
                 break;
             }
             if matches!(command, Command::Shutdown) {
@@ -215,7 +192,7 @@ pub(crate) fn supervise(
                 emit(&events, &shared, HostEvent::Completed { request: id });
                 continue;
             }
-            if watch_policy && shared.status.load(Ordering::Acquire) == 4 {
+            if watch_policy && shared.lifecycle() == Lifecycle::Recovering {
                 emit(
                     &events,
                     &shared,
@@ -337,7 +314,7 @@ pub(crate) fn supervise(
                         }
                     }
                     Err(reason) => {
-                        shared.status.store(1, Ordering::Release);
+                        shared.set_lifecycle(Lifecycle::Failed);
                         emit(
                             &events,
                             &shared,
@@ -350,7 +327,7 @@ pub(crate) fn supervise(
                     }
                 },
                 Err(error) => {
-                    shared.status.store(1, Ordering::Release);
+                    shared.set_lifecycle(Lifecycle::Failed);
                     if let Some(request) = request {
                         emit(
                             &events,
@@ -479,7 +456,7 @@ pub(crate) fn supervise(
                                 emit(&events, &shared, HostEvent::LatencyChanged(frames))
                             }
                             Message::Fault { text, .. } => {
-                                shared.status.store(1, Ordering::Release);
+                                shared.set_lifecycle(Lifecycle::Failed);
                                 failure_reported = true;
                                 emit(&events, &shared, HostEvent::Failed { reason: text });
                             }
@@ -492,7 +469,7 @@ pub(crate) fn supervise(
                     ControlEvent::NeedsRespawn if watch_policy => respawn_requested = true,
                     ControlEvent::Action(action @ Action::Disable { .. }) => {
                         disabled = true;
-                        shared.status.store(1, Ordering::Release);
+                        shared.set_lifecycle(Lifecycle::Failed);
                         if !stopping && !failure_reported {
                             failure_reported = true;
                             let Action::Disable { reason } = action else {
@@ -511,9 +488,11 @@ pub(crate) fn supervise(
                         }
                     }
                     ControlEvent::Action(action @ Action::Kill { .. }) => {
-                        shared
-                            .status
-                            .store(if watch_policy { 4 } else { 1 }, Ordering::Release);
+                        shared.set_lifecycle(if watch_policy {
+                            Lifecycle::Recovering
+                        } else {
+                            Lifecycle::Failed
+                        });
                         if !stopping && !failure_reported {
                             failure_reported = true;
                             let Action::Kill { reason } = action else {
@@ -529,7 +508,7 @@ pub(crate) fn supervise(
                         }
                     }
                     ControlEvent::Action(Action::EnterFallback) if watch_policy => {
-                        shared.status.store(4, Ordering::Release);
+                        shared.set_lifecycle(Lifecycle::Recovering);
                         if !stopping && !failure_reported {
                             failure_reported = true;
                             emit(
@@ -582,14 +561,15 @@ pub(crate) fn supervise(
                 );
             }
             if stopping {
-                shared.status.store(2, Ordering::Release);
+                shared.set_lifecycle(Lifecycle::Stopped);
                 emit(&events, &shared, HostEvent::Stopped);
                 return;
             }
-            shared.status.store(
-                if watch_policy && !disabled { 4 } else { 1 },
-                Ordering::Release,
-            );
+            shared.set_lifecycle(if watch_policy && !disabled {
+                Lifecycle::Recovering
+            } else {
+                Lifecycle::Failed
+            });
             if !failure_reported {
                 failure_reported = true;
                 emit(
@@ -643,7 +623,7 @@ pub(crate) fn supervise(
                         failure_reported = false;
                     }
                     Err(reason) => {
-                        shared.status.store(1, Ordering::Release);
+                        shared.set_lifecycle(Lifecycle::Failed);
                         emit(&events, &shared, HostEvent::Failed { reason });
                         emit(&events, &shared, HostEvent::RecoveryRequired);
                     }
@@ -651,7 +631,7 @@ pub(crate) fn supervise(
                 Err(error) => {
                     let now_ms = orphan.now_ms();
                     let actions = orphan.watch.poll(now_ms, 0, Some(1));
-                    shared.status.store(4, Ordering::Release);
+                    shared.set_lifecycle(Lifecycle::Recovering);
                     failure_reported = false;
                     let disabled = actions
                         .iter()
@@ -668,7 +648,7 @@ pub(crate) fn supervise(
                         },
                     );
                     if disabled {
-                        shared.status.store(1, Ordering::Release);
+                        shared.set_lifecycle(Lifecycle::Failed);
                         emit(&events, &shared, HostEvent::RecoveryRequired);
                     } else {
                         orphaned_watch = Some(orphan);
@@ -715,7 +695,7 @@ pub(crate) fn supervise(
                         }
                         Err(reason) => {
                             orphaned_watch = None;
-                            shared.status.store(1, Ordering::Release);
+                            shared.set_lifecycle(Lifecycle::Failed);
                             emit(&events, &shared, HostEvent::Failed { reason });
                             emit(&events, &shared, HostEvent::RecoveryRequired);
                         }
@@ -743,7 +723,7 @@ pub(crate) fn supervise(
             }
             if let Some(reason) = disable {
                 orphaned_watch = None;
-                shared.status.store(1, Ordering::Release);
+                shared.set_lifecycle(Lifecycle::Failed);
                 emit(
                     &events,
                     &shared,
