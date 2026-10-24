@@ -1810,6 +1810,11 @@ impl Vst3Processor {
         {
             return false;
         }
+        // Only the plugin's own refusal is a fault. A closed or not yet active
+        // admission gate is the ordinary race with a main-thread control call
+        // (set_state, deactivate), and the contract for it is "leave the block
+        // uncompleted", never "fail the worker".
+        let mut plugin_failed = false;
         let result = (|| {
             if !self.shared.admitted.load(Ordering::SeqCst)
                 || !self.shared.active.load(Ordering::SeqCst)
@@ -1820,6 +1825,7 @@ impl Vst3Processor {
             if !self.processing {
                 // SAFETY: sole audio handle, active configured component, entering processing.
                 if unsafe { self.shared.processor.setProcessing(1) } != kResultOk {
+                    plugin_failed = true;
                     return false;
                 }
                 self.processing = true;
@@ -1937,6 +1943,7 @@ impl Vst3Processor {
                 };
                 // SAFETY: exclusive admitted audio call, complete native bus arrays and bounded live buffers/event interfaces.
                 if unsafe { self.shared.processor.process(&mut data) } != kResultOk {
+                    plugin_failed = true;
                     return false;
                 }
                 self.output_events.collect(output);
@@ -1946,7 +1953,7 @@ impl Vst3Processor {
             }
             true
         })();
-        if !result {
+        if plugin_failed {
             self.shared.edits.flags.fetch_or(16, Ordering::Release);
         }
         self.shared.busy.store(false, Ordering::SeqCst);
