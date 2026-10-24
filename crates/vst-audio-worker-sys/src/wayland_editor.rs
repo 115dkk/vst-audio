@@ -53,6 +53,15 @@ impl WaylandHost {
         if !crate::linux_editor::wayland_allowed() || !crate::linux_editor::wayland_session() {
             return Err(err("no Wayland session is available"));
         }
+        // connect_to_env would consume WAYLAND_SOCKET and remove it from the
+        // process environment, which is unsound once plugin threads may be
+        // reading `environ`. The application strips the variable before spawning
+        // the worker; a worker that still sees it refuses rather than mutate.
+        if std::env::var_os("WAYLAND_SOCKET").is_some() {
+            return Err(err(
+                "WAYLAND_SOCKET is not supported by the worker; use WAYLAND_DISPLAY",
+            ));
+        }
         let connection = Connection::connect_to_env().map_err(err)?;
         *self.connection.borrow_mut() = Some(connection.clone());
         Ok(connection)

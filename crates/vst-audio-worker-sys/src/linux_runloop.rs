@@ -2,6 +2,7 @@
 //! VST3 Linux main-thread timers and descriptor callbacks, independent of editors.
 use std::{
     cell::RefCell,
+    rc::Rc,
     time::{Duration, Instant},
 };
 use vst3::{
@@ -10,14 +11,17 @@ use vst3::{
 };
 
 const LIMIT: usize = 128;
+// Retained COM references live behind `Rc` so that snapshots taken while a
+// RefCell is borrowed only touch Rust counts: `ComPtr::clone` would call the
+// plugin's `addRef`, which may re-enter this registry.
 struct Timer {
-    handler: ComPtr<ITimerHandler>,
+    handler: Rc<ComPtr<ITimerHandler>>,
     period: Duration,
     next: Instant,
 }
 #[derive(Default)]
 pub(crate) struct RunLoop {
-    events: RefCell<Vec<(ComPtr<IEventHandler>, i32)>>,
+    events: RefCell<Vec<(Rc<ComPtr<IEventHandler>>, i32)>>,
     timers: RefCell<Vec<Timer>>,
 }
 impl RunLoop {
@@ -29,14 +33,19 @@ impl RunLoop {
         let Some(handler) = (unsafe { ComRef::from_raw(pointer) }) else {
             return kInvalidArgument;
         };
+        // addRef runs here, before any borrow, so a re-entrant plugin cannot
+        // observe a live RefCell borrow; a rejected retain is released after it.
+        let retained = Rc::new(handler.to_com_ptr());
         let mut events = self.events.borrow_mut();
         if events.len() >= LIMIT || events.iter().any(|(p, _)| p.as_ptr() == pointer) {
             return kResultFalse;
         }
-        events.push((handler.to_com_ptr(), fd));
+        events.push((retained, fd));
         kResultOk
     }
     pub fn unregister_event(&self, pointer: *mut IEventHandler) -> tresult {
+        // The removed entry drops (and may release the plugin's reference) only
+        // after the borrow ends.
         let removed = {
             let mut events = self.events.borrow_mut();
             let index = events.iter().position(|(p, _)| p.as_ptr() == pointer);
@@ -56,13 +65,15 @@ impl RunLoop {
         let Some(handler) = (unsafe { ComRef::from_raw(pointer) }) else {
             return kInvalidArgument;
         };
+        // See register_event: retain before borrowing.
+        let retained = Rc::new(handler.to_com_ptr());
         let mut timers = self.timers.borrow_mut();
         if timers.len() >= LIMIT || timers.iter().any(|t| t.handler.as_ptr() == pointer) {
             return kResultFalse;
         }
         let period = Duration::from_millis(milliseconds);
         timers.push(Timer {
-            handler: handler.to_com_ptr(),
+            handler: retained,
             period,
             next: Instant::now() + period,
         });
@@ -87,8 +98,9 @@ impl RunLoop {
             .any(|(_, registered)| *registered == fd)
     }
     pub fn poll(&self) {
-        // Main-thread work may allocate. Clone retained references and end all
-        // RefCell borrows before calling foreign code (callbacks may unregister).
+        // Main-thread work may allocate. Snapshot the Rc handles (no plugin call)
+        // and end all RefCell borrows before calling foreign code, which may
+        // register or unregister handlers.
         let events = self.events.borrow().clone();
         let mut fds: Vec<_> = events
             .iter()

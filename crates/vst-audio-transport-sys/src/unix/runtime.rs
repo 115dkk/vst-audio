@@ -442,6 +442,10 @@ pub fn spawn_handles(
             }
         }
         let mut command = Command::new(exe);
+        // A compositor-provided socket descriptor is not among the selected
+        // descriptors, so its number must not reach the worker as WAYLAND_SOCKET:
+        // libwayland would otherwise claim whichever descriptor has that number.
+        command.env_remove("WAYLAND_SOCKET");
         if let Some(temporary) = sandbox.temporary() {
             for key in ["TMPDIR", "TMP", "TEMP"] {
                 command.env(key, temporary);

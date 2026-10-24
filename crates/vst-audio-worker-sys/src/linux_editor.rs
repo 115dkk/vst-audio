@@ -10,9 +10,9 @@ pub enum Policy {
 }
 thread_local! {
     static POLICY: Cell<Policy> = const { Cell::new(Policy::Auto) };
-    // connect_to_env consumes WAYLAND_SOCKET, so discovery must precede it.
-    static WAYLAND_SESSION: bool = std::env::var_os("WAYLAND_DISPLAY").is_some()
-        || std::env::var_os("WAYLAND_SOCKET").is_some();
+    // Only a named display counts: the worker never consumes an inherited
+    // WAYLAND_SOCKET (see WaylandHost::connection).
+    static WAYLAND_SESSION: bool = std::env::var_os("WAYLAND_DISPLAY").is_some();
 }
 pub fn configure(value: &str, _processes: bool) {
     let _ = wayland_session();
