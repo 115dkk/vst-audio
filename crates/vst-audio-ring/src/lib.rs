@@ -48,6 +48,8 @@ use std::time::{Duration, Instant};
 mod block;
 pub use block::{BlockError, BlockLane, Exchange};
 pub mod events;
+#[cfg(test)]
+mod serial_tests;
 use events::{CONTEXT_WORDS, EVENT_WORDS, METADATA_WORDS, PACKET_WORDS};
 pub use events::{Event, EventBuffer, EventData, MAX_EVENTS, MAX_SYSEX_BYTES, Transport};
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -64,7 +66,7 @@ impl SampleFormat {
 }
 
 pub const MAGIC: u32 = u32::from_le_bytes(*b"SSRR");
-pub const LAYOUT_VERSION: u32 = 3;
+pub const LAYOUT_VERSION: u32 = 4;
 pub const HEADER_BYTES: usize = 512;
 pub const CACHE_LINE: usize = 64;
 pub const MAX_CHANNELS: u32 = 64;
@@ -143,7 +145,7 @@ impl Geometry {
         if !(1..=2).contains(&self.lanes) {
             return Err(GeometryError::LaneCount);
         }
-        if !(2..=MAX_SLOTS).contains(&self.slots) {
+        if !matches!(self.slots, 2 | 4 | 8 | 16) {
             return Err(GeometryError::Slots);
         }
         if self.input_channels > MAX_CHANNELS || self.output_channels > MAX_CHANNELS {
@@ -198,7 +200,7 @@ struct Layout {
 
 impl Layout {
     fn slot_offset(self, lane: usize, sequence: u32) -> usize {
-        self.first_slot_offsets[lane] + (sequence % self.slots) as usize * self.slot_bytes
+        self.first_slot_offsets[lane] + (sequence & (self.slots - 1)) as usize * self.slot_bytes
     }
 }
 
@@ -467,6 +469,15 @@ impl Publisher {
         region.state()
     }
 
+    /// The last sequence the producer published on `lane` (0 outside the
+    /// geometry).
+    pub fn published(&self, region: Region<'_>, lane: usize) -> u32 {
+        if lane >= self.geometry.lanes as usize {
+            return 0;
+        }
+        u32::from_le(region.load32(SEQUENCE_I + lane, Ordering::Acquire))
+    }
+
     /// The last sequence the consumer completed on `lane` (0 outside the
     /// geometry).
     pub fn completed(&self, region: Region<'_>, lane: usize) -> u32 {
@@ -476,11 +487,10 @@ impl Publisher {
         u32::from_le(region.load32(COMPLETED_I + lane, Ordering::Acquire))
     }
 
-    /// Writes `sequence` (never 0) into its slot and publishes it, then
+    /// Writes the next wrapping `sequence` into its slot, publishes it, then
     /// signals `work`. `Dropped`, touching nothing, unless the consumer is
-    /// `Ready` and has completed `sequence - slots`, whose slot this reuses.
-    /// Sequences start at 1, advance once per publish, and must not wrap; a
-    /// lane therefore carries at most `u32::MAX` sequences.
+    /// `Ready` and has completed `sequence.wrapping_sub(slots)`, whose slot
+    /// this reuses.
     pub fn try_publish<F>(
         &self,
         region: Region<'_>,
@@ -492,16 +502,11 @@ impl Publisher {
     where
         F: FnOnce(&mut SlotWriter<'_>),
     {
-        if region.state() != Some(State::Ready)
-            || lane >= self.geometry.lanes as usize
-            || sequence == 0
-        {
+        if region.state() != Some(State::Ready) || lane >= self.geometry.lanes as usize {
             return Publish::Dropped;
         }
         let completed = self.completed(region, lane);
-        if sequence > self.geometry.slots
-            && !sequence_at_least(completed, sequence - self.geometry.slots)
-        {
+        if !sequence_at_least(completed, sequence.wrapping_sub(self.geometry.slots)) {
             return Publish::Dropped;
         }
         let offset = self.layout.slot_offset(lane, sequence) / 4;
@@ -542,7 +547,7 @@ impl Publisher {
         {
             return false;
         }
-        let published = u32::from_le(region.load32(SEQUENCE_I + lane, Ordering::Acquire));
+        let published = self.published(region, lane);
         if published.wrapping_sub(sequence) >= self.geometry.slots {
             return false;
         }
@@ -596,6 +601,16 @@ impl<'a> Producer<'a> {
     }
 
     pub fn announce(&mut self, geometry: Geometry, producer_pid: u32) -> Result<(), GeometryError> {
+        self.announce_at(geometry, producer_pid, 0)
+    }
+
+    /// Announces a ring whose lane sequence counters start at `origin`.
+    pub fn announce_at(
+        &mut self,
+        geometry: Geometry,
+        producer_pid: u32,
+        origin: u32,
+    ) -> Result<(), GeometryError> {
         let geometry = geometry.validate()?;
         let layout = layout(geometry).expect("validated geometry has a layout");
         if self.region.words32.len() * 4 < layout.prefix_bytes
@@ -627,6 +642,10 @@ impl<'a> Producer<'a> {
             self.region.store32(index, value.to_le(), Ordering::Relaxed);
         }
         for lane in 0..geometry.lanes as usize {
+            self.region
+                .store32(SEQUENCE_I + lane, origin.to_le(), Ordering::Relaxed);
+            self.region
+                .store32(COMPLETED_I + lane, origin.to_le(), Ordering::Relaxed);
             let base = LANE_GEOMETRY_I + lane * 3;
             self.region.store32(
                 base,
@@ -1206,7 +1225,11 @@ fn validate_header(region: Region<'_>) -> Result<Geometry, HeaderError> {
     Ok(geometry)
 }
 
-fn sequence_at_least(value: u32, reference: u32) -> bool {
+/// Compares modulo-2^32 serial numbers using their signed forward distance.
+///
+/// Ring users maintain `0 <= D(published, completed) <= slots <= 16 < 2^31`,
+/// so every sequence pair compared here is unambiguous across wraparound.
+pub fn sequence_at_least(value: u32, reference: u32) -> bool {
     value.wrapping_sub(reference) as i32 >= 0
 }
 

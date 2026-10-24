@@ -48,7 +48,8 @@ endpoint; `take_blocks` instead transfers a block-synchronous `BlockEndpoint`.
 It accepts variable-length planar f32/f64 callbacks up to the configured
 `max_callback_frames`, reblocks them into a prepared quantum, and carries bounded
 sample-offset MIDI/SysEx, automation and transport data. The implemented ring
-uses `Configuration::slots` for the ring capacity. `BlockLane` is the standalone
+uses `Configuration::slots` (2, 4, 8 or 16) for the ring capacity and wraps its
+modulo-2^32 sequence numbers continuously. `BlockLane` is the standalone
 ring-crate client; block misses are reported for caller fallback. The audio
 endpoint returns processed or explicit fallback output and reports
 `(ceil(max_callback_frames / quantum) + 1) * quantum` plus plugin latency; the

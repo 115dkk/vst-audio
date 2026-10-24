@@ -219,7 +219,7 @@ fn editor_resize_and_idle_do_not_stop_audio() {
     let mut sequence = 1;
     while begin.elapsed() < Duration::from_millis(350) {
         block(&s, sequence);
-        sequence += 1;
+        sequence = sequence.wrapping_add(1);
         std::thread::sleep(Duration::from_millis(2));
     }
     let blob = state(&mut s);

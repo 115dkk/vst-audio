@@ -21,9 +21,9 @@ made twice. A block caller also had no high-level handle: it had to drive the
 low-level `PluginProcess` and rebuild its audio side after every recovery.
 
 `Configuration::slots` chooses the number of ring slots per lane. Its default is
-callback depth plus one; an explicit value must be at least that large and at
-most `MAX_SLOTS`. A `BlockEndpoint` can restart at any depth from 1 through
-`slots - 1`.
+the next power of two at or above callback depth plus one; an explicit value
+must be one of 2, 4, 8 or 16 and at least that large. A `BlockEndpoint` can
+restart at any depth from 1 through `slots - 1`.
 
 Consequences: `BlockEndpoint` reports `depth * quantum + plugin latency`.
 `AudioEndpoint` retains its extra reblocking quantum and reports

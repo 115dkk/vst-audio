@@ -12,8 +12,6 @@ pub enum BlockStatus {
     Missed,
     /// Wrong sample format or buffer length; nothing was submitted.
     InvalidBuffer,
-    /// The lane's counters are exhausted; recovery is required.
-    CounterExhausted,
 }
 
 impl BlockStatus {
@@ -188,9 +186,6 @@ impl BlockEndpoint {
         W: FnOnce(&mut SlotWriter<'_>),
         R: FnOnce(SlotReader<'_>),
     {
-        if self.active.lane.exhausted() {
-            return BlockStatus::CounterExhausted;
-        }
         if !matches!(self.shared.status.load(Ordering::Acquire), 0 | 3)
             || self.shared.generation.load(Ordering::Acquire) != self.active.generation
         {

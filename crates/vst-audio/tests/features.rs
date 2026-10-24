@@ -1,5 +1,8 @@
 #![forbid(unsafe_code)]
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 use vst_audio::*;
 #[global_allocator]
 static ALLOC: assert_no_alloc::AllocDisabler = assert_no_alloc::AllocDisabler;
@@ -221,6 +224,27 @@ fn f64_instruments_midi_automation_and_transport_are_sample_accurate() {
         let mut left = [0.0; 128];
         let mut right = [0.0; 128];
         let mut received = [AudioEvent::default(); 32];
+        // A fresh worker's first block can outlast the 10 ms gap below on a
+        // loaded runner; run silent blocks until one comes back processed.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while audio
+            .process_events_f64(
+                128,
+                &[],
+                &mut [&mut left, &mut right],
+                Transport::default(),
+                &[],
+                &mut received,
+            )
+            .status
+            != AudioStatus::Processed
+        {
+            assert!(
+                Instant::now() < deadline,
+                "{format:?} never processed a block"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         for block in 0..3 {
             let context = Transport {
                 sample_position: 1000 + block * 128,

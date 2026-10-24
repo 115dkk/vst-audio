@@ -22,8 +22,8 @@ pub struct Exchange {
     /// for the first `depth` blocks after `new` or `restart`, and for a block
     /// that was skipped, dropped, late or overwritten.
     pub delivered: bool,
-    /// Block `k` was published. False when the consumer is not `Ready`, is
-    /// `slots` blocks behind, or no sequence is left.
+    /// Block `k` was published. False when the consumer is not `Ready` or is
+    /// `slots` blocks behind.
     pub published: bool,
 }
 
@@ -70,13 +70,14 @@ impl<M: RegionMemory, S: Signal> BlockLane<M, S> {
         if !(1..geometry.slots).contains(&depth) {
             return Err(BlockError::Depth);
         }
+        let sequence = publisher.published(memory.region(), lane);
         Ok(Self {
             memory,
             work,
             publisher,
             lane,
             pipeline: Pipeline::with_depth(depth),
-            sequence: 0,
+            sequence,
             block: 0,
             generation: 0,
         })
@@ -104,12 +105,6 @@ impl<M: RegionMemory, S: Signal> BlockLane<M, S> {
         self.block
     }
 
-    /// The lane has carried `u32::MAX` sequences (or `u64::MAX` blocks): later
-    /// calls publish nothing and the consumer must be replaced.
-    pub fn exhausted(&self) -> bool {
-        self.sequence == u32::MAX || self.block == u64::MAX
-    }
-
     pub fn memory(&self) -> &M {
         &self.memory
     }
@@ -133,7 +128,7 @@ impl<M: RegionMemory, S: Signal> BlockLane<M, S> {
     /// Counts block `k` as submitted without publishing or reading anything;
     /// it is never delivered.
     pub fn skip(&mut self) {
-        self.block = self.block.saturating_add(1);
+        self.block = self.block.wrapping_add(1);
     }
 
     /// Submits block `k`: lends block `k - depth`'s slot to `read` when the
@@ -154,9 +149,8 @@ impl<M: RegionMemory, S: Signal> BlockLane<M, S> {
             )
             .is_some_and(|sequence| self.publisher.try_read(view, self.lane, sequence, read));
 
-        let mut published = false;
-        if !self.exhausted() {
-            let sequence = self.sequence + 1;
+        let sequence = self.sequence.wrapping_add(1);
+        let published =
             if self
                 .publisher
                 .try_publish(view, self.lane, sequence, Some(&self.work), write)
@@ -165,10 +159,11 @@ impl<M: RegionMemory, S: Signal> BlockLane<M, S> {
                 self.pipeline
                     .published(sequence, self.block, self.generation);
                 self.sequence = sequence;
-                published = true;
-            }
-            self.block += 1;
-        }
+                true
+            } else {
+                false
+            };
+        self.block = self.block.wrapping_add(1);
         Exchange {
             delivered,
             published,
@@ -242,7 +237,11 @@ mod tests {
     use super::*;
     use crate::{Consumer, InProcessEvent, Producer, RegionBuf, SampleFormat};
 
-    fn setup(slots: u32, depth: u32) -> (BlockLane<RegionBuf, InProcessEvent>, InProcessEvent) {
+    fn setup_at(
+        slots: u32,
+        depth: u32,
+        origin: u32,
+    ) -> (BlockLane<RegionBuf, InProcessEvent>, InProcessEvent) {
         let geometry = Geometry {
             sample_format: SampleFormat::F32,
             lanes: 1,
@@ -257,7 +256,7 @@ mod tests {
         let work = InProcessEvent::new();
         let ready = InProcessEvent::new();
         let mut producer = Producer::new(memory.region(), [Some(&work), None], &ready);
-        producer.announce(geometry, 1).unwrap();
+        producer.announce_at(geometry, 1, origin).unwrap();
         let publisher = producer.publisher().unwrap();
         Consumer::new(memory.region(), &ready, [None, None])
             .validate_and_ready(2)
@@ -266,6 +265,10 @@ mod tests {
             BlockLane::new(memory, work.clone(), publisher, 0, depth).unwrap(),
             ready,
         )
+    }
+
+    fn setup(slots: u32, depth: u32) -> (BlockLane<RegionBuf, InProcessEvent>, InProcessEvent) {
+        setup_at(slots, depth, 0)
     }
 
     fn consume(lane: &BlockLane<RegionBuf, InProcessEvent>) -> Option<Vec<f32>> {
@@ -343,8 +346,25 @@ mod tests {
     }
 
     #[test]
-    fn validates_buffers_clears_planes_and_exhausts() {
-        let (mut lane, _) = setup(2, 1);
+    fn origin_wraps_at_minimum_and_maximum_depth() {
+        for depth in [1, 7] {
+            let (mut lane, _) = setup_at(8, depth, u32::MAX - 3);
+            let mut output = vec![-1.0; 8];
+            for block in 0..3 * depth + 8 {
+                let input = vec![block as f32; 4];
+                let exchange = lane.process_planes(&input, &mut output).unwrap();
+                assert_eq!(exchange.delivered, block >= depth);
+                if block >= depth {
+                    assert_eq!(output[0], (block - depth) as f32 + 10.0);
+                }
+                consume(&lane);
+            }
+        }
+    }
+
+    #[test]
+    fn validates_buffers_clears_planes_and_wraps() {
+        let (mut lane, _) = setup_at(2, 1, u32::MAX - 1);
         let mut output = vec![0.0; 8];
         assert_eq!(
             lane.process_planes(&[], &mut output),
@@ -360,9 +380,8 @@ mod tests {
         let _ = lane.process_planes(&[1.0; 4], &mut output).unwrap();
         let seen = consume(&lane).unwrap();
         assert_eq!(&seen[4..], &[0.0; 4]);
-        lane.sequence = u32::MAX - 1;
         assert!(lane.process(|_| {}, |_| {}).published);
-        assert!(lane.exhausted());
-        assert!(!lane.process(|_| panic!("must not write"), |_| {}).published);
+        consume(&lane);
+        assert!(lane.process(|_| {}, |_| {}).published);
     }
 }
