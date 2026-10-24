@@ -6,6 +6,7 @@ mod vst3;
 pub use vst_audio_protocol::{
     Bus, BusInfo, BusKind, ClassInfo, PluginError, PluginFormat, layout, state,
 };
+pub use vst_audio_worker_sys::notifications::{EditPhase, ParameterEdit, PluginEvents};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PluginInfo {
     pub name: String,
@@ -15,19 +16,9 @@ pub struct PluginInfo {
     pub outputs: Vec<BusInfo>,
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct PluginEvents {
-    pub params_changed: bool,
-    pub parameter_edits: Vec<(u32, u8, f64)>,
-    pub latency_changed: Option<u32>,
-    pub editor_closed: bool,
-    pub editor_resized: Option<(u32, u32)>,
-    pub fault: Option<&'static str>,
-}
-
-/// Main-thread lifecycle and state interface. The Windows adapter creates an
-/// independent processor handle for the audio thread. A non-waiting admission
-/// gate excludes foreign processing during control calls; only the main thread
+/// Main-thread lifecycle and state interface. Both format adapters transfer a
+/// unique audio handle after `configure_audio`. A non-waiting admission gate
+/// excludes foreign processing during control calls; only the main thread
 /// waits for an in-flight block. Closed admission leaves blocks uncompleted so
 /// the engine uses fallback. All editor and state calls stay on the main thread.
 pub trait Plugin {

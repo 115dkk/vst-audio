@@ -2,7 +2,13 @@
 //! VST 2 lifecycle calls close a non-waiting audio admission gate. UI and
 //! parameter calls may overlap DSP, using copied ABI function pointers rather
 //! than Rust references to foreign mutable storage. Callbacks use atomics/TLS.
-use crate::{editor::EditorWindow, editor_scaling, library::Library, vst2::*};
+use crate::{
+    editor::EditorWindow,
+    editor_scaling,
+    library::Library,
+    notifications::{EditPhase, Notifications, ParameterEdit, PluginEvents, SuppressNotifications},
+    vst2::*,
+};
 use std::{
     cell::Cell,
     ffi::{CStr, CString, c_void},
@@ -28,15 +34,6 @@ pub struct Info {
     pub input_types: Option<Vec<i32>>,
     pub output_types: Option<Vec<i32>>,
 }
-#[derive(Clone, Debug, Default)]
-pub struct Events {
-    pub params: bool,
-    pub parameter_edits: Vec<(u32, u8, f64)>,
-    pub latency: bool,
-    pub closed: bool,
-    pub resized: Option<(u32, u32)>,
-    pub fault: bool,
-}
 #[derive(Debug)]
 struct CallbackState {
     flags: AtomicU32,
@@ -50,8 +47,7 @@ struct CallbackState {
     events: crate::vst2_events::CallbackEvents,
     offline: AtomicBool,
     parameter_count: AtomicU32,
-    parameter_edits: crossbeam_queue::ArrayQueue<(u32, u8, f64)>,
-    parameter_edits_overflow: AtomicBool,
+    notifications: Notifications,
 }
 #[derive(Debug)]
 struct Shared {
@@ -235,8 +231,7 @@ impl Vst2Plugin {
                 events: crate::vst2_events::CallbackEvents::default(),
                 offline: AtomicBool::new(false),
                 parameter_count: AtomicU32::new(fields.num_params as u32),
-                parameter_edits: crossbeam_queue::ArrayQueue::new(1024),
-                parameter_edits_overflow: AtomicBool::new(false),
+                notifications: Notifications::new(),
             }),
             _library: library,
         });
@@ -504,7 +499,7 @@ impl Vst2Plugin {
             .effect()
             .set_parameter
             .ok_or_else(|| PluginError("no parameter setter".into()))?;
-        let _notifications = NotificationGuard::enter();
+        let _notifications = SuppressNotifications::enter();
         // SAFETY: validated index/value; the VST2 plugin synchronizes parameter writes with DSP.
         unsafe { set(self.shared.effect(), id, value as f32) };
         Ok(())
@@ -546,7 +541,7 @@ impl Vst2Plugin {
             return Err(PluginError("state too large".into()));
         }
         let control = self.shared.control();
-        let _notifications = NotificationGuard::enter();
+        let _notifications = SuppressNotifications::enter();
         if control.effect().flags & PROGRAM_CHUNKS != 0 {
             let mut blob = blob.to_vec();
             control.call(
@@ -876,28 +871,24 @@ impl Vst2Plugin {
             }
         }
     }
-    pub fn take_events(&mut self) -> Events {
+    pub fn take_events(&mut self) -> PluginEvents {
         if self.shared.callback.io_pending.load(Ordering::Acquire) {
             let control = self.shared.control();
             refresh(&self.shared, &control, &mut self.info, self.parameter_count);
         }
         let flags = self.shared.callback.flags.swap(0, Ordering::AcqRel);
-        let mut parameter_edits = Vec::new();
-        while let Some(edit) = self.shared.callback.parameter_edits.pop() {
-            parameter_edits.push(edit);
-        }
-        Events {
-            params: flags & 1 != 0
-                || self
-                    .shared
-                    .callback
-                    .parameter_edits_overflow
-                    .swap(false, Ordering::AcqRel),
-            parameter_edits,
-            latency: flags & 2 != 0,
-            closed: std::mem::take(&mut self.closed),
-            resized: self.resized.take(),
-            fault: self.shared.callback.invalid.load(Ordering::Acquire),
+        PluginEvents {
+            params_changed: flags & 1 != 0 || self.shared.callback.notifications.take_overflow(),
+            parameter_edits: self.shared.callback.notifications.drain(),
+            latency_changed: (flags & 2 != 0).then_some(self.info.latency),
+            editor_closed: std::mem::take(&mut self.closed),
+            editor_resized: self.resized.take(),
+            fault: self
+                .shared
+                .callback
+                .invalid
+                .load(Ordering::Acquire)
+                .then_some(RESTART_REQUIRED),
         }
     }
 }
@@ -1043,7 +1034,7 @@ impl Vst2Processor {
                                 continue;
                             }
                             let set = set.expect("validated setter");
-                            let _notifications = NotificationGuard::enter();
+                            let _notifications = SuppressNotifications::enter();
                             // SAFETY: admitted instance, validated parameter index and normalized value.
                             unsafe { set(self.shared.effect(), id, value as f32) };
                         }
@@ -1221,13 +1212,22 @@ unsafe extern "C" fn callback(
             1
         }
         43 | 44 => {
-            notify_parameter_edit(state, index, if opcode == 43 { 0 } else { 2 }, 0.0);
+            notify_parameter_edit(
+                state,
+                index,
+                if opcode == 43 {
+                    EditPhase::Begin
+                } else {
+                    EditPhase::End
+                },
+                0.0,
+            );
             1
         }
         MASTER_SAMPLE_RATE => state.rate.load(Ordering::Relaxed) as isize,
         MASTER_BLOCK_SIZE => state.frames.load(Ordering::Relaxed) as isize,
         MASTER_AUTOMATE => {
-            notify_parameter_edit(state, index, 1, f64::from(option));
+            notify_parameter_edit(state, index, EditPhase::Perform, f64::from(option));
             1
         }
         MASTER_IO_CHANGED => {
@@ -1250,10 +1250,7 @@ unsafe extern "C" fn callback(
     }
 }
 
-fn notify_parameter_edit(state: &CallbackState, index: i32, phase: u8, value: f64) {
-    if SUPPRESS_NOTIFICATIONS.get() != 0 {
-        return;
-    }
+fn notify_parameter_edit(state: &CallbackState, index: i32, phase: EditPhase, value: f64) {
     if index < 0
         || index as u32 >= state.parameter_count.load(Ordering::Relaxed)
         || !value.is_finite()
@@ -1262,33 +1259,17 @@ fn notify_parameter_edit(state: &CallbackState, index: i32, phase: u8, value: f6
         state.flags.fetch_or(1, Ordering::Release);
         return;
     }
-    let edit = (index as u32, phase, value);
-    if state.parameter_edits.push(edit).is_err() {
-        state
-            .parameter_edits_overflow
-            .store(true, Ordering::Release);
-        let _ = state.parameter_edits.pop();
-        let _ = state.parameter_edits.push(edit);
-    }
+    state.notifications.push(ParameterEdit {
+        id: index as u32,
+        phase,
+        value,
+    });
 }
 
 const RESTART_REQUIRED: &str = "plugin changed its channel or parameter count; restart required";
 thread_local! {
     static CURRENT_ID: Cell<i32> = const { Cell::new(0) };
     static PROCESS_LEVEL: Cell<isize> = const { Cell::new(1) };
-    static SUPPRESS_NOTIFICATIONS: Cell<u32> = const { Cell::new(0) };
-}
-struct NotificationGuard;
-impl NotificationGuard {
-    fn enter() -> Self {
-        SUPPRESS_NOTIFICATIONS.set(SUPPRESS_NOTIFICATIONS.get() + 1);
-        Self
-    }
-}
-impl Drop for NotificationGuard {
-    fn drop(&mut self) {
-        SUPPRESS_NOTIFICATIONS.set(SUPPRESS_NOTIFICATIONS.get() - 1);
-    }
 }
 struct ProcessingThread(isize);
 impl ProcessingThread {

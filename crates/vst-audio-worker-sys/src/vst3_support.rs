@@ -5,16 +5,19 @@
     clippy::undocumented_unsafe_blocks
 )]
 //! Host-owned COM objects. Controller callbacks are UI-thread-only (SDK threading model).
-use crate::{editor::EditorWindow, state_buffer::StateBuffer};
+use crate::{
+    editor::EditorWindow,
+    notifications::{EditPhase, Notifications, ParameterEdit},
+    state_buffer::StateBuffer,
+};
 use std::{
-    cell::Cell,
     collections::HashMap,
     ffi::{c_char, c_void},
     io::{Seek, SeekFrom, Write},
     rc::Rc,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
     },
 };
 use vst3::{Class, ComRef, ComWrapper, Steinberg::Vst::*, Steinberg::*};
@@ -23,33 +26,13 @@ use vst3::{Class, ComRef, ComWrapper, Steinberg::Vst::*, Steinberg::*};
 use vst3::{wl_display, wl_surface, xdg_surface, xdg_toplevel};
 
 pub(crate) const CAPACITY: usize = 256;
-pub(crate) const NOTIFICATION_CAPACITY: usize = 1024;
-thread_local! {
-    static SUPPRESS_NOTIFICATIONS: Cell<u32> = const { Cell::new(0) };
-}
-pub(crate) struct NotificationGuard;
-impl NotificationGuard {
-    pub(crate) fn enter() -> Self {
-        SUPPRESS_NOTIFICATIONS.set(SUPPRESS_NOTIFICATIONS.get() + 1);
-        Self
-    }
-}
-impl Drop for NotificationGuard {
-    fn drop(&mut self) {
-        SUPPRESS_NOTIFICATIONS.set(SUPPRESS_NOTIFICATIONS.get() - 1);
-    }
-}
-fn notifications_suppressed() -> bool {
-    SUPPRESS_NOTIFICATIONS.get() != 0
-}
 
 pub(crate) struct Edits {
     slots: [(AtomicU32, AtomicU64); CAPACITY],
     read: AtomicUsize,
     write: AtomicUsize,
     pub flags: AtomicU32,
-    notifications: crossbeam_queue::ArrayQueue<(u32, u8, f64)>,
-    overflow: AtomicBool,
+    pub notifications: Notifications,
     // Editor edits that did not fit the processor queue, latest value per ID.
     // Main thread only; flushed in order before newer edits are queued.
     deferred: Mutex<Vec<(u32, f64)>>,
@@ -61,8 +44,7 @@ impl Edits {
             read: AtomicUsize::new(0),
             write: AtomicUsize::new(0),
             flags: AtomicU32::new(0),
-            notifications: crossbeam_queue::ArrayQueue::new(NOTIFICATION_CAPACITY),
-            overflow: AtomicBool::new(false),
+            notifications: Notifications::new(),
             deferred: Mutex::new(Vec::new()),
         }
     }
@@ -105,23 +87,6 @@ impl Edits {
         slot.1.store(value.to_bits(), Ordering::Relaxed);
         self.write.store(write.wrapping_add(1), Ordering::Release);
         true
-    }
-    pub fn notify(&self, id: u32, phase: u8, value: f64) {
-        if notifications_suppressed() {
-            return;
-        }
-        let edit = (id, phase, value);
-        if self.notifications.push(edit).is_err() {
-            self.overflow.store(true, Ordering::Release);
-            let _ = self.notifications.pop();
-            let _ = self.notifications.push(edit);
-        }
-    }
-    pub fn pop_notification(&self) -> Option<(u32, u8, f64)> {
-        self.notifications.pop()
-    }
-    pub fn take_overflow(&self) -> bool {
-        self.overflow.swap(false, Ordering::AcqRel)
     }
     pub fn pop(&self) -> Option<(u32, f64)> {
         let read = self.read.load(Ordering::Relaxed);
@@ -599,7 +564,11 @@ impl Class for Handler {
 }
 impl IComponentHandlerTrait for Handler {
     unsafe fn beginEdit(&self, id: u32) -> tresult {
-        self.0.notify(id, 0, 0.0);
+        self.0.notifications.push(ParameterEdit {
+            id,
+            phase: EditPhase::Begin,
+            value: 0.0,
+        });
         kResultOk
     }
     unsafe fn performEdit(&self, id: u32, value: f64) -> tresult {
@@ -607,7 +576,11 @@ impl IComponentHandlerTrait for Handler {
             self.0.flags.fetch_or(1, Ordering::Release);
             return kInvalidArgument;
         }
-        self.0.notify(id, 1, value);
+        self.0.notifications.push(ParameterEdit {
+            id,
+            phase: EditPhase::Perform,
+            value,
+        });
         // Test only: never enable __test-drop-editor-edits in distribution builds.
         if !cfg!(feature = "__test-drop-editor-edits") {
             self.0.push_edit(id, value);
@@ -615,7 +588,11 @@ impl IComponentHandlerTrait for Handler {
         kResultOk
     }
     unsafe fn endEdit(&self, id: u32) -> tresult {
-        self.0.notify(id, 2, 0.0);
+        self.0.notifications.push(ParameterEdit {
+            id,
+            phase: EditPhase::End,
+            value: 0.0,
+        });
         kResultOk
     }
     unsafe fn restartComponent(&self, flags: i32) -> tresult {

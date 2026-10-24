@@ -133,14 +133,6 @@ impl Plugin for Vst3 {
         self.inner.idle();
     }
     fn take_events(&mut self) -> PluginEvents {
-        let events = self.inner.take_events();
-        PluginEvents {
-            params_changed: events.params,
-            parameter_edits: events.parameter_edits,
-            latency_changed: events.latency,
-            editor_closed: events.closed,
-            editor_resized: events.resized,
-            fault: events.fault,
-        }
+        self.inner.take_events()
     }
 }

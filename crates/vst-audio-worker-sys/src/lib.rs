@@ -13,6 +13,7 @@ pub mod library;
 #[cfg(unix)]
 #[path = "unix/library.rs"]
 pub mod library;
+pub mod notifications;
 pub mod plugin;
 pub mod state_buffer;
 pub mod vst2;

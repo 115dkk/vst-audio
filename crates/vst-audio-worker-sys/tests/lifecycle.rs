@@ -49,7 +49,7 @@ fn io_change_never_calls_old_buffers() {
             )
         );
     }
-    assert!(plugin.take_events().fault);
+    assert!(plugin.take_events().fault.is_some());
     let blob = plugin.get_state().unwrap();
     assert_eq!(u32::from_le_bytes(blob[34..38].try_into().unwrap()), 0);
     println!("resume time=44100, post-change process calls=0 across 20 attempts");
@@ -70,7 +70,7 @@ fn audio_io_callback_blocks_following_calls_before_control_poll() {
     for _ in 0..20 {
         assert!(!processor.process(&mut planes, 128));
     }
-    assert!(plugin.take_events().fault);
+    assert!(plugin.take_events().fault.is_some());
     assert!(!processor.process(&mut planes, 128));
     let blob = plugin.get_state().unwrap();
     assert_eq!(u32::from_le_bytes(blob[34..38].try_into().unwrap()), 0);
