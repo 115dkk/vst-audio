@@ -436,7 +436,7 @@ impl Controller {
     /// some commands own state allocations.
     pub fn request(&self, command: Command) -> Result<RequestId, StartError> {
         if let Command::RestoreState(state) = &command
-            && state.len() > vst_audio_protocol::MAX_STATE_BYTES - 8
+            && state.len() > vst_audio_protocol::MAX_STATE_BODY_BYTES
         {
             return Err(StartError("state too large".into()));
         }

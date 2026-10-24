@@ -1,6 +1,6 @@
 //! Bounded seekable storage used by the main-thread VST 3 IBStream adapter.
 use std::io::{self, Read, Seek, SeekFrom, Write};
-const LIMIT: u64 = 64 * 1024 * 1024 - 8;
+const LIMIT: u64 = vst_audio_protocol::MAX_STATE_BODY_BYTES as u64;
 #[derive(Debug, Default)]
 pub struct StateBuffer(std::io::Cursor<Vec<u8>>);
 impl StateBuffer {

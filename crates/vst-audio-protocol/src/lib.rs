@@ -29,6 +29,43 @@ pub const MAX_STATE_BYTES: usize = 64 * 1024 * 1024;
 /// MAX_PATH.
 pub const MAX_STRING_BYTES: usize = 4096;
 const FRAME_META_BYTES: usize = 8;
+/// The largest state blob that can fit in a State or SetState frame body.
+pub const MAX_STATE_BODY_BYTES: usize = MAX_STATE_BYTES - FRAME_META_BYTES;
+
+mod kind {
+    pub(super) const HELLO: u16 = 1;
+    pub(super) const LOAD: u16 = 2;
+    pub(super) const CONFIGURE: u16 = 3;
+    pub(super) const ACTIVATE: u16 = 4;
+    pub(super) const SET_STATE: u16 = 5;
+    pub(super) const GET_STATE: u16 = 6;
+    pub(super) const OPEN_EDITOR: u16 = 7;
+    pub(super) const SHUTDOWN: u16 = 8;
+    pub(super) const SCAN: u16 = 9;
+    pub(super) const LOADED: u16 = 10;
+    pub(super) const CLASSES: u16 = 11;
+    pub(super) const LATENCY_CHANGED: u16 = 12;
+    pub(super) const STATE: u16 = 13;
+    pub(super) const PARAMS_CHANGED: u16 = 14;
+    pub(super) const FAULT: u16 = 15;
+    pub(super) const ACK: u16 = 16;
+    pub(super) const EDITOR_CLOSED: u16 = 17;
+    pub(super) const CLOSE_EDITOR: u16 = 18;
+    pub(super) const LIST_PARAMETERS: u16 = 19;
+    pub(super) const PARAMETERS: u16 = 20;
+    pub(super) const SET_PARAMETER: u16 = 21;
+    pub(super) const REQUEST_ERROR: u16 = 22;
+    pub(super) const PREPARE: u16 = 23;
+    pub(super) const DESCRIBE: u16 = 24;
+    pub(super) const FEATURES: u16 = 25;
+    pub(super) const EDITOR: u16 = 26;
+    pub(super) const EDITOR_STATUS: u16 = 27;
+    pub(super) const EDITOR_IMAGE: u16 = 28;
+    pub(super) const SANDBOXED: u16 = 29;
+    pub(super) const OPEN_EDITOR_IN: u16 = 30;
+    pub(super) const EDITOR_RESIZED: u16 = 31;
+    pub(super) const PARAMETER_EDIT: u16 = 32;
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u16)]
@@ -209,38 +246,38 @@ impl Message {
     /// The wire kind number, for diagnostics.
     pub fn kind(&self) -> u16 {
         match self {
-            Self::Sandboxed { .. } => 29,
-            Self::Hello { .. } => 1,
-            Self::Load { .. } => 2,
-            Self::Configure { .. } => 3,
-            Self::Editor(_) => 26,
-            Self::EditorStatus(_) => 27,
-            Self::EditorImage(_) => 28,
-            Self::Prepare(_) => 23,
-            Self::Describe => 24,
-            Self::Features(_) => 25,
-            Self::Activate => 4,
-            Self::SetState { .. } => 5,
-            Self::GetState => 6,
-            Self::OpenEditor { .. } => 7,
-            Self::OpenEditorIn { .. } => 30,
-            Self::CloseEditor => 18,
-            Self::ListParameters { .. } => 19,
-            Self::Parameters { .. } => 20,
-            Self::SetParameter { .. } => 21,
-            Self::RequestError { .. } => 22,
-            Self::Shutdown => 8,
-            Self::Scan { .. } => 9,
-            Self::Loaded { .. } => 10,
-            Self::Classes { .. } => 11,
-            Self::LatencyChanged { .. } => 12,
-            Self::State { .. } => 13,
-            Self::ParamsChanged => 14,
-            Self::Fault { .. } => 15,
-            Self::Ack => 16,
-            Self::EditorClosed => 17,
-            Self::EditorResized { .. } => 31,
-            Self::ParameterEdit { .. } => 32,
+            Self::Sandboxed { .. } => kind::SANDBOXED,
+            Self::Hello { .. } => kind::HELLO,
+            Self::Load { .. } => kind::LOAD,
+            Self::Configure { .. } => kind::CONFIGURE,
+            Self::Editor(_) => kind::EDITOR,
+            Self::EditorStatus(_) => kind::EDITOR_STATUS,
+            Self::EditorImage(_) => kind::EDITOR_IMAGE,
+            Self::Prepare(_) => kind::PREPARE,
+            Self::Describe => kind::DESCRIBE,
+            Self::Features(_) => kind::FEATURES,
+            Self::Activate => kind::ACTIVATE,
+            Self::SetState { .. } => kind::SET_STATE,
+            Self::GetState => kind::GET_STATE,
+            Self::OpenEditor { .. } => kind::OPEN_EDITOR,
+            Self::OpenEditorIn { .. } => kind::OPEN_EDITOR_IN,
+            Self::CloseEditor => kind::CLOSE_EDITOR,
+            Self::ListParameters { .. } => kind::LIST_PARAMETERS,
+            Self::Parameters { .. } => kind::PARAMETERS,
+            Self::SetParameter { .. } => kind::SET_PARAMETER,
+            Self::RequestError { .. } => kind::REQUEST_ERROR,
+            Self::Shutdown => kind::SHUTDOWN,
+            Self::Scan { .. } => kind::SCAN,
+            Self::Loaded { .. } => kind::LOADED,
+            Self::Classes { .. } => kind::CLASSES,
+            Self::LatencyChanged { .. } => kind::LATENCY_CHANGED,
+            Self::State { .. } => kind::STATE,
+            Self::ParamsChanged => kind::PARAMS_CHANGED,
+            Self::Fault { .. } => kind::FAULT,
+            Self::Ack => kind::ACK,
+            Self::EditorClosed => kind::EDITOR_CLOSED,
+            Self::EditorResized { .. } => kind::EDITOR_RESIZED,
+            Self::ParameterEdit { .. } => kind::PARAMETER_EDIT,
         }
     }
 }
@@ -373,10 +410,10 @@ fn map_eof(error: io::Error) -> CodecError {
 }
 
 fn length_limit(kind: u16) -> usize {
-    if kind == 28 {
+    if kind == kind::EDITOR_IMAGE {
         return 16 * 1024 * 1024 + 16;
     }
-    if matches!(kind, 5 | 13) {
+    if matches!(kind, kind::SET_STATE | kind::STATE) {
         MAX_STATE_BYTES
     } else {
         MAX_MESSAGE_BYTES
@@ -636,7 +673,7 @@ fn decode_optional_editor_scaling(cursor: &mut Cursor<'_>) -> Result<EditorScali
 fn decode_message(kind: u16, body: &[u8]) -> Result<Option<Message>, CodecError> {
     let mut cursor = Cursor::new(body);
     let message = match kind {
-        1 => {
+        kind::HELLO => {
             let magic = cursor.array::<4>()?;
             let major = cursor.u16()?;
             let minor = cursor.u16()?;
@@ -655,10 +692,10 @@ fn decode_message(kind: u16, body: &[u8]) -> Result<Option<Message>, CodecError>
                 minor,
             }
         }
-        29 => Message::Sandboxed {
+        kind::SANDBOXED => Message::Sandboxed {
             mechanism: cursor.string()?,
         },
-        2 => {
+        kind::LOAD => {
             let path = cursor.string()?;
             let format = match cursor.u16()? {
                 2 => PluginFormat::Vst2,
@@ -676,32 +713,32 @@ fn decode_message(kind: u16, body: &[u8]) -> Result<Option<Message>, CodecError>
                 class_id,
             }
         }
-        3 => Message::Configure {
+        kind::CONFIGURE => Message::Configure {
             rate: cursor.u32()?,
             max_frames: cursor.u32()?,
             in_channels: cursor.u16()?,
             out_channels: cursor.u16()?,
         },
-        4 => Message::Activate,
-        5 => Message::SetState {
+        kind::ACTIVATE => Message::Activate,
+        kind::SET_STATE => Message::SetState {
             blob: body.to_vec(),
         },
-        6 => Message::GetState,
-        7 => Message::OpenEditor {
+        kind::GET_STATE => Message::GetState,
+        kind::OPEN_EDITOR => Message::OpenEditor {
             scaling: decode_optional_editor_scaling(&mut cursor)?,
         },
-        8 => Message::Shutdown,
-        9 => Message::Scan {
+        kind::SHUTDOWN => Message::Shutdown,
+        kind::SCAN => Message::Scan {
             path: cursor.string()?,
         },
-        10 => Message::Loaded {
+        kind::LOADED => Message::Loaded {
             name: cursor.string()?,
             vendor: cursor.string()?,
             latency_frames: cursor.u32()?,
             inputs: cursor.bus_infos()?,
             outputs: cursor.bus_infos()?,
         },
-        11 => {
+        kind::CLASSES => {
             let count = cursor.u16()? as usize;
             let mut entries = Vec::with_capacity(count);
             for _ in 0..count {
@@ -714,20 +751,20 @@ fn decode_message(kind: u16, body: &[u8]) -> Result<Option<Message>, CodecError>
             }
             Message::Classes { entries }
         }
-        12 => Message::LatencyChanged {
+        kind::LATENCY_CHANGED => Message::LatencyChanged {
             frames: cursor.u32()?,
         },
-        13 => Message::State {
+        kind::STATE => Message::State {
             blob: body.to_vec(),
         },
-        14 => Message::ParamsChanged,
-        15 => Message::Fault {
+        kind::PARAMS_CHANGED => Message::ParamsChanged,
+        kind::FAULT => Message::Fault {
             code: cursor.u32()?,
             text: cursor.string()?,
         },
-        16 => Message::Ack,
-        17 => Message::EditorClosed,
-        31 => {
+        kind::ACK => Message::Ack,
+        kind::EDITOR_CLOSED => Message::EditorClosed,
+        kind::EDITOR_RESIZED => {
             let width = cursor.u32()?;
             let height = cursor.u32()?;
             if !(1..=8192).contains(&width) || !(1..=8192).contains(&height) {
@@ -735,8 +772,8 @@ fn decode_message(kind: u16, body: &[u8]) -> Result<Option<Message>, CodecError>
             }
             Message::EditorResized { width, height }
         }
-        18 => Message::CloseEditor,
-        26 => Message::Editor(match cursor.u8()? {
+        kind::CLOSE_EDITOR => Message::CloseEditor,
+        kind::EDITOR => Message::Editor(match cursor.u8()? {
             0 => EditorAction::Show,
             1 => EditorAction::Hide,
             2 => EditorAction::Focus,
@@ -749,7 +786,7 @@ fn decode_message(kind: u16, body: &[u8]) -> Result<Option<Message>, CodecError>
             6 => EditorAction::Capture,
             _ => return Err(CodecError::InvalidValue),
         }),
-        30 => {
+        kind::OPEN_EDITOR_IN => {
             let parent = match cursor.u8()? {
                 0 => ParentWindow::Win32 {
                     hwnd: cursor.u64()?,
@@ -764,7 +801,7 @@ fn decode_message(kind: u16, body: &[u8]) -> Result<Option<Message>, CodecError>
                 scaling: decode_optional_editor_scaling(&mut cursor)?,
             }
         }
-        27 => {
+        kind::EDITOR_STATUS => {
             let platform = match cursor.u8()? {
                 0 => EditorPlatform::Win32,
                 1 => EditorPlatform::Cocoa,
@@ -791,7 +828,7 @@ fn decode_message(kind: u16, body: &[u8]) -> Result<Option<Message>, CodecError>
                 scale_supported,
             })
         }
-        28 => {
+        kind::EDITOR_IMAGE => {
             let width = cursor.u32()?;
             let height = cursor.u32()?;
             if width == 0
@@ -809,7 +846,7 @@ fn decode_message(kind: u16, body: &[u8]) -> Result<Option<Message>, CodecError>
                 rgba,
             })
         }
-        23 => {
+        kind::PREPARE => {
             let sample_rate = cursor.u32()?;
             let quantum = cursor.u32()?;
             let sample_format = match cursor.u8()? {
@@ -851,8 +888,8 @@ fn decode_message(kind: u16, body: &[u8]) -> Result<Option<Message>, CodecError>
             }
             Message::Prepare(setup)
         }
-        24 => Message::Describe,
-        25 => Message::Features(Capabilities {
+        kind::DESCRIBE => Message::Describe,
+        kind::FEATURES => Message::Features(Capabilities {
             f64: cursor.boolean()?,
             input_event_buses: cursor.u16()?,
             output_event_buses: cursor.u16()?,
@@ -860,7 +897,7 @@ fn decode_message(kind: u16, body: &[u8]) -> Result<Option<Message>, CodecError>
             sysex: cursor.boolean()?,
             sample_accurate_parameters: cursor.boolean()?,
         }),
-        19 => {
+        kind::LIST_PARAMETERS => {
             let start = cursor.u32()?;
             let count = cursor.u16()?;
             if count == 0 || count > 32 {
@@ -868,7 +905,7 @@ fn decode_message(kind: u16, body: &[u8]) -> Result<Option<Message>, CodecError>
             }
             Message::ListParameters { start, count }
         }
-        20 => {
+        kind::PARAMETERS => {
             let total = cursor.u32()?;
             let count = cursor.u16()?;
             if total > 16384 || count > 32 {
@@ -908,15 +945,15 @@ fn decode_message(kind: u16, body: &[u8]) -> Result<Option<Message>, CodecError>
             }
             Message::Parameters { total, entries }
         }
-        21 => Message::SetParameter {
+        kind::SET_PARAMETER => Message::SetParameter {
             id: cursor.u32()?,
             value: cursor.normalized()?,
         },
-        22 => Message::RequestError {
+        kind::REQUEST_ERROR => Message::RequestError {
             code: cursor.u32()?,
             text: cursor.string()?,
         },
-        32 => Message::ParameterEdit {
+        kind::PARAMETER_EDIT => Message::ParameterEdit {
             id: cursor.u32()?,
             phase: match cursor.u8()? {
                 0 => EditPhase::Begin,
@@ -928,7 +965,7 @@ fn decode_message(kind: u16, body: &[u8]) -> Result<Option<Message>, CodecError>
         },
         _ => return Ok(None),
     };
-    if !matches!(kind, 5 | 13) && cursor.remaining() != 0 {
+    if !matches!(kind, kind::SET_STATE | kind::STATE) && cursor.remaining() != 0 {
         return Err(CodecError::TrailingBytes);
     }
     Ok(Some(message))

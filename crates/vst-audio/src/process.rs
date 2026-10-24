@@ -358,7 +358,7 @@ impl PluginControl {
         self.request(Message::GetState, RequestKind::StateSave)
     }
     pub fn set_state(&mut self, blob: &[u8]) -> Result<u32, StartError> {
-        if blob.len() > vst_audio_protocol::MAX_STATE_BYTES - 8 {
+        if blob.len() > vst_audio_protocol::MAX_STATE_BODY_BYTES {
             return Err(StartError("state too large".into()));
         }
         self.request(

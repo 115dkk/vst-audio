@@ -73,9 +73,14 @@ pub const MAX_CHANNELS: u32 = 64;
 pub const MAX_FRAMES: u32 = 65_536;
 pub const MAX_SLOTS: u32 = 16;
 pub const MAX_REGION_BYTES: usize = 128 * 1024 * 1024;
-const COUNTER_BYTES: usize = 2 * CACHE_LINE;
+/// Byte length of the two cache-line-aligned `AtomicU64` suffixes for the
+/// heartbeat and last-error counters.
+pub const COUNTER_BYTES: usize = 2 * CACHE_LINE;
+/// Number of `AtomicU64` words in the heartbeat and last-error suffixes.
+pub const COUNTER_WORDS: usize = COUNTER_BYTES / 8;
+/// Smallest mapping that can contain the fixed header and counter suffixes.
+pub const MIN_REGION_BYTES: usize = HEADER_BYTES + COUNTER_BYTES;
 const HEADER_WORDS: usize = HEADER_BYTES / 4;
-const COUNTER_WORDS: usize = COUNTER_BYTES / 8;
 
 const MAGIC_I: usize = 0;
 const VERSION_I: usize = 1;
@@ -86,6 +91,9 @@ const OUTPUTS_I: usize = 5;
 const FRAMES_I: usize = 6;
 const RATE_I: usize = 7;
 const LATENCY_I: usize = 8;
+/// Byte offset of the latency-bound header word, the only header value mapping
+/// adapters read before they know the geometry.
+pub const LATENCY_BOUND_OFFSET: usize = LATENCY_I * 4;
 const STATE_I: usize = 9;
 const FAULT_I: usize = 10;
 const PRODUCER_PID_I: usize = 11;
@@ -176,6 +184,18 @@ impl Geometry {
         Ok(layout(self)
             .expect("validated geometry has a layout")
             .total_bytes)
+    }
+
+    /// The byte length of the `AtomicU32` prefix when this geometry is placed in a
+    /// mapping of `mapping_bytes` bytes: the 128-byte `AtomicU64` suffix starts
+    /// there. The returned split is always a multiple of [`CACHE_LINE`]. Fails
+    /// when the geometry does not fit the mapping.
+    pub fn mapping_split(self, mapping_bytes: usize) -> Result<usize, GeometryError> {
+        let total = self.total_bytes()?;
+        if total > mapping_bytes {
+            return Err(GeometryError::RegionTooLarge);
+        }
+        Ok(total - COUNTER_BYTES)
     }
 }
 

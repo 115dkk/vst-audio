@@ -38,7 +38,7 @@ impl SharedRegion {
                 windows::Win32::Foundation::E_INVALIDARG,
             ));
         }
-        if !(640..vst_audio_ring::MAX_REGION_BYTES).contains(&bytes) {
+        if !(vst_audio_ring::MIN_REGION_BYTES..vst_audio_ring::MAX_REGION_BYTES).contains(&bytes) {
             return Err(windows::core::Error::from_hresult(
                 windows::Win32::Foundation::E_INVALIDARG,
             ));
@@ -77,7 +77,7 @@ impl SharedRegion {
         Self::map(crate::runtime::duplicate_value(value, false)?, bytes)
     }
     fn map(handle: OwnedHandle, bytes: usize) -> windows::core::Result<Self> {
-        if !(640..vst_audio_ring::MAX_REGION_BYTES).contains(&bytes) {
+        if !(vst_audio_ring::MIN_REGION_BYTES..vst_audio_ring::MAX_REGION_BYTES).contains(&bytes) {
             return Err(windows::core::Error::from_hresult(
                 windows::Win32::Foundation::E_INVALIDARG,
             ));
@@ -110,18 +110,16 @@ impl SharedRegion {
     }
     pub fn latency_bound(&self) -> u32 {
         // SAFETY: word 8 is in the fixed 512-byte header and only accessed as AtomicU32.
-        let word = unsafe { &*((self.address + 32) as *const AtomicU32) };
+        let word = unsafe {
+            &*((self.address + vst_audio_ring::LATENCY_BOUND_OFFSET) as *const AtomicU32)
+        };
         u32::from_le(word.load(Ordering::Acquire))
     }
     pub fn region_for(
         &self,
         geometry: Geometry,
     ) -> Result<Region<'_>, vst_audio_ring::GeometryError> {
-        let total = geometry.total_bytes()?;
-        if total > self.bytes {
-            return Err(vst_audio_ring::GeometryError::RegionTooLarge);
-        }
-        let prefix = total - 128;
+        let prefix = geometry.mapping_split(self.bytes)?;
         if *self.split.get_or_init(|| prefix) != prefix {
             return Err(vst_audio_ring::GeometryError::RegionTooLarge);
         }
@@ -137,8 +135,12 @@ impl SharedRegion {
         let words32 =
             unsafe { std::slice::from_raw_parts(self.address as *const AtomicU32, prefix / 4) };
         // SAFETY: disjoint 128-byte suffix at a 64-byte boundary, bounded by mapping.
-        let words64 =
-            unsafe { std::slice::from_raw_parts((self.address + prefix) as *const AtomicU64, 16) };
+        let words64 = unsafe {
+            std::slice::from_raw_parts(
+                (self.address + prefix) as *const AtomicU64,
+                vst_audio_ring::COUNTER_WORDS,
+            )
+        };
         Region::new(words32, words64)
     }
 }
