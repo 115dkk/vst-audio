@@ -572,6 +572,8 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
                     let request = frame.request;
                     let kind = frame.message.kind();
                     let shutdown = matches!(frame.message, Message::Shutdown);
+                    // GetState/SetState failures are fatal because continuing cannot prove that
+                    // the recovery checkpoint and the plugin's actual state agree (audit #11 TD-51).
                     let recoverable = matches!(
                         &frame.message,
                         Message::Editor(_)
