@@ -444,3 +444,177 @@ fn variable_callback_sizes_keep_sample_and_event_positions() {
     assert!(samples[..261].iter().all(|v| *v == 0.0));
     assert!((samples[261] - 0.12345679).abs() < 1e-7);
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "native fixtures and Xvfb required"]
+fn x11_disconnect_closes_editor_and_preserves_audio() {
+    const READY: &str = "VST_AUDIO_TEST_X11_DISCONNECT_READY";
+    if let Some(ready) = std::env::var_os(READY) {
+        let plugin = PluginDescriptor::new(
+            PathBuf::from(std::env::var_os("VST_AUDIO_TEST_VST3").unwrap()),
+            PluginFormat::Vst3,
+        );
+        let mut instance = host()
+            .spawn(
+                &plugin,
+                &Configuration {
+                    linux_editor: LinuxEditor::X11,
+                    recovery: RecoveryPolicy::Manual,
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        let mut audio = instance.take_audio().unwrap();
+        let generation = audio.generation();
+        let request = instance.controller().request(Command::OpenEditor).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(event) = instance.try_next_event() {
+                match event {
+                    HostEvent::Completed { request: id } if id == request => break,
+                    HostEvent::Failed { .. } | HostEvent::RequestFailed { .. } => {
+                        panic!("editor open failed: {event:?}");
+                    }
+                    _ => {}
+                }
+            }
+            assert!(Instant::now() < deadline, "editor open timed out");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // The basic fixture uses x11rb, not Xlib's fatal I/O-error handler.
+        // Both its child connection and the host connection target this server.
+        let left = [0.25; 128];
+        let right = [-0.125; 128];
+        let mut samples = [[0.0; 128]; 6];
+        let mut output: Vec<_> = samples.iter_mut().map(|p| &mut p[..]).collect();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut warmed = 0;
+        while warmed < 4 {
+            if audio.process(&[&left, &right], &mut output) == AudioStatus::Processed {
+                warmed += 1;
+            }
+            assert!(Instant::now() < deadline, "pre-disconnect audio timed out");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::fs::write(ready, b"editor open and audio running").unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut closed = 0;
+        let mut processed = 0;
+        while closed == 0 || processed < 10 {
+            while let Some(event) = instance.try_next_event() {
+                match event {
+                    HostEvent::EditorClosed => closed += 1,
+                    HostEvent::Failed { .. }
+                    | HostEvent::RecoveryRequired
+                    | HostEvent::Recovered { .. }
+                    | HostEvent::Stopped => panic!("worker did not survive: {event:?}"),
+                    _ => {}
+                }
+            }
+            if audio.process(&[&left, &right], &mut output) == AudioStatus::Processed && closed != 0
+            {
+                processed += 1;
+                for (plane, expected) in output
+                    .iter()
+                    .zip([0.25, -0.125, 0.0625, 0.0625, 0.0625, -0.03125])
+                {
+                    assert!(plane.iter().all(|value| (*value - expected).abs() < 1e-6));
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "missing EditorClosed or continued audio after X11 disconnect: closed={closed}, processed={processed}"
+            );
+            assert_eq!(instance.status(), Status::Running);
+            assert_eq!(audio.generation(), generation, "worker must not restart");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(closed, 1, "one disconnect must emit one EditorClosed");
+        eprintln!(
+            "EditorClosed={closed}; post-disconnect numeric blocks={processed}; generation={generation}"
+        );
+        return;
+    }
+
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let display_file = directory.path().join("display");
+    let ready = directory.path().join("ready");
+    let mut server = ChildGuard(
+        std::process::Command::new("Xvfb")
+            .args([
+                "-displayfd",
+                "1",
+                "-screen",
+                "0",
+                "800x600x24",
+                "-nolisten",
+                "tcp",
+                "-ac",
+            ])
+            .stdout(std::fs::File::create(&display_file).unwrap())
+            .spawn()
+            .expect("private Xvfb required"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let display = loop {
+        let display = std::fs::read_to_string(&display_file).unwrap();
+        if display.ends_with('\n') {
+            let number: u32 = display.trim().parse().unwrap();
+            break format!(":{number}");
+        }
+        assert!(
+            server.0.try_wait().unwrap().is_none(),
+            "Xvfb exited during startup"
+        );
+        assert!(Instant::now() < deadline, "Xvfb startup timed out");
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    // Only the child test and its worker inherit DISPLAY; other tests keep theirs.
+    let mut child = ChildGuard(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "x11_disconnect_closes_editor_and_preserves_audio",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("DISPLAY", display)
+            .env(READY, &ready)
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !ready.exists() {
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "child failed before X11 disconnect"
+        );
+        assert!(Instant::now() < deadline, "child never opened its editor");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    server.0.kill().unwrap();
+    server.0.wait().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            assert!(
+                status.success(),
+                "X11 disconnect regression failed: {status}"
+            );
+            break;
+        }
+        assert!(Instant::now() < deadline, "child hung after X11 disconnect");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}

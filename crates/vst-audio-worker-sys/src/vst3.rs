@@ -1677,11 +1677,18 @@ impl Vst3Plugin {
         } else {
             None
         };
-        let size = self
-            .editor
-            .as_ref()
-            .and_then(|editor| editor.window.status().ok())
-            .map(|(_, w, h)| (w, h));
+        let size = match self.editor.as_ref().map(|editor| editor.window.status()) {
+            Some(Ok((_, width, height))) => Some((width, height)),
+            Some(Err(error)) => {
+                // X11 can disconnect between pump and status (audit #11 TD-34;
+                // x11_disconnect_closes_editor_and_preserves_audio).
+                eprintln!("VST3 editor status failed: {error}");
+                self.editor = None;
+                self.closed_editor = true;
+                None
+            }
+            None => None,
+        };
         let resized = if self.editor_size.is_some() && size != self.editor_size {
             size
         } else {
