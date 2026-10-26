@@ -18,6 +18,8 @@ run("cargo", "test", "--locked", "-p", "vst-audio", "--test", "native",
     "--", "--ignored", "--test-threads=1", "--skip", "third_party_vst3", env=env)
 run("cargo", "test", "--locked", "-p", "vst-audio", "--test", "processes",
     "--", "--ignored", "--nocapture", "--test-threads=1", env=env)
+run("cargo", "test", "--locked", "-p", "vst-audio", "--test", "load_task",
+    "--", "--ignored", "--nocapture", "--test-threads=1", env=env)
 for test in ["latency", "supervision"]:
     run("cargo", "test", "--locked", "-p", "vst-audio", "--test", test,
         "--", "--ignored", "--nocapture", "--test-threads=1", env=env)

@@ -5,6 +5,7 @@ use crate::{
     plugin_architectures,
 };
 use std::{
+    cell::Cell,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -566,6 +567,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn notification_queue_dequeues_after_reporting_loss_under_pressure() {
+        let shared = Shared::for_audio_test(0);
+        let (send, events) = mpsc::sync_channel(2);
+        send.send(HostEvent::Stopped).unwrap();
+        let queue = NotificationQueue::new(events, shared.clone());
+
+        shared.overflow.store(true, Ordering::Release);
+        assert!(matches!(
+            queue.try_next(),
+            Some(HostEvent::NotificationsLost)
+        ));
+        shared.overflow.store(true, Ordering::Release);
+        assert!(matches!(queue.try_next(), Some(HostEvent::Stopped)));
+        assert!(matches!(
+            queue.try_next(),
+            Some(HostEvent::NotificationsLost)
+        ));
+    }
+
+    #[test]
     fn runtime_latency_is_read_whole_for_its_generation() {
         let shared = Shared::for_audio_test(64);
         assert_eq!(shared.runtime_latency(1), Some(64));
@@ -682,9 +703,44 @@ impl Shared {
 /// Owns one worker's lifetime. Drop on a control thread. Dropping this owner
 /// requests teardown even if cloned controllers or its audio endpoint remain.
 #[derive(Debug)]
+struct NotificationQueue {
+    events: mpsc::Receiver<HostEvent>,
+    shared: Arc<Shared>,
+    reported_loss: Cell<bool>,
+}
+impl NotificationQueue {
+    fn new(events: mpsc::Receiver<HostEvent>, shared: Arc<Shared>) -> Self {
+        Self {
+            events,
+            shared,
+            reported_loss: Cell::new(false),
+        }
+    }
+
+    fn try_next(&self) -> Option<HostEvent> {
+        if !self.reported_loss.get() && self.shared.overflow.swap(false, Ordering::AcqRel) {
+            self.reported_loss.set(true);
+            return Some(HostEvent::NotificationsLost);
+        }
+
+        if let Ok(event) = self.events.try_recv() {
+            self.reported_loss.set(false);
+            return Some(event);
+        }
+
+        if self.reported_loss.replace(false) && self.shared.overflow.swap(false, Ordering::AcqRel) {
+            self.reported_loss.set(true);
+            return Some(HostEvent::NotificationsLost);
+        }
+
+        None
+    }
+}
+
+#[derive(Debug)]
 pub struct Instance {
     controller: Controller,
-    events: mpsc::Receiver<HostEvent>,
+    notifications: NotificationQueue,
     audio: Option<AudioEndpoint>,
 }
 impl Instance {
@@ -695,8 +751,11 @@ impl Instance {
         shared: Arc<Shared>,
     ) -> Self {
         Self {
-            controller: Controller { requests, shared },
-            events,
+            controller: Controller {
+                requests,
+                shared: shared.clone(),
+            },
+            notifications: NotificationQueue::new(events, shared),
             audio: None,
         }
     }
@@ -762,8 +821,11 @@ impl Instance {
             })
             .map_err(|e| StartError::new(StartErrorKind::Io, e.to_string()))?;
         Ok(Self {
-            controller: Controller { requests, shared },
-            events,
+            controller: Controller {
+                requests,
+                shared: shared.clone(),
+            },
+            notifications: NotificationQueue::new(events, shared),
             audio: Some(audio),
         })
     }
@@ -782,16 +844,7 @@ impl Instance {
         self.audio.take().map(AudioEndpoint::into_blocks)
     }
     pub fn try_next_event(&self) -> Option<HostEvent> {
-        if self
-            .controller
-            .shared
-            .overflow
-            .swap(false, Ordering::AcqRel)
-        {
-            Some(HostEvent::NotificationsLost)
-        } else {
-            self.events.try_recv().ok()
-        }
+        self.notifications.try_next()
     }
 }
 impl Drop for Instance {
