@@ -311,6 +311,121 @@ fn finish_audio(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn start_audio(
+    geometry: Geometry,
+    region: Arc<SharedRegion>,
+    work: Arc<Event>,
+    done: Arc<Event>,
+    ready: Arc<Event>,
+    stop: Arc<AtomicBool>,
+    mut scratch: AudioBuffer,
+    mut processor: Box<dyn Processor>,
+) -> Result<thread::JoinHandle<()>, StartError> {
+    let (validated, validation) = mpsc::sync_channel(1);
+    let audio = thread::spawn(move || {
+        let _mmcss = Mmcss::pro_audio();
+        let view = region.region();
+        let mut consumer = Consumer::new(view, &*ready, [Some(&*done), None]);
+        let result = consumer.validate_and_ready(std::process::id());
+        let valid = result == Ok(geometry);
+        let _ = validated.send(result);
+        if !valid {
+            consumer.fault(vst_audio_ring::Fault::LayoutMismatch as u32);
+            return;
+        }
+        while !stop.load(Ordering::Acquire) {
+            let wake = work.wait(Duration::from_millis(100));
+            consumer.beat();
+            if wake == Waited::PeerGone || view.state() != Some(State::Ready) {
+                break;
+            }
+            scratch.drain(&consumer, processor.as_mut());
+        }
+        processor.stop();
+    });
+    let actual = validation
+        .recv_timeout(Duration::from_secs(5))
+        .map_err(error)?;
+    if actual != Ok(geometry) {
+        return Err(ring_validation_error(geometry, actual));
+    }
+    Ok(audio)
+}
+
+fn forward_notifications(
+    output: &mut impl std::io::Write,
+    events: PluginEvents,
+    reported_latency: &mut Option<u32>,
+) -> Result<bool, StartError> {
+    let mut send = |message| {
+        write_frame(
+            &mut *output,
+            &Frame {
+                flags: 0,
+                request: 0,
+                message,
+            },
+        )
+        .map_err(error)
+    };
+    if let Some(text) = events.fault {
+        send(Message::Fault {
+            code: 4,
+            text: text.into(),
+        })?;
+        return Ok(true);
+    }
+    let mut pending_perform: Option<ParameterEdit> = None;
+    for edit in events.parameter_edits {
+        if edit.phase == EditPhase::Perform
+            && pending_perform.is_some_and(|pending| pending.id == edit.id)
+        {
+            pending_perform = Some(edit);
+            continue;
+        }
+        if let Some(pending) = pending_perform.take() {
+            send(Message::ParameterEdit {
+                id: pending.id,
+                phase: pending.phase,
+                value: pending.value,
+            })?;
+        }
+        if edit.phase == EditPhase::Perform {
+            pending_perform = Some(edit);
+        } else {
+            send(Message::ParameterEdit {
+                id: edit.id,
+                phase: edit.phase,
+                value: edit.value,
+            })?;
+        }
+    }
+    if let Some(pending) = pending_perform {
+        send(Message::ParameterEdit {
+            id: pending.id,
+            phase: pending.phase,
+            value: pending.value,
+        })?;
+    }
+    if events.params_changed {
+        send(Message::ParamsChanged)?;
+    }
+    if let Some(frames) = events.latency_changed
+        && Some(frames) != *reported_latency
+    {
+        send(Message::LatencyChanged { frames })?;
+        *reported_latency = Some(frames);
+    }
+    if let Some((width, height)) = events.editor_resized {
+        send(Message::EditorResized { width, height })?;
+    }
+    if events.editor_closed {
+        send(Message::EditorClosed)?;
+    }
+    Ok(false)
+}
+
 pub fn host_main(args: Args) -> Result<(), StartError> {
     runtime::suppress_error_dialogs();
     #[cfg(target_os = "linux")]
@@ -564,46 +679,19 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
                                 region
                                     .region_for(geometry)
                                     .map_err(|e| error(format!("{e:?}")))?;
-                                let (validated, validation) = mpsc::sync_channel(1);
-                                let mut scratch = AudioBuffer::new(geometry)
+                                let scratch = AudioBuffer::new(geometry)
                                     .map_err(|e| error(format!("{e:?}")))?;
-                                let mut processor = plugin.take_processor().map_err(error)?;
-                                let region = region.clone();
-                                let work = work.clone();
-                                let done = done.clone();
-                                let ready = ready.clone();
-                                let stop = stop.clone();
-                                audio = Some(thread::spawn(move || {
-                                    let _mmcss = Mmcss::pro_audio();
-                                    let view = region.region();
-                                    let mut consumer =
-                                        Consumer::new(view, &*ready, [Some(&*done), None]);
-                                    let result = consumer.validate_and_ready(std::process::id());
-                                    let valid = result == Ok(geometry);
-                                    let _ = validated.send(result);
-                                    if !valid {
-                                        consumer
-                                            .fault(vst_audio_ring::Fault::LayoutMismatch as u32);
-                                        return;
-                                    }
-                                    while !stop.load(Ordering::Acquire) {
-                                        let wake = work.wait(Duration::from_millis(100));
-                                        consumer.beat();
-                                        if wake == Waited::PeerGone
-                                            || view.state() != Some(State::Ready)
-                                        {
-                                            break;
-                                        }
-                                        scratch.drain(&consumer, processor.as_mut());
-                                    }
-                                    processor.stop();
-                                }));
-                                let actual = validation
-                                    .recv_timeout(Duration::from_secs(5))
-                                    .map_err(error)?;
-                                if actual != Ok(geometry) {
-                                    return Err(ring_validation_error(geometry, actual));
-                                }
+                                let processor = plugin.take_processor().map_err(error)?;
+                                audio = Some(start_audio(
+                                    geometry,
+                                    region.clone(),
+                                    work.clone(),
+                                    done.clone(),
+                                    ready.clone(),
+                                    stop.clone(),
+                                    scratch,
+                                    processor,
+                                )?);
                                 Ok(Message::Ack)
                             }
                             Message::Activate => {
@@ -727,72 +815,10 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
             }
             if let Some(plugin) = plugin.as_mut() {
                 plugin.idle();
-                let events = plugin.take_events();
-                let mut send = |message| {
-                    write_frame(
-                        &mut output,
-                        &Frame {
-                            flags: 0,
-                            request: 0,
-                            message,
-                        },
-                    )
-                    .map_err(error)
-                };
-                if let Some(text) = events.fault {
-                    send(Message::Fault {
-                        code: 4,
-                        text: text.into(),
-                    })?;
+                if forward_notifications(&mut output, plugin.take_events(), &mut reported_latency)?
+                {
                     failed = true;
                     break;
-                }
-                let mut pending_perform: Option<ParameterEdit> = None;
-                for edit in events.parameter_edits {
-                    if edit.phase == EditPhase::Perform
-                        && pending_perform.is_some_and(|pending| pending.id == edit.id)
-                    {
-                        pending_perform = Some(edit);
-                        continue;
-                    }
-                    if let Some(pending) = pending_perform.take() {
-                        send(Message::ParameterEdit {
-                            id: pending.id,
-                            phase: pending.phase,
-                            value: pending.value,
-                        })?;
-                    }
-                    if edit.phase == EditPhase::Perform {
-                        pending_perform = Some(edit);
-                    } else {
-                        send(Message::ParameterEdit {
-                            id: edit.id,
-                            phase: edit.phase,
-                            value: edit.value,
-                        })?;
-                    }
-                }
-                if let Some(pending) = pending_perform {
-                    send(Message::ParameterEdit {
-                        id: pending.id,
-                        phase: pending.phase,
-                        value: pending.value,
-                    })?;
-                }
-                if events.params_changed {
-                    send(Message::ParamsChanged)?;
-                }
-                if let Some(frames) = events.latency_changed
-                    && Some(frames) != reported_latency
-                {
-                    send(Message::LatencyChanged { frames })?;
-                    reported_latency = Some(frames);
-                }
-                if let Some((width, height)) = events.editor_resized {
-                    send(Message::EditorResized { width, height })?;
-                }
-                if events.editor_closed {
-                    send(Message::EditorClosed)?;
                 }
             }
         }
