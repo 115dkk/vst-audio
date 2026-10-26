@@ -147,6 +147,10 @@ fn directory(root: &Path, name: &str) -> PathBuf {
     fs::create_dir(&path).unwrap_or_else(|e| panic!("create fresh {}: {e}", path.display()));
     path
 }
+fn named_rect(top: u64, name: &str) -> Option<desktop::Rect> {
+    desktop::find_named(top, name, None)
+        .unwrap_or_else(|error| panic!("UI Automation search for {name:?} failed: {error}"))
+}
 /// Answers the Editor's message boxes (No, else OK); true when one was open.
 /// The plugin panel dialog (it has Apply) is not a message box.
 fn dismiss_message_boxes(case: Case, pid: u32) -> bool {
@@ -155,12 +159,12 @@ fn dismiss_message_boxes(case: Case, pid: u32) -> bool {
         .filter(|w| {
             !w.title.contains("Configuration Editor")
                 && w.class == "Qt6120QWindowIcon"
-                && desktop::find_named(w.handle, "Apply", None).is_none()
+                && named_rect(w.handle, "Apply").is_none()
         })
         .collect();
     for window in &boxes {
-        if let Some(rect) = desktop::find_named(window.handle, "No", None)
-            .or_else(|| desktop::find_named(window.handle, "OK", None))
+        if let Some(rect) =
+            named_rect(window.handle, "No").or_else(|| named_rect(window.handle, "OK"))
         {
             println!(
                 "METRIC {{\"case\":{:?},\"message_box\":{:?}}}",
@@ -210,9 +214,7 @@ fn gui(case: Case, app: &Path, root: &Path, library: &Path) -> (PluginLine, usiz
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-    let button = until(15, "Open panel", || {
-        desktop::find_named(main.handle, "Open panel", None)
-    });
+    let button = until(15, "Open panel", || named_rect(main.handle, "Open panel"));
     // On a cold runner a startup message box can appear after the quiet period
     // above; it is modal, so the click lands on a disabled window and no panel
     // opens. Close late boxes while waiting and press the button again.
@@ -292,14 +294,12 @@ fn gui(case: Case, app: &Path, root: &Path, library: &Path) -> (PluginLine, usiz
         case.name()
     );
     // Apply first, as a user would before closing the panel.
-    if let Some(button) = desktop::find_named(dialog.handle, "Apply", None) {
+    if let Some(button) = named_rect(dialog.handle, "Apply") {
         let (x, y) = button.center();
         desktop::click(pid, x, y);
         std::thread::sleep(Duration::from_millis(500));
     }
-    let button = until(5, "panel OK", || {
-        desktop::find_named(dialog.handle, "OK", None)
-    });
+    let button = until(5, "panel OK", || named_rect(dialog.handle, "OK"));
     let (x, y) = button.center();
     desktop::click(pid, x, y);
     until(5, "panel close", || {
@@ -308,7 +308,7 @@ fn gui(case: Case, app: &Path, root: &Path, library: &Path) -> (PluginLine, usiz
             .any(|w| w.handle == dialog.handle))
         .then_some(())
     });
-    let button = until(5, "Save", || desktop::find_named(main.handle, "Save", None));
+    let button = until(5, "Save", || named_rect(main.handle, "Save"));
     let (x, y) = button.center();
     desktop::click(pid, x, y);
     let line = until(10, "saved plugin state", || {
