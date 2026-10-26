@@ -1209,6 +1209,13 @@ const PARAM_QUIET_MS: u64 = 2_000;
 const FAILURE_WINDOW_MS: u64 = 10 * 60 * 1_000;
 const BACKOFF_MS: [u64; 3] = [500, 2_000, 8_000];
 
+/// Deterministic worker-health state machine.
+///
+/// Every `now_ms` argument must come from one monotonic clock and share the
+/// epoch passed to [`HostWatch::new`]. While running, observe the current worker
+/// counter with [`HostWatch::heartbeat`] before calling [`HostWatch::tick`] at
+/// that observation time; otherwise `tick` can declare a healthy worker silent
+/// before recording its latest heartbeat (audit #11 TD-94).
 #[derive(Debug)]
 pub struct HostWatch {
     state: WatchState,
