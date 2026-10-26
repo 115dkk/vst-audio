@@ -2,6 +2,7 @@
 //! notifications and the per-poll event summary, shared by both plugin formats.
 use std::{
     cell::Cell,
+    marker::PhantomData,
     sync::atomic::{AtomicBool, Ordering},
 };
 
@@ -77,13 +78,21 @@ thread_local! {
 }
 
 /// Suppresses notifications on the current thread while alive. Nests.
+///
+/// The guard must be dropped on the thread that entered suppression.
+///
+/// ```compile_fail
+/// use vst_audio_worker_sys::notifications::SuppressNotifications;
+/// let guard = SuppressNotifications::enter();
+/// std::thread::spawn(move || drop(guard));
+/// ```
 #[derive(Debug)]
-pub struct SuppressNotifications(());
+pub struct SuppressNotifications(PhantomData<*const ()>);
 
 impl SuppressNotifications {
     pub fn enter() -> Self {
         SUPPRESSED.set(SUPPRESSED.get() + 1);
-        Self(())
+        Self(PhantomData)
     }
 }
 
