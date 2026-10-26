@@ -17,6 +17,42 @@ fn emit(tx: &mpsc::SyncSender<HostEvent>, shared: &Shared, event: HostEvent) {
         shared.overflow.store(true, Ordering::Release);
     }
 }
+
+fn fail_pending(
+    pending: &mut BTreeMap<u32, RequestId>,
+    events: &mpsc::SyncSender<HostEvent>,
+    shared: &Shared,
+    reason: &str,
+) {
+    for (_, request) in std::mem::take(pending) {
+        emit(
+            events,
+            shared,
+            HostEvent::RequestFailed {
+                request,
+                reason: reason.into(),
+            },
+        );
+    }
+}
+
+fn handle_transport_error(
+    operation: &'static str,
+    source: String,
+    pending: &mut BTreeMap<u32, RequestId>,
+    events: &mpsc::SyncSender<HostEvent>,
+    shared: &Shared,
+    stopping: bool,
+    failure_reported: &mut bool,
+) {
+    let reason = format!("control transport {operation} failed: {source}");
+    fail_pending(pending, events, shared, &reason);
+    shared.set_lifecycle(Lifecycle::Failed);
+    if !stopping && !*failure_reported {
+        *failure_reported = true;
+        emit(events, shared, HostEvent::Failed { reason });
+    }
+}
 pub(crate) struct RecoveryConfig {
     pub launch: Launch,
     pub geometry: vst_audio_ring::Geometry,
@@ -69,6 +105,7 @@ fn prepare_audio_handover(
     updates
         .push(prepared)
         .map_err(|_| "recovery audio boundary became unavailable".to_string())?;
+    shared.publish_runtime_latency(generation, latency_frames);
     shared.generation.store(generation, Ordering::Release);
     shared.set_lifecycle(Lifecycle::Replacing);
     shared.worker_pid.store(control.pid(), Ordering::Release);
@@ -368,8 +405,39 @@ pub(crate) fn supervise(
         let mut exited = None;
         let mut respawn_requested = false;
         let mut disabled = false;
+        let mut transport_failed = false;
         if let Some(control) = &mut control {
-            for event in control.poll(control.elapsed_ms()) {
+            let batch = control.poll(control.elapsed_ms());
+            if let Some((operation, reason)) = batch.iter().find_map(|event| match event {
+                ControlEvent::TransportError { operation, reason } => {
+                    Some((*operation, reason.clone()))
+                }
+                _ => None,
+            }) {
+                transport_failed = true;
+                handle_transport_error(
+                    operation,
+                    reason,
+                    &mut pending,
+                    &events,
+                    &shared,
+                    stopping,
+                    &mut failure_reported,
+                );
+            }
+            for event in batch {
+                // The terminal transport diagnosis owns all pending requests in
+                // this batch, even if a Fault or timeout was observed first.
+                if transport_failed
+                    && !matches!(
+                        event,
+                        ControlEvent::Exited(_)
+                            | ControlEvent::NeedsRespawn
+                            | ControlEvent::Action(Action::Disable { .. })
+                    )
+                {
+                    continue;
+                }
                 match event {
                     ControlEvent::Message(frame) => {
                         let request = pending.remove(&frame.request);
@@ -452,10 +520,37 @@ pub(crate) fn supervise(
                                 emit(&events, &shared, HostEvent::ParametersChanged)
                             }
                             Message::LatencyChanged { frames } => {
-                                latency = frames;
-                                emit(&events, &shared, HostEvent::LatencyChanged(frames))
+                                if frames > recovery_config.geometry.latency_bound_frames {
+                                    shared.set_lifecycle(Lifecycle::Failed);
+                                    failure_reported = true;
+                                    emit(
+                                        &events,
+                                        &shared,
+                                        HostEvent::Failed {
+                                            reason: format!(
+                                                "runtime plugin latency {frames} exceeds prepared delay bound {}",
+                                                recovery_config.geometry.latency_bound_frames
+                                            ),
+                                        },
+                                    );
+                                } else {
+                                    latency = frames;
+                                    let generation = shared.generation.load(Ordering::Acquire);
+                                    shared.publish_runtime_latency(generation, frames);
+                                    emit(&events, &shared, HostEvent::LatencyChanged(frames));
+                                }
                             }
                             Message::Fault { text, .. } => {
+                                if let Some(request) = request {
+                                    emit(
+                                        &events,
+                                        &shared,
+                                        HostEvent::RequestFailed {
+                                            request,
+                                            reason: text.clone(),
+                                        },
+                                    );
+                                }
                                 shared.set_lifecycle(Lifecycle::Failed);
                                 failure_reported = true;
                                 emit(&events, &shared, HostEvent::Failed { reason: text });
@@ -469,6 +564,7 @@ pub(crate) fn supervise(
                     ControlEvent::NeedsRespawn if watch_policy => respawn_requested = true,
                     ControlEvent::Action(action @ Action::Disable { .. }) => {
                         disabled = true;
+                        fail_pending(&mut pending, &events, &shared, "worker disabled");
                         shared.set_lifecycle(Lifecycle::Failed);
                         if !stopping && !failure_reported {
                             failure_reported = true;
@@ -524,10 +620,28 @@ pub(crate) fn supervise(
                 }
             }
         }
-        if disabled && watch_policy {
-            drop(control.take());
+        if transport_failed {
+            prepared_generation = None;
+            if watch_policy && !stopping && !disabled {
+                if let Some(mut old_control) = control.take() {
+                    let base_ms = old_control.elapsed_ms();
+                    let taken_at = Instant::now();
+                    orphaned_watch = Some(OrphanedWatch::new(
+                        old_control.take_watch(),
+                        base_ms,
+                        taken_at,
+                    ));
+                }
+            } else {
+                drop(control.take());
+            }
         }
-        if respawn_requested && !stopping {
+        if disabled {
+            drop(control.take());
+            orphaned_watch = None;
+            respawn_requested = false;
+        }
+        if respawn_requested && !stopping && control.is_some() {
             for (_, request) in std::mem::take(&mut pending) {
                 emit(
                     &events,
@@ -545,7 +659,7 @@ pub(crate) fn supervise(
             orphaned_watch = Some(OrphanedWatch::new(watch, base_ms, taken_at));
             drop(old_control);
         }
-        if let Some(code) = exited {
+        if exited.is_some() || transport_failed {
             if !watch_policy {
                 drop(control.take());
             }
@@ -576,7 +690,10 @@ pub(crate) fn supervise(
                     &events,
                     &shared,
                     HostEvent::Failed {
-                        reason: format!("worker exited with status {code}"),
+                        reason: format!(
+                            "worker exited with status {}",
+                            exited.expect("native exit without transport failure")
+                        ),
                     },
                 );
             }

@@ -1,5 +1,5 @@
 //! Bounded binary-header inspection; plugin code is never loaded here.
-use crate::{PluginFormat, StartError};
+use crate::{PluginFormat, StartError, StartErrorKind};
 use std::{fs::File, io::Read, path::Path};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -103,8 +103,9 @@ pub fn plugin_architectures(
         }
     }
     if architectures.is_empty() {
-        return Err(StartError(
-            "plugin bundle has no binary for this platform".into(),
+        return Err(StartError::new(
+            StartErrorKind::Start,
+            "plugin bundle has no binary for this platform",
         ));
     }
     Ok(architectures)
@@ -129,7 +130,10 @@ fn macos_executable(bundle: &Path) -> Option<std::path::PathBuf> {
 }
 
 fn invalid() -> StartError {
-    StartError("unsupported or truncated plugin binary header".into())
+    StartError::new(
+        StartErrorKind::InvalidInput,
+        "unsupported or truncated plugin binary header",
+    )
 }
 
 fn insert(architectures: &mut Vec<Architecture>, architecture: Architecture) {
@@ -139,7 +143,8 @@ fn insert(architectures: &mut Vec<Architecture>, architecture: Architecture) {
 }
 
 fn read_binary(path: &Path) -> Result<Vec<Architecture>, StartError> {
-    let mut file = File::open(path).map_err(|e| StartError(e.to_string()))?;
+    let mut file =
+        File::open(path).map_err(|e| StartError::new(StartErrorKind::Io, e.to_string()))?;
     let mut header = [0u8; 4096];
     let mut length = 0;
     while length < header.len() {
@@ -147,7 +152,7 @@ fn read_binary(path: &Path) -> Result<Vec<Architecture>, StartError> {
             Ok(0) => break,
             Ok(count) => length += count,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(StartError(e.to_string())),
+            Err(e) => return Err(StartError::new(StartErrorKind::Io, e.to_string())),
         }
     }
     parse(&header[..length])
@@ -323,7 +328,7 @@ mod tests {
                 );
             } else {
                 let error = host.worker_for(&plugin).unwrap_err();
-                assert!(error.0.contains(architecture.name()));
+                assert!(error.to_string().contains(architecture.name()));
                 let registered = host
                     .clone()
                     .with_worker(architecture, "old")
@@ -346,6 +351,32 @@ mod tests {
             .with_worker(Architecture::X86_64, "x64")
             .with_worker(Architecture::Aarch64, "arm");
         assert_eq!(host.worker_for(&plugin).unwrap(), host.worker_path());
+    }
+
+    #[test]
+    fn architecture_errors_distinguish_io_invalid_headers_and_start_failure() {
+        let directory = Directory::new();
+        let missing = plugin_architectures(&directory.path().join("missing"), PluginFormat::Vst2)
+            .unwrap_err();
+        assert_eq!(missing.kind(), StartErrorKind::Io);
+
+        let invalid_path = directory.path().join("invalid");
+        fs::write(&invalid_path, b"not a plugin binary").unwrap();
+        let invalid = plugin_architectures(&invalid_path, PluginFormat::Vst2).unwrap_err();
+        assert_eq!(invalid.kind(), StartErrorKind::InvalidInput);
+        assert_eq!(
+            invalid.to_string(),
+            "unsupported or truncated plugin binary header"
+        );
+
+        let empty_bundle = directory.path().join("empty.vst3");
+        fs::create_dir(&empty_bundle).unwrap();
+        let start = plugin_architectures(&empty_bundle, PluginFormat::Vst3).unwrap_err();
+        assert_eq!(start.kind(), StartErrorKind::Start);
+        assert_eq!(
+            start.to_string(),
+            "plugin bundle has no binary for this platform"
+        );
     }
 
     #[test]

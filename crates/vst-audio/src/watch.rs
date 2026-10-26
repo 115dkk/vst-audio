@@ -65,6 +65,29 @@ impl ControlWatch {
     pub fn shutdown(&mut self, now_ms: u64) -> Action {
         self.watch.shutdown(now_ms)
     }
+    pub fn restore_running(&mut self, now_ms: u64, latency_frames: u32) {
+        let hello = Frame {
+            flags: 0,
+            request: 0,
+            message: Message::hello(),
+        };
+        self.received(now_ms, &hello);
+        self.received(
+            now_ms,
+            &Frame {
+                flags: 0,
+                request: 0,
+                message: Message::Loaded {
+                    name: String::new(),
+                    vendor: String::new(),
+                    latency_frames,
+                    inputs: vec![],
+                    outputs: vec![],
+                },
+            },
+        );
+        self.activated(now_ms);
+    }
     pub fn poll(&mut self, now_ms: u64, heartbeat: u64, exit: Option<i32>) -> Vec<Action> {
         self.watch.heartbeat(now_ms, heartbeat);
         let mut actions = Vec::new();
@@ -158,6 +181,14 @@ mod tests {
         assert!(watch.poll(2, 1, Some(0)).is_empty());
         assert!(watch.poll(10000, 1, None).is_empty());
         assert_eq!(watch.state(), WatchState::Stopped);
+    }
+
+    #[test]
+    fn restored_watch_uses_the_new_workers_latency() {
+        let mut watch = ControlWatch::new(0);
+        running(&mut watch, 0);
+        watch.restore_running(100, 192);
+        assert_eq!(watch.latency(), 192);
     }
 
     #[test]
