@@ -17,6 +17,24 @@ fn emit(tx: &mpsc::SyncSender<HostEvent>, shared: &Shared, event: HostEvent) {
         shared.overflow.store(true, Ordering::Release);
     }
 }
+
+fn fail_pending(
+    pending: &mut BTreeMap<u32, RequestId>,
+    events: &mpsc::SyncSender<HostEvent>,
+    shared: &Shared,
+    reason: &str,
+) {
+    for (_, request) in std::mem::take(pending) {
+        emit(
+            events,
+            shared,
+            HostEvent::RequestFailed {
+                request,
+                reason: reason.into(),
+            },
+        );
+    }
+}
 pub(crate) struct RecoveryConfig {
     pub launch: Launch,
     pub geometry: vst_audio_ring::Geometry,
@@ -479,6 +497,7 @@ pub(crate) fn supervise(
                     ControlEvent::NeedsRespawn if watch_policy => respawn_requested = true,
                     ControlEvent::Action(action @ Action::Disable { .. }) => {
                         disabled = true;
+                        fail_pending(&mut pending, &events, &shared, "worker disabled");
                         shared.set_lifecycle(Lifecycle::Failed);
                         if !stopping && !failure_reported {
                             failure_reported = true;
