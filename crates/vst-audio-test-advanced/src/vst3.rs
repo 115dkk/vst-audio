@@ -395,7 +395,7 @@ impl IEditControllerTrait for Matrix {
         1
     }
     unsafe fn getParameterInfo(&self, index: i32, info: *mut ParameterInfo) -> tresult {
-        if !(0..2).contains(&index) || info.is_null() {
+        if index != 0 || info.is_null() {
             return kInvalidArgument;
         }
         // SAFETY: SDK output for parameter zero is a writable ParameterInfo.
@@ -739,5 +739,27 @@ unsafe fn write_sample(data: &ProcessData, bus: usize, channel: usize, frame: us
         let pointer = unsafe { *pointers.wrapping_add(channel) };
         // SAFETY: frame is within the writable output buffer.
         unsafe { *pointer.wrapping_add(frame) = value };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parameter_info_rejects_index_past_declared_count() {
+        let controller = Matrix::new(1);
+        // SAFETY: ParameterInfo consists only of integer/float fields and arrays;
+        // all-zero bits are valid, including fields a rejected query leaves alone.
+        let mut info: ParameterInfo = unsafe { std::mem::zeroed() };
+        // SAFETY: the local controller is live on this thread.
+        assert_eq!(unsafe { controller.getParameterCount() }, 1);
+        // SAFETY: info points to writable storage for the complete SDK record.
+        let result = unsafe { controller.getParameterInfo(0, &mut info) };
+        assert_eq!(result, kResultOk);
+        assert_eq!(info.id, 0);
+        // SAFETY: info remains writable, and a rejected index must not read it.
+        let result = unsafe { controller.getParameterInfo(1, &mut info) };
+        assert_eq!(result, kInvalidArgument);
     }
 }
