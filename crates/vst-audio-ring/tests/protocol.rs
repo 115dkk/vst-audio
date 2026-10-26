@@ -167,6 +167,7 @@ fn publisher_and_owned_region_cross_threads_after_announcement() {
     };
     let consumer_storage = Arc::clone(&storage);
     let consumer_ready = Arc::clone(&ready);
+    let deadline = Instant::now() + Duration::from_secs(10);
     let consumer = thread::spawn(move || {
         let mut consumer = Consumer::new(
             consumer_storage.region(),
@@ -177,6 +178,10 @@ fn publisher_and_owned_region_cross_threads_after_announcement() {
         let mut buffer = vec![0.0; geometry(1).samples_per_slot()];
         for sequence in 1..=3 {
             while consumer.next_published(0) != Some(sequence) {
+                assert!(
+                    Instant::now() < deadline,
+                    "publisher never announced {sequence}"
+                );
                 thread::yield_now();
             }
             assert!(consumer.slot_mut(0, sequence, &mut buffer, |samples| samples[0] *= 2.0));
@@ -187,6 +192,7 @@ fn publisher_and_owned_region_cross_threads_after_announcement() {
     let memory: Box<dyn RegionMemory> = Box::new(Arc::clone(&storage));
     let publishing = thread::spawn(move || {
         while publisher.state(memory.region()) != Some(State::Ready) {
+            assert!(Instant::now() < deadline, "consumer never became ready");
             thread::yield_now();
         }
         let mut results = Vec::new();
@@ -198,6 +204,10 @@ fn publisher_and_owned_region_cross_threads_after_announcement() {
                 Publish::Published
             );
             while publisher.completed(memory.region(), 0) != sequence {
+                assert!(
+                    Instant::now() < deadline,
+                    "consumer never completed {sequence}"
+                );
                 thread::yield_now();
             }
             assert!(publisher.try_read(memory.region(), 0, sequence, |slot| {
