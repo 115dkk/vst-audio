@@ -885,7 +885,7 @@ impl Vst2Plugin {
                 .callback
                 .invalid
                 .load(Ordering::Acquire)
-                .then_some(RESTART_REQUIRED),
+                .then_some(RESTART_REQUIRED.into()),
         }
     }
 }

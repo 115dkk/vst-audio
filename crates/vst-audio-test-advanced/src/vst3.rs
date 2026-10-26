@@ -33,6 +33,8 @@ struct Matrix {
     active: AtomicBool,
     kind: u8,
     bus_count_change: Option<(i32, i32)>,
+    // Default-off: which audio call reports kResultFalse ("process" or "set-processing").
+    process_failure: Option<String>,
     arrangements_set: AtomicBool,
     gate: AtomicU64,
     handler: RefCell<Option<ComPtr<IComponentHandler>>>,
@@ -55,6 +57,7 @@ impl Matrix {
                 Ok("output-drop") => Some((1, 1)),
                 _ => None,
             },
+            process_failure: std::env::var("VST_AUDIO_TEST_VST3_PROCESS_FAILURE").ok(),
             arrangements_set: AtomicBool::new(false),
             gate: AtomicU64::new(0),
             handler: RefCell::new(None),
@@ -249,10 +252,16 @@ impl IAudioProcessorTrait for Matrix {
             kInvalidArgument
         }
     }
-    unsafe fn setProcessing(&self, _: TBool) -> tresult {
+    unsafe fn setProcessing(&self, state: TBool) -> tresult {
+        if state != 0 && self.process_failure.as_deref() == Some("set-processing") {
+            return kResultFalse;
+        }
         kResultOk
     }
     unsafe fn process(&self, data: *mut ProcessData) -> tresult {
+        if self.process_failure.as_deref() == Some("process") {
+            return kResultFalse;
+        }
         if data.is_null() {
             return kInvalidArgument;
         }

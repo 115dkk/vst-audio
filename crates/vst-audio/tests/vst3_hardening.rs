@@ -8,6 +8,7 @@ use std::{
 use vst_audio::*;
 
 const BUS_COUNT_CHANGE: &str = "VST_AUDIO_TEST_VST3_BUS_COUNT_CHANGE";
+const PROCESS_FAILURE: &str = "VST_AUDIO_TEST_VST3_PROCESS_FAILURE";
 
 fn start_sidechain() -> Result<Started, StartError> {
     let worker = PathBuf::from(std::env::var_os("VST_AUDIO_WORKER").expect("worker required"));
@@ -283,6 +284,74 @@ fn bus_count_changes_during_negotiation_are_rejected() {
                 "--nocapture",
             ])
             .env(BUS_COUNT_CHANGE, mode)
+            .output()
+            .unwrap();
+        if !output.status.success() {
+            failures.push(format!(
+                "{mode}: {}\n{}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A failed audio call names the call and its tresult in the failure reason
+/// (audit #11 TD-35).
+#[test]
+#[ignore = "native fixtures required"]
+fn audio_call_failure_reports_operation_and_tresult() {
+    if let Ok(mode) = std::env::var(PROCESS_FAILURE) {
+        let worker = PathBuf::from(std::env::var_os("VST_AUDIO_WORKER").expect("worker required"));
+        let plugin = PluginDescriptor::new(
+            PathBuf::from(
+                std::env::var_os("VST_AUDIO_ADVANCED_VST3").expect("advanced VST3 required"),
+            ),
+            PluginFormat::Vst3,
+        );
+        let config = Configuration {
+            recovery: RecoveryPolicy::Manual,
+            ..Configuration::default()
+        };
+        let mut instance = Host::new(worker).spawn(&plugin, &config, None).unwrap();
+        let mut audio = instance.take_audio().unwrap();
+        let geometry = audio.geometry();
+        let input = vec![[0.25f32; 128]; geometry.input_channels as usize];
+        let inputs: Vec<_> = input.iter().map(|plane| &plane[..]).collect();
+        let mut samples = vec![[0.0f32; 128]; geometry.output_channels as usize];
+        let mut outputs: Vec<_> = samples.iter_mut().map(|plane| &mut plane[..]).collect();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let reason = loop {
+            audio.process(&inputs, &mut outputs);
+            if let Some(HostEvent::Failed { reason }) = instance.try_next_event() {
+                break reason;
+            }
+            assert!(Instant::now() < deadline, "{mode}: no failure reported");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let call = if mode == "process" {
+            "process"
+        } else {
+            "setProcessing"
+        };
+        assert!(
+            reason.contains(call) && reason.contains("tresult 1"),
+            "{mode}: {reason}"
+        );
+        return;
+    }
+    let mut failures = Vec::new();
+    for mode in ["process", "set-processing"] {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "audio_call_failure_reports_operation_and_tresult",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(PROCESS_FAILURE, mode)
             .output()
             .unwrap();
         if !output.status.success() {

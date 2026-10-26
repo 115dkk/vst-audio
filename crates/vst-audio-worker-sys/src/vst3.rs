@@ -19,7 +19,7 @@ use std::{
     rc::Rc,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -280,8 +280,41 @@ struct Shared {
     busy: AtomicBool,
     active: AtomicBool,
     closed: AtomicBool,
+    // First failed audio call, as AudioFailure::pack; written by audio, read by main.
+    failure: AtomicU64,
     edits: Arc<Edits>,
     _library: Arc<ModuleLibrary>,
+}
+/// The audio call that failed, kept as one atomic so the audio thread never
+/// allocates; the main thread renders it into the Fault (audit #11 TD-35).
+#[derive(Clone, Copy)]
+enum AudioFailure {
+    SetProcessing(tresult),
+    Process(tresult),
+}
+impl AudioFailure {
+    fn pack(self) -> u64 {
+        let (call, result) = match self {
+            Self::SetProcessing(result) => (1u64, result),
+            Self::Process(result) => (2, result),
+        };
+        call << 32 | u64::from(result as u32)
+    }
+    fn unpack(value: u64) -> Option<Self> {
+        let result = value as u32 as tresult;
+        match value >> 32 {
+            1 => Some(Self::SetProcessing(result)),
+            2 => Some(Self::Process(result)),
+            _ => None,
+        }
+    }
+    fn describe(self) -> String {
+        let (call, result) = match self {
+            Self::SetProcessing(result) => ("setProcessing(true)", result),
+            Self::Process(result) => ("process", result),
+        };
+        format!("VST 3 audio processing failed: {call} returned tresult {result}")
+    }
 }
 // SAFETY: processor access follows the SDK's existing main/audio thread contract;
 // all remaining shared state is atomic or internally synchronized. The sole
@@ -427,6 +460,7 @@ impl Vst3Plugin {
             busy: AtomicBool::new(false),
             active: AtomicBool::new(false),
             closed: AtomicBool::new(false),
+            failure: AtomicU64::new(0),
             edits,
             _library: module.library.clone(),
         });
@@ -1808,11 +1842,16 @@ impl Vst3Plugin {
             latency_changed,
             editor_closed: std::mem::take(&mut self.closed_editor),
             fault: if mapping_failed {
-                Some("VST 3 mapping rebuild failed")
+                Some("VST 3 mapping rebuild failed".into())
             } else if flags & 4 != 0 {
-                Some("bus layout changed")
+                Some("bus layout changed".into())
             } else if flags & 16 != 0 {
-                Some("VST 3 audio processing failed")
+                Some(
+                    AudioFailure::unpack(self.shared.failure.load(Ordering::Acquire))
+                        .map_or("VST 3 audio processing failed".into(), |failure| {
+                            failure.describe().into()
+                        }),
+                )
             } else {
                 None
             },
@@ -1955,7 +1994,7 @@ impl Vst3Processor {
         // admission gate is the ordinary race with a main-thread control call
         // (set_state, deactivate), and the contract for it is "leave the block
         // uncompleted", never "fail the worker".
-        let mut plugin_failed = false;
+        let mut plugin_failed = None;
         let result = (|| {
             if !self.shared.admitted.load(Ordering::SeqCst)
                 || !self.shared.active.load(Ordering::SeqCst)
@@ -1965,8 +2004,9 @@ impl Vst3Processor {
             }
             if !self.processing {
                 // SAFETY: sole audio handle, active configured component, entering processing.
-                if unsafe { self.shared.processor.setProcessing(1) } != kResultOk {
-                    plugin_failed = true;
+                let status = unsafe { self.shared.processor.setProcessing(1) };
+                if status != kResultOk {
+                    plugin_failed = Some(AudioFailure::SetProcessing(status));
                     return false;
                 }
                 self.processing = true;
@@ -2087,8 +2127,9 @@ impl Vst3Processor {
                     processContext: &mut native_context,
                 };
                 // SAFETY: exclusive admitted audio call, complete native bus arrays and bounded live buffers/event interfaces.
-                if unsafe { self.shared.processor.process(&mut data) } != kResultOk {
-                    plugin_failed = true;
+                let status = unsafe { self.shared.processor.process(&mut data) };
+                if status != kResultOk {
+                    plugin_failed = Some(AudioFailure::Process(status));
                     return false;
                 }
                 self.output_events.collect(output);
@@ -2098,7 +2139,14 @@ impl Vst3Processor {
             }
             true
         })();
-        if plugin_failed {
+        if let Some(failure) = plugin_failed {
+            // The first failure is the one reported; the Fault ends the worker.
+            let _ = self.shared.failure.compare_exchange(
+                0,
+                failure.pack(),
+                Ordering::Release,
+                Ordering::Relaxed,
+            );
             self.shared.edits.flags.fetch_or(16, Ordering::Release);
         }
         self.shared.busy.store(false, Ordering::SeqCst);

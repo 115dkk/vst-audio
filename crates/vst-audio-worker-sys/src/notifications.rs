@@ -1,6 +1,7 @@
 //! What a plugin tells the application between control calls: parameter edit
 //! notifications and the per-poll event summary, shared by both plugin formats.
 use std::{
+    borrow::Cow,
     cell::Cell,
     marker::PhantomData,
     sync::atomic::{AtomicBool, Ordering},
@@ -113,7 +114,8 @@ pub struct PluginEvents {
     pub latency_changed: Option<u32>,
     pub editor_closed: bool,
     pub editor_resized: Option<(u32, u32)>,
-    pub fault: Option<&'static str>,
+    /// Why the plugin can no longer run; owned when it carries plugin-reported detail.
+    pub fault: Option<Cow<'static, str>>,
 }
 
 #[cfg(test)]
