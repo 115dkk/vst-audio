@@ -474,9 +474,9 @@ pub(crate) struct Shared {
     pub(crate) overflow: AtomicBool,
     next_request: AtomicU64,
     pub(crate) generation: AtomicU64,
-    runtime_latency_sequence: AtomicU64,
-    runtime_latency_generation: AtomicU64,
-    runtime_latency_frames: AtomicU32,
+    // The runtime latency and the low 32 bits of its generation in one word, so
+    // the audio thread never reads a torn pair (audit #11 TD-05).
+    runtime_latency: AtomicU64,
     pub(crate) applied_generation: AtomicU64,
     pub(crate) processed_generation: AtomicU64,
     pub(crate) history: Mutex<vst_audio_protocol::StateHistory>,
@@ -490,24 +490,18 @@ impl Shared {
     }
 
     pub(crate) fn publish_runtime_latency(&self, generation: u64, frames: u32) {
-        self.runtime_latency_sequence.fetch_add(1, Ordering::AcqRel);
-        self.runtime_latency_generation
-            .store(generation, Ordering::Relaxed);
-        self.runtime_latency_frames.store(frames, Ordering::Relaxed);
-        self.runtime_latency_sequence
-            .fetch_add(1, Ordering::Release);
+        self.runtime_latency
+            .store(runtime_latency_word(generation, frames), Ordering::Release);
     }
 
-    pub(crate) fn runtime_latency(&self) -> Option<(u64, u32)> {
-        let before = self.runtime_latency_sequence.load(Ordering::Acquire);
-        if before & 1 != 0 {
-            return None;
-        }
-        let generation = self.runtime_latency_generation.load(Ordering::Relaxed);
-        let frames = self.runtime_latency_frames.load(Ordering::Relaxed);
-        let after = self.runtime_latency_sequence.load(Ordering::Acquire);
-        (before == after).then_some((generation, frames))
+    /// The latest runtime latency, if it belongs to `generation`.
+    pub(crate) fn runtime_latency(&self, generation: u64) -> Option<u32> {
+        let word = self.runtime_latency.load(Ordering::Acquire);
+        ((word >> 32) as u32 == generation as u32).then_some(word as u32)
     }
+}
+fn runtime_latency_word(generation: u64, frames: u32) -> u64 {
+    u64::from(generation as u32) << 32 | u64::from(frames)
 }
 #[derive(Clone, Debug)]
 pub struct Controller {
@@ -567,6 +561,20 @@ fn status(shared: &Shared) -> Status {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_latency_is_read_whole_for_its_generation() {
+        let shared = Shared::for_audio_test(64);
+        assert_eq!(shared.runtime_latency(1), Some(64));
+        shared.publish_runtime_latency(2, 128);
+        assert_eq!(shared.runtime_latency(1), None);
+        assert_eq!(shared.runtime_latency(2), Some(128));
+        // Only the generation's low 32 bits are kept; equality still holds past them.
+        let late = (1 << 32) + 5;
+        shared.publish_runtime_latency(late, 256);
+        assert_eq!(shared.runtime_latency(late), Some(256));
+        assert_eq!(shared.runtime_latency(2), None);
+    }
 
     #[test]
     fn controller_request_distinguishes_full_and_disconnected_queues() {
@@ -660,9 +668,7 @@ impl Shared {
             overflow: AtomicBool::new(false),
             next_request: AtomicU64::new(1),
             generation: AtomicU64::new(1),
-            runtime_latency_sequence: AtomicU64::new(0),
-            runtime_latency_generation: AtomicU64::new(1),
-            runtime_latency_frames: AtomicU32::new(latency_frames),
+            runtime_latency: AtomicU64::new(runtime_latency_word(1, latency_frames)),
             applied_generation: AtomicU64::new(1),
             processed_generation: AtomicU64::new(0),
             history: Mutex::new(vst_audio_protocol::StateHistory::new()),
@@ -708,9 +714,7 @@ impl Instance {
             overflow: AtomicBool::new(false),
             next_request: AtomicU64::new(1),
             generation: AtomicU64::new(1),
-            runtime_latency_sequence: AtomicU64::new(0),
-            runtime_latency_generation: AtomicU64::new(1),
-            runtime_latency_frames: AtomicU32::new(initial_latency),
+            runtime_latency: AtomicU64::new(runtime_latency_word(1, initial_latency)),
             applied_generation: AtomicU64::new(1),
             processed_generation: AtomicU64::new(0),
             history: Mutex::new(started.control.state_history()),
