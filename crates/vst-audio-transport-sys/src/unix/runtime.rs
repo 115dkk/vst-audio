@@ -344,9 +344,10 @@ fn spawn_handles_macos(
     };
     spawn_result(result)?;
     Ok(ChildProcess {
-        child: Mutex::new(Some(MacChild {
+        child: Mutex::new(Some(UnixChild {
             pid,
             exit_code: None,
+            ownership_lost: false,
         })),
         _parent: parent,
         sandbox: Some(sandbox),
@@ -355,67 +356,141 @@ fn spawn_handles_macos(
     })
 }
 
-#[cfg(target_os = "macos")]
 #[derive(Debug)]
-struct MacChild {
+struct UnixChild {
+    #[cfg(not(target_os = "macos"))]
+    child: Child,
+    #[cfg(target_os = "macos")]
     pid: libc::pid_t,
     exit_code: Option<u32>,
+    ownership_lost: bool,
 }
 
-#[cfg(target_os = "macos")]
-impl MacChild {
-    fn cache_status(&mut self, status: libc::c_int) -> u32 {
-        let code = if libc::WIFEXITED(status) {
-            libc::WEXITSTATUS(status) as u32
-        } else {
-            (128 + libc::WTERMSIG(status)) as u32
+impl UnixChild {
+    fn pid(&self) -> libc::pid_t {
+        #[cfg(target_os = "macos")]
+        {
+            self.pid
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.child.id() as libc::pid_t
+        }
+    }
+
+    // Called under ChildProcess's mutex, or by the sole owner in the reaper.
+    // WNOWAIT keeps even an exited leader's PID reserved until group cleanup.
+    fn exit_pending(&mut self) -> io::Result<bool> {
+        if self.ownership_lost {
+            return Err(io::Error::from_raw_os_error(libc::ECHILD));
+        }
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        // SAFETY: info is writable siginfo_t storage, and P_PID selects only this
+        // child's positive PID. WNOWAIT never consumes its wait status.
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                self.pid() as libc::id_t,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
         };
-        self.exit_code = Some(code);
-        code
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            self.ownership_lost = error.raw_os_error() == Some(libc::ECHILD);
+            return Err(error);
+        }
+        // SAFETY: the storage was zeroed and waitid succeeded; the zero PID also
+        // covers systems that leave the structure unchanged when no exit is pending.
+        let info = unsafe { info.assume_init() };
+        // SAFETY: successful waitid with WEXITED supplies the SIGCHLD layout.
+        Ok(unsafe { info.si_pid() } != 0)
+    }
+
+    fn kill_group(&self) -> io::Result<()> {
+        // SAFETY: spawn created a group led by this child, and the caller just
+        // validated outstanding wait ownership without reaping. Exclusive access
+        // prevents our other wait paths from releasing the PID before this signal.
+        let result = unsafe { libc::kill(-self.pid(), libc::SIGKILL) };
+        if result != 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(error);
+            }
+        }
+        Ok(())
     }
 
     fn try_wait(&mut self) -> io::Result<Option<u32>> {
         if self.exit_code.is_some() {
             return Ok(self.exit_code);
         }
-        let mut status = 0;
-        // SAFETY: self owns this unreaped PID and status points to writable storage.
-        let result = unsafe { libc::waitpid(self.pid, &mut status, libc::WNOHANG) };
-        if result < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if result == 0 {
+        if !self.exit_pending()? {
             return Ok(None);
         }
-        debug_assert_eq!(result, self.pid);
-        Ok(Some(self.cache_status(status)))
+        // Audit #11 TD-45: a plugin helper can outlive its leader. Kill the group before
+        // every reap, including supervision and the reaper; see
+        // drop_removes_helper_after_worker_leader_exits at the Instance seam.
+        self.kill_group()?;
+        #[cfg(target_os = "macos")]
+        let code = {
+            let mut status = 0;
+            // SAFETY: status is writable and the non-reaping probe confirmed this
+            // child exited. Exclusive ownership is held through group kill and reap.
+            let result = unsafe { libc::waitpid(self.pid, &mut status, libc::WNOHANG) };
+            if result < 0 {
+                let error = io::Error::last_os_error();
+                self.ownership_lost = error.raw_os_error() == Some(libc::ECHILD);
+                return Err(error);
+            }
+            if result == 0 {
+                return Ok(None);
+            }
+            if libc::WIFEXITED(status) {
+                libc::WEXITSTATUS(status) as u32
+            } else {
+                (128 + libc::WTERMSIG(status)) as u32
+            }
+        };
+        #[cfg(not(target_os = "macos"))]
+        let code = match self.child.try_wait() {
+            Ok(Some(status)) => status
+                .code()
+                .unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
+                as u32,
+            Ok(None) => return Ok(None),
+            Err(error) => {
+                self.ownership_lost = error.raw_os_error() == Some(libc::ECHILD);
+                return Err(error);
+            }
+        };
+        self.exit_code = Some(code);
+        Ok(Some(code))
     }
 
-    fn wait(&mut self) -> io::Result<u32> {
-        if let Some(code) = self.exit_code {
-            return Ok(code);
+    fn terminate(&mut self) -> io::Result<()> {
+        if self.exit_code.is_some() {
+            return Ok(());
         }
-        loop {
-            let mut status = 0;
-            // SAFETY: self owns this unreaped PID and status points to writable storage.
-            let result = unsafe { libc::waitpid(self.pid, &mut status, 0) };
-            if result == self.pid {
-                return Ok(self.cache_status(status));
-            }
+        self.exit_pending()?;
+        let group_result = self.kill_group();
+        // SAFETY: waitid confirmed outstanding child ownership without reaping;
+        // exclusive access keeps its PID reserved even if it exits during the call.
+        // Address the leader too in case it has moved out of its original group.
+        let result = unsafe { libc::kill(self.pid(), libc::SIGKILL) };
+        if result != 0 {
             let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted {
+            if error.raw_os_error() != Some(libc::ESRCH) {
                 return Err(error);
             }
         }
+        group_result
     }
 }
 
 #[derive(Debug)]
 pub struct ChildProcess {
-    #[cfg(not(target_os = "macos"))]
-    child: Mutex<Option<Child>>,
-    #[cfg(target_os = "macos")]
-    child: Mutex<Option<MacChild>>,
+    child: Mutex<Option<UnixChild>>,
     // Only the parent retains the write end: death closes it even while a
     // plugin's main thread is blocked inside foreign code.
     _parent: ParentHandle,
@@ -500,7 +575,11 @@ fn spawn_handles_unix(
     unsafe { command.pre_exec(prepare) };
     let child = command.spawn()?;
     Ok(ChildProcess {
-        child: Mutex::new(Some(child)),
+        child: Mutex::new(Some(UnixChild {
+            child,
+            exit_code: None,
+            ownership_lost: false,
+        })),
         _parent: parent,
         sandbox: Some(sandbox),
         #[cfg(test)]
@@ -631,46 +710,20 @@ fn mark_all_cloexec() -> bool {
 
 impl ChildProcess {
     pub fn pid(&self) -> u32 {
-        #[cfg(target_os = "macos")]
-        {
-            self.child
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .as_ref()
-                .unwrap()
-                .pid as u32
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            self.child
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .as_ref()
-                .unwrap()
-                .id()
-        }
+        self.child
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .unwrap()
+            .pid() as u32
     }
     pub fn exit_code(&self) -> io::Result<Option<u32>> {
-        #[cfg(target_os = "macos")]
-        {
-            self.child
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .as_mut()
-                .unwrap()
-                .try_wait()
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            Ok(self
-                .child
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .as_mut()
-                .unwrap()
-                .try_wait()?
-                .map(|s| s.code().unwrap_or_else(|| 128 + s.signal().unwrap_or(0)) as u32))
-        }
+        self.child
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+            .unwrap()
+            .try_wait()
     }
     /// Waits for confirmed exit, returning `false` only when the timeout expires.
     /// OS errors are returned immediately rather than treated as timeouts.
@@ -702,43 +755,12 @@ impl ChildProcess {
         if self.suppress_termination {
             return Ok(());
         }
-        #[cfg(target_os = "macos")]
-        {
-            let mut owned = self.child.lock().unwrap_or_else(|e| e.into_inner());
-            let child = owned.as_mut().unwrap();
-            if child.try_wait()?.is_some() {
-                return Ok(());
-            }
-            // SAFETY: spawn put this owned, unreaped child in its own process group.
-            // Holding the lock prevents another thread reaping/reusing its PID.
-            let _ = unsafe { libc::kill(-child.pid, libc::SIGKILL) };
-            // SAFETY: the same owned, unreaped child, whatever process group it has
-            // joined since; a worker cannot escape a signal addressed to its PID.
-            let result = unsafe { libc::kill(child.pid, libc::SIGKILL) };
-            if result != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let mut owned = self.child.lock().unwrap_or_else(|e| e.into_inner());
-            let child = owned.as_mut().unwrap();
-            if child.try_wait()?.is_some() {
-                return Ok(());
-            }
-            let pid = child.id() as i32;
-            // SAFETY: spawn put this owned, unreaped child in its own process group.
-            // Holding the lock prevents another thread reaping/reusing its PID.
-            let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
-            // SAFETY: the same owned, unreaped child, whatever process group it has
-            // joined since; a worker cannot escape a signal addressed to its PID.
-            let result = unsafe { libc::kill(pid, libc::SIGKILL) };
-            if result != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        }
+        self.child
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+            .unwrap()
+            .terminate()
     }
 }
 
@@ -778,13 +800,13 @@ impl Drop for ChildProcess {
                     .take()
                     .unwrap();
                 loop {
-                    match child.wait() {
-                        Ok(_) => break,
+                    match child.try_wait() {
+                        Ok(Some(_)) => break,
                         Err(error) if error.raw_os_error() == Some(libc::ECHILD) => break,
-                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                        Ok(None) => std::thread::sleep(Duration::from_millis(10)),
                         Err(_) => {
                             // An error is not proof of exit. Retain ownership and
-                            // retry off the dropping thread without signalling a PID.
+                            // retry the non-reaping ownership check off the drop thread.
                             std::thread::sleep(Duration::from_secs(1));
                         }
                     }
@@ -924,8 +946,8 @@ mod tests {
         let result = child.wait_for(Duration::from_secs(2));
         let elapsed = start.elapsed();
         let legacy = std::panic::catch_unwind(|| child.wait(Duration::ZERO));
-        // Drop's try_wait returns ECHILD before signalling, and its bounded wait
-        // also returns ECHILD. Do not signal a PID that has already been reaped.
+        // Drop's non-reaping probe returns ECHILD before signalling, and its
+        // bounded wait also returns ECHILD. Never signal an already-reaped PID.
         drop(child);
         let error = result.expect_err("external reap must report ECHILD, not a timeout");
         assert_eq!(error.raw_os_error(), Some(libc::ECHILD));
