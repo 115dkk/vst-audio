@@ -8,6 +8,11 @@ import shutil
 from fixtures import prepare, target_directory
 
 ROOT = Path(__file__).resolve().parents[1]
+# GUI_TEST_ROUNDS repeats the matrix; a diagnosis job uses it to catch
+# intermittent failures. Every round must pass.
+rounds = int(os.environ.get("GUI_TEST_ROUNDS", "1"))
+if rounds <= 0:
+    raise ValueError("GUI_TEST_ROUNDS must be a positive integer")
 worker, vst2, vst3 = prepare()
 subprocess.run(["cargo", "build", "--locked", "--manifest-path",
                 "examples/gui/Cargo.toml", "--workspace"], cwd=ROOT, check=True)
@@ -16,9 +21,6 @@ extension = ".exe" if sys.platform == "win32" else ""
 fixtures = [vst2, vst3]
 output = ROOT / "test-results"
 output.mkdir(exist_ok=True)
-# GUI_TEST_ROUNDS repeats the matrix; a diagnosis job uses it to catch
-# intermittent failures. Every round must pass.
-rounds = int(os.environ.get("GUI_TEST_ROUNDS", "1"))
 started = time.time()
 
 
