@@ -361,6 +361,9 @@ pub enum Command {
     },
     SaveState,
     RestoreState(Vec<u8>),
+    /// Start a new worker from the newest saved state, or the one before it with
+    /// `use_previous`. Accepted while `Failed` and also while `Running`, where it
+    /// deliberately replaces the healthy worker: a forced restart.
     Recover {
         use_previous: bool,
     },
