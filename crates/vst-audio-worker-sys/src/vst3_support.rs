@@ -102,6 +102,16 @@ impl Edits {
             .count();
         deferred.drain(..sent);
     }
+    /// Main thread only, with audio admission closed and no active consumer.
+    /// State replacement supersedes processor edits, not notification history.
+    pub fn clear_pending_edits(&self) {
+        self.read
+            .store(self.write.load(Ordering::Acquire), Ordering::Release);
+        self.deferred
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
     /// An application value supersedes an older deferred editor value.
     pub fn forget_deferred(&self, id: u32) {
         self.deferred

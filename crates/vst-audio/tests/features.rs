@@ -19,6 +19,135 @@ fn host() -> Host {
 }
 
 #[test]
+#[ignore = "native fixtures and display required"]
+fn restore_state_discards_queued_and_deferred_vst3_edits() {
+    const MODE: &str = "VST_AUDIO_TEST_STATE_WIDTH";
+    if std::env::var_os(MODE).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "restore_state_discards_queued_and_deferred_vst3_edits",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(MODE, "1")
+            .env("VST_AUDIO_TEST_EDIT_FLOOD", "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "state restore child failed: {status}");
+        return;
+    }
+
+    // Independent literal: SSV3 v1 envelope, two ten-byte fixture states,
+    // each [version=1, mode=0, Width=0.25 as little-endian f64].
+    const RESTORED: &[u8] = &[
+        83, 83, 86, 51, 1, 10, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 208, 63, 10, 0, 0, 0, 1, 0, 0, 0,
+        0, 0, 0, 0, 208, 63,
+    ];
+    for deferred in [false, true] {
+        let descriptor = PluginDescriptor::new(
+            PathBuf::from(std::env::var_os("VST_AUDIO_TEST_VST3").unwrap()),
+            PluginFormat::Vst3,
+        );
+        let mut instance = host()
+            .spawn(
+                &descriptor,
+                &Configuration {
+                    slots: Some(8),
+                    linux_editor: LinuxEditor::X11,
+                    recovery: RecoveryPolicy::Manual,
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        let control = instance.controller();
+        let wait = |request| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(event) = instance.try_next_event() {
+                    match event {
+                        HostEvent::Completed { request: id }
+                        | HostEvent::State {
+                            request: Some(id), ..
+                        } if id == request => return event,
+                        HostEvent::Failed { .. } | HostEvent::RequestFailed { .. } => {
+                            panic!("state restore request failed: {event:?}");
+                        }
+                        _ => {}
+                    }
+                }
+                assert!(Instant::now() < deadline, "state restore request timed out");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        wait(
+            control
+                .request(Command::SetParameter { id: 0, value: 1.0 })
+                .unwrap(),
+        );
+        if deferred {
+            // With no audio yet, 5000 editor edits fill the processor queue and
+            // leave the last Width=0.75 in the main-thread deferred store.
+            wait(control.request(Command::OpenEditor).unwrap());
+        }
+        wait(
+            control
+                .request(Command::RestoreState(RESTORED.to_vec()))
+                .unwrap(),
+        );
+        let HostEvent::State { bytes: state, .. } =
+            wait(control.request(Command::SaveState).unwrap())
+        else {
+            panic!("missing saved restored state");
+        };
+        assert_eq!(state, RESTORED, "fixture must actually restore Width=0.25");
+
+        let mut blocks = instance.take_blocks().unwrap();
+        blocks.restart(7).unwrap();
+        let input = [1.0; 256];
+        let mut output = [-1.0; 768];
+        // Seven pipeline calls precede the FIRST delivered 128-frame block.
+        // The fixture contributes exactly 64 initial silent frames, not a warmup
+        // that could hide the stale edit on the first processor invocation.
+        for call in 0..11 {
+            let status = assert_no_alloc::assert_no_alloc(|| blocks.process(&input, &mut output));
+            if call < 7 {
+                assert_eq!(status, BlockStatus::Missed);
+                assert!(output.iter().all(|value| *value == -1.0));
+            } else {
+                assert_eq!(
+                    status,
+                    BlockStatus::Delivered,
+                    "call={call}, deferred={deferred}"
+                );
+                for (channel, expected) in
+                    [1.0, 1.0, 1.0, 1.0, 0.125, 0.125].into_iter().enumerate()
+                {
+                    for frame in 0..128 {
+                        let expected = if call == 7 && frame < 64 {
+                            0.0
+                        } else {
+                            expected
+                        };
+                        assert_eq!(
+                            output[channel * 128 + frame],
+                            expected,
+                            "restored Width=0.25 must win: call={call}, channel={channel}, frame={frame}, deferred={deferred}"
+                        );
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(instance.status(), Status::Running);
+        eprintln!(
+            "restored Width=0.25: first delivered rear[64]=0.125; four numeric blocks; deferred={deferred}"
+        );
+    }
+}
+
+#[test]
 #[ignore = "native fixtures required"]
 fn invalid_event_routes_and_parameter_ids_preserve_the_instance() {
     for format in [PluginFormat::Vst2, PluginFormat::Vst3] {

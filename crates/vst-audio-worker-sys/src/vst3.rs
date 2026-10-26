@@ -1083,6 +1083,10 @@ impl Vst3Plugin {
     }
     pub fn set_state(&mut self, component: &[u8], controller: &[u8]) -> Result<(), PluginError> {
         let _control = self.shared.control();
+        // Audit #11 TD-08: the basic VST3 fixture reproduces old edits overriding
+        // restored state in restore_state_discards_queued_and_deferred_vst3_edits.
+        // Admission is closed and the audio consumer has left its busy scope.
+        self.shared.edits.clear_pending_edits();
         let _notifications = SuppressNotifications::enter();
         let stream = Stream::try_from_slice(component)
             .map_err(|_| PluginError("out of memory for plugin state".into()))?;

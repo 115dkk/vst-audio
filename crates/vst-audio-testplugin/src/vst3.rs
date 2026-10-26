@@ -33,6 +33,7 @@ struct Matrix {
     width: AtomicU64,
     active: AtomicBool,
     flood_edits: bool,
+    state_width: bool,
     delay: UnsafeCell<Delay>,
     handler: RefCell<Option<ComPtr<IComponentHandler>>>,
     #[cfg(target_os = "linux")]
@@ -48,6 +49,7 @@ impl Matrix {
             width: AtomicU64::new(1.0f64.to_bits()),
             active: AtomicBool::new(false),
             flood_edits: std::env::var_os("VST_AUDIO_TEST_EDIT_FLOOD").is_some(),
+            state_width: std::env::var_os("VST_AUDIO_TEST_STATE_WIDTH").is_some(),
             delay: UnsafeCell::new(Delay {
                 samples: [[0.0; 64]; 6],
                 cursor: 0,
@@ -71,6 +73,21 @@ impl Matrix {
         if result != kResultOk || read != 2 || bytes[0] != 1 || bytes[1] > 6 {
             return kInvalidArgument;
         }
+        // TD-08 opt-in state carries Width immediately after the version and mode.
+        if self.state_width {
+            let mut width = [0u8; 8];
+            // SAFETY: eight-byte writable output and byte-count output live for this call.
+            let result = unsafe { stream.read(width.as_mut_ptr().cast(), 8, &mut read) };
+            let value = f64::from_le_bytes(width);
+            if result != kResultOk
+                || read != 8
+                || !value.is_finite()
+                || !(0.0..=1.0).contains(&value)
+            {
+                return kInvalidArgument;
+            }
+            self.width.store(value.to_bits(), Ordering::Relaxed);
+        }
         if bytes[1] == 5 {
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(1));
@@ -93,8 +110,7 @@ impl Matrix {
             return kInvalidArgument;
         };
         let mode = self.mode.load(Ordering::Relaxed);
-        #[allow(unused_mut)]
-        let mut bytes = [
+        let bytes = [
             1,
             mode,
             self.probe[0].load(Ordering::Relaxed),
@@ -103,7 +119,7 @@ impl Matrix {
         ];
         let length = if mode == 6 { 5 } else { 2 };
         #[cfg(target_os = "linux")]
-        let mut bytes = if std::env::var_os("VST_AUDIO_VIEW_LIFECYCLE").is_some() {
+        let bytes = if std::env::var_os("VST_AUDIO_VIEW_LIFECYCLE").is_some() {
             bytes[..length as usize]
                 .iter()
                 .copied()
@@ -114,8 +130,13 @@ impl Matrix {
         };
         #[cfg(target_os = "linux")]
         let length = bytes.len() as i32;
+        let mut bytes = bytes[..length as usize].to_vec();
+        if self.state_width {
+            bytes.splice(2..2, self.width.load(Ordering::Relaxed).to_le_bytes());
+        }
+        let length = bytes.len() as i32;
         let mut written = 0;
-        // SAFETY: stream reads length initialized stack bytes synchronously; count output is writable.
+        // SAFETY: stream reads length initialized bytes synchronously; count output is writable.
         let result = unsafe { stream.write(bytes.as_mut_ptr().cast(), length, &mut written) };
         if result == kResultOk && written == length {
             kResultOk
