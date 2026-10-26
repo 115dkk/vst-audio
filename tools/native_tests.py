@@ -18,6 +18,8 @@ run("cargo", "test", "--locked", "-p", "vst-audio", "--test", "native",
     "--", "--ignored", "--test-threads=1", "--skip", "third_party_vst3", env=env)
 run("cargo", "test", "--locked", "-p", "vst-audio-worker-sys", "--test", "lifecycle",
     "--", "--ignored", "--test-threads=1", env=env)
+run("cargo", "test", "--locked", "-p", "vst-audio", "--test", "runtime",
+    "--", "--ignored", "--test-threads=1", env=env)
 run("cargo", "test", "--locked", "-p", "vst-audio", "--test", "application",
     "--", "--ignored", "--test-threads=1", "--skip", "audio_thread_automate_is_reported_without_allocating",
     "--skip", "parameter_edit_overflow_keeps_latest_value_and_reports_refresh", env=env)
