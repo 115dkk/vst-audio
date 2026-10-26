@@ -56,11 +56,10 @@ impl Phase {
             (Phase::Loaded, Message::Configure { .. } | Message::Prepare(_)) => {
                 Ok(Phase::Configured)
             }
-            (Phase::Configured | Phase::Active, Message::Activate) => Ok(Phase::Active),
+            (Phase::Configured, Message::Activate) => Ok(Phase::Active),
             (
                 phase,
-                Message::Scan { .. }
-                | Message::Describe
+                Message::Describe
                 | Message::GetState
                 | Message::SetState { .. }
                 | Message::Editor(_)
@@ -324,6 +323,7 @@ mod tests {
     struct Fake {
         state: Vec<u8>,
         active: bool,
+        activations: u32,
     }
     impl Processor for Fake {
         fn process(&mut self, planes: &mut [&mut [f32]], frames: usize) -> bool {
@@ -369,6 +369,7 @@ mod tests {
         }
         fn activate(&mut self) -> Result<(), PluginError> {
             self.active = true;
+            self.activations += 1;
             Ok(())
         }
         fn deactivate(&mut self) {
@@ -378,6 +379,7 @@ mod tests {
             Ok(Box::new(Fake {
                 state: self.state.clone(),
                 active: self.active,
+                activations: self.activations,
             }))
         }
         fn get_state(&mut self) -> Result<Vec<u8>, PluginError> {
@@ -642,6 +644,47 @@ mod tests {
             Phase::Closed
         );
         assert!(Phase::Closed.accept(&Message::GetState).is_err());
+    }
+
+    #[test]
+    fn active_phase_refuses_duplicate_activate_and_scan_before_plugin_calls() {
+        let mut session = Session::new(Fake::default());
+        let request = |id, message| Frame {
+            flags: 0,
+            request: id,
+            message,
+        };
+        assert_eq!(
+            session
+                .serve(request(
+                    1,
+                    Message::Configure {
+                        rate: 48000,
+                        max_frames: 4,
+                        in_channels: 2,
+                        out_channels: 2,
+                    }
+                ))
+                .message,
+            Message::Ack
+        );
+        assert_eq!(
+            session.serve(request(2, Message::Activate)).message,
+            Message::Ack
+        );
+
+        assert!(matches!(
+            session.serve(request(3, Message::Activate)).message,
+            Message::Fault { .. }
+        ));
+        assert_eq!(session.plugin_mut().activations, 1);
+        assert!(
+            Phase::Loaded
+                .accept(&Message::Scan {
+                    path: "plugin.vst3".into()
+                })
+                .is_err()
+        );
     }
 
     #[test]
