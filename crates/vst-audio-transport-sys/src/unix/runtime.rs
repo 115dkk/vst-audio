@@ -553,17 +553,30 @@ impl ChildProcess {
                 .map(|s| s.code().unwrap_or_else(|| 128 + s.signal().unwrap_or(0)) as u32))
         }
     }
-    pub fn wait(&self, timeout: Duration) -> bool {
-        let end = Instant::now() + timeout;
+    /// Waits for confirmed exit, returning `false` only when the timeout expires.
+    /// OS errors are returned immediately rather than treated as timeouts.
+    pub fn wait_for(&self, timeout: Duration) -> io::Result<bool> {
+        let start = Instant::now();
         loop {
-            if self.exit_code().ok().flatten().is_some() {
-                return true;
+            if self.exit_code()?.is_some() {
+                return Ok(true);
             }
-            if Instant::now() >= end {
-                return false;
+            let remaining = timeout.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                return Ok(false);
             }
-            std::thread::sleep(Duration::from_millis(2));
+            std::thread::sleep(remaining.min(Duration::from_millis(2)));
         }
+    }
+    /// Legacy boolean wait; use [`Self::wait_for`] to handle OS errors.
+    ///
+    /// # Panics
+    ///
+    /// Panics if waiting fails. This fail-loud policy no longer disguises an OS
+    /// error as a timeout.
+    pub fn wait(&self, timeout: Duration) -> bool {
+        self.wait_for(timeout)
+            .unwrap_or_else(|error| panic!("failed to wait for child process exit: {error}"))
     }
     pub fn terminate(&self, _: u32) -> io::Result<()> {
         #[cfg(target_os = "macos")]
@@ -649,6 +662,51 @@ mod tests {
         .unwrap();
         assert!(child.wait(Duration::from_secs(10)), "shell did not exit");
         child.exit_code().unwrap().unwrap()
+    }
+
+    #[test]
+    fn wait_for_preserves_echild_after_external_reap() {
+        let sandbox = crate::sandbox::SandboxLaunch::new(None, Path::new("/bin/sh")).unwrap();
+        let args = [OsString::from("-c"), OsString::from("exit 0")];
+        let child = spawn_handles(
+            Path::new("/bin/sh"),
+            &args,
+            &[],
+            parent_handle().unwrap(),
+            sandbox,
+        )
+        .unwrap();
+        let pid = child.pid() as libc::pid_t;
+        let mut status = 0;
+        loop {
+            // SAFETY: pid is this test's actual child and status is writable. No
+            // other thread uses this ChildProcess; this deliberately reaps it externally.
+            let result = unsafe { libc::waitpid(pid, &mut status, 0) };
+            if result == pid {
+                break;
+            }
+            let error = io::Error::last_os_error();
+            assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        }
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+
+        let start = Instant::now();
+        let result = child.wait_for(Duration::from_secs(2));
+        let elapsed = start.elapsed();
+        let legacy = std::panic::catch_unwind(|| child.wait(Duration::ZERO));
+        // Drop's try_wait returns ECHILD before signalling, and its blocking wait
+        // also returns ECHILD. Do not signal a PID that has already been reaped.
+        drop(child);
+        let error = result.expect_err("external reap must report ECHILD, not a timeout");
+        assert_eq!(error.raw_os_error(), Some(libc::ECHILD));
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "error was delayed: {elapsed:?}"
+        );
+        let panic = legacy.expect_err("legacy wait must panic on ECHILD");
+        let message = panic.downcast_ref::<String>().unwrap();
+        assert!(message.contains("failed to wait for child process exit"));
     }
 
     #[test]

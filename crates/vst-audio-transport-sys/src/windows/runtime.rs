@@ -308,17 +308,40 @@ impl ChildProcess {
     pub fn duplicate_handle(&self) -> std::io::Result<OwnedHandle> {
         self.process.try_clone()
     }
-    pub fn wait(&self, timeout: Duration) -> bool {
+    /// Waits for confirmed exit, returning `false` only when the timeout expires.
+    /// OS errors retain their raw Win32 error code.
+    pub fn wait_for(&self, timeout: Duration) -> std::io::Result<bool> {
         // SAFETY: owned process handle remains valid for the whole wait.
-        unsafe {
+        let result = unsafe {
             WaitForSingleObject(
                 self.handle(),
                 timeout.as_millis().min(u128::from(u32::MAX - 1)) as u32,
-            ) == WAIT_OBJECT_0
+            )
+        };
+        match result {
+            WAIT_OBJECT_0 => Ok(true),
+            WAIT_TIMEOUT => Ok(false),
+            WAIT_FAILED => Err(std::io::Error::last_os_error()),
+            status => Err(std::io::Error::other(format!(
+                "unexpected process wait status: {status:?}"
+            ))),
         }
     }
+    /// Legacy boolean wait; use [`Self::wait_for`] to handle OS errors.
+    ///
+    /// # Panics
+    ///
+    /// Panics if waiting fails. This fail-loud policy no longer disguises an OS
+    /// error as a timeout.
+    pub fn wait(&self, timeout: Duration) -> bool {
+        self.wait_for(timeout)
+            .unwrap_or_else(|error| panic!("failed to wait for child process exit: {error}"))
+    }
     pub fn exit_code(&self) -> windows::core::Result<Option<u32>> {
-        if !self.wait(Duration::ZERO) {
+        if !self
+            .wait_for(Duration::ZERO)
+            .map_err(windows::core::Error::from)?
+        {
             return Ok(None);
         }
         let mut code = 0;
@@ -417,4 +440,39 @@ fn environment(temporary: &Path) -> windows::core::Result<Vec<u16>> {
     }
     result.push(0);
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_wait_errors_preserve_access_denied() {
+        let pid = std::process::id();
+        // SAFETY: the current process exists; OpenProcess returns a fresh owned
+        // handle with query rights only, deliberately excluding SYNCHRONIZE.
+        let process =
+            own(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.unwrap());
+        // SAFETY: unnamed job with default security; no process is assigned to it.
+        let job = own(unsafe { CreateJobObjectW(None, None) }.unwrap());
+        let child = ChildProcess {
+            job,
+            process,
+            pid,
+            _sandbox: crate::sandbox::SandboxLaunch::new(None, Path::new("unused")).unwrap(),
+        };
+
+        let error = child.wait_for(Duration::ZERO).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(ERROR_ACCESS_DENIED.0 as i32));
+        let error = child.exit_code().unwrap_err();
+        assert_eq!(
+            error.code(),
+            windows::core::HRESULT::from_win32(ERROR_ACCESS_DENIED.0)
+        );
+        let panic = std::panic::catch_unwind(|| child.wait(Duration::ZERO)).unwrap_err();
+        let message = panic.downcast_ref::<String>().unwrap();
+        assert!(message.contains("failed to wait for child process exit"));
+        // Drop cannot terminate this process: the handle has no terminate right.
+        // Its wait also fails immediately, and the empty job owns no processes.
+    }
 }
