@@ -26,9 +26,7 @@ fn editor_status(width: u32, height: u32, scale: f32) -> Message {
 #[test]
 fn editor_status_rejects_invalid_dimensions_and_scale() {
     for message in [
-        editor_status(0, 200, 1.0),
         editor_status(8193, 200, 1.0),
-        editor_status(320, 0, 1.0),
         editor_status(320, 8193, 1.0),
         editor_status(320, 200, 0.0),
         editor_status(320, 200, 0.49),
@@ -46,7 +44,8 @@ fn editor_status_rejects_invalid_dimensions_and_scale() {
         ));
     }
 
-    for (width, height, scale) in [(1, 1, 0.5), (8192, 8192, 4.0)] {
+    // A minimized or unmapped window reports 0 (Windows GetClientRect, X11).
+    for (width, height, scale) in [(0, 0, 1.0), (1, 1, 0.5), (8192, 8192, 4.0)] {
         round_trip(editor_status(width, height, scale));
     }
 
@@ -57,8 +56,8 @@ fn editor_status_rejects_invalid_dimensions_and_scale() {
     })
     .unwrap();
     for (offset, bytes) in [
-        (15, 0_u32.to_le_bytes()),
-        (19, 8193_u32.to_le_bytes()),
+        (15, 8193_u32.to_le_bytes()),
+        (19, u32::MAX.to_le_bytes()),
         (23, f32::NAN.to_bits().to_le_bytes()),
     ] {
         let mut invalid = valid.clone();

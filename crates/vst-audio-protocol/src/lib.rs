@@ -32,6 +32,9 @@ pub const MAX_STRING_BYTES: usize = 4096;
 const FRAME_META_BYTES: usize = 8;
 /// The largest state blob that can fit in a State or SetState frame body.
 pub const MAX_STATE_BODY_BYTES: usize = MAX_STATE_BYTES - FRAME_META_BYTES;
+/// Largest editor width or height a message carries. An `EditorStatus` may also
+/// report 0 for a minimized or unmapped window (audit #11 TD-48).
+pub const MAX_EDITOR_EXTENT: u32 = 8192;
 
 mod kind {
     pub(super) const HELLO: u16 = 1;
@@ -559,8 +562,8 @@ fn encode_message(message: &Message, out: &mut Vec<u8>) -> Result<(), CodecError
             out.push(*scaling as u8);
         }
         Message::EditorStatus(status) => {
-            if !(1..=8192).contains(&status.width)
-                || !(1..=8192).contains(&status.height)
+            if status.width > MAX_EDITOR_EXTENT
+                || status.height > MAX_EDITOR_EXTENT
                 || !status.scale.is_finite()
                 || !(0.5..=4.0).contains(&status.scale)
             {
@@ -843,8 +846,8 @@ fn decode_message(kind: u16, body: &[u8]) -> Result<Option<Message>, CodecError>
             let width = cursor.u32()?;
             let height = cursor.u32()?;
             let scale = f32::from_bits(cursor.u32()?);
-            if !(1..=8192).contains(&width)
-                || !(1..=8192).contains(&height)
+            if width > MAX_EDITOR_EXTENT
+                || height > MAX_EDITOR_EXTENT
                 || !scale.is_finite()
                 || !(0.5..=4.0).contains(&scale)
             {

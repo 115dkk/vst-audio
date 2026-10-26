@@ -54,6 +54,8 @@ pub struct EditorStatus {
     pub scaling: EditorScaling,
     pub visible: bool,
     pub embedded: bool,
+    /// Client size in pixels, at most [`crate::MAX_EDITOR_EXTENT`]; 0 while the
+    /// window is minimized or unmapped.
     pub width: u32,
     pub height: u32,
     pub scale: f32,

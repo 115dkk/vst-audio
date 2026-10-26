@@ -15,7 +15,8 @@ use std::{
     time::Duration,
 };
 use vst_audio_protocol::{
-    Bus, ClassInfo, DecodedFrame, Frame, Message, PluginFormat, read_frame, write_frame,
+    Bus, ClassInfo, DecodedFrame, EditorStatus, Frame, MAX_EDITOR_EXTENT, Message, PluginFormat,
+    read_frame, write_frame,
 };
 use vst_audio_ring::{Consumer, Geometry, Signal, State, Wait, Waited};
 use vst_audio_transport_sys::{
@@ -37,6 +38,14 @@ fn plugin_error(error: impl std::fmt::Display) -> PluginError {
 /// VST 3 and every other path is VST 2, as `Load` accepts them. VST 2 binaries
 /// keep no fixed extension (a bundle's inner executable has none), so the loader
 /// rather than the extension refuses what is not a plugin (audit #11 TD-95).
+/// A window spanning several monitors can outgrow the wire range, and an
+/// unencodable reply would end the worker; report the largest extent instead
+/// (audit #11 TD-48).
+fn wire_status(mut status: EditorStatus) -> EditorStatus {
+    status.width = status.width.min(MAX_EDITOR_EXTENT);
+    status.height = status.height.min(MAX_EDITOR_EXTENT);
+    status
+}
 fn scan_format(path: &Path) -> PluginFormat {
     if path
         .extension()
@@ -438,8 +447,16 @@ fn forward_notifications(
         send(Message::LatencyChanged { frames })?;
         *reported_latency = Some(frames);
     }
-    if let Some((width, height)) = events.editor_resized {
-        send(Message::EditorResized { width, height })?;
+    // A minimized window reports 0 x 0, which is not a resize; neither that nor
+    // an extent past the wire range may end the worker (audit #11 TD-48).
+    if let Some((width, height)) = events.editor_resized
+        && width != 0
+        && height != 0
+    {
+        send(Message::EditorResized {
+            width: width.min(MAX_EDITOR_EXTENT),
+            height: height.min(MAX_EDITOR_EXTENT),
+        })?;
     }
     if events.editor_closed {
         send(Message::EditorClosed)?;
@@ -736,7 +753,7 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
                             Message::Editor(action) => {
                                 match loaded(&mut plugin)?.editor_action(action).map_err(error)? {
                                     vst_audio_protocol::EditorReply::Status(s) => {
-                                        Ok(Message::EditorStatus(s))
+                                        Ok(Message::EditorStatus(wire_status(s)))
                                     }
                                     vst_audio_protocol::EditorReply::Image(i) => {
                                         Ok(Message::EditorImage(i))
@@ -920,6 +937,56 @@ mod tests {
         ] {
             assert_eq!(scan_format(Path::new(path)), PluginFormat::Vst2, "{path}");
         }
+    }
+
+    #[test]
+    fn oversized_editor_status_still_encodes() {
+        use vst_audio_protocol::{EditorPlatform, EditorScaling, EditorStatus, encode_frame};
+        let status = wire_status(EditorStatus {
+            platform: EditorPlatform::X11,
+            scaling: EditorScaling::Off,
+            visible: true,
+            embedded: false,
+            width: 11_520,
+            height: 0,
+            scale: 1.0,
+            resize_supported: true,
+            scale_supported: false,
+        });
+        assert_eq!((status.width, status.height), (8192, 0));
+        encode_frame(&Frame {
+            flags: 0,
+            request: 1,
+            message: Message::EditorStatus(status),
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn minimized_or_oversized_editor_resize_keeps_the_worker() {
+        let mut output = Vec::new();
+        let mut latency = None;
+        let minimized = PluginEvents {
+            editor_resized: Some((0, 0)),
+            ..Default::default()
+        };
+        assert!(!forward_notifications(&mut output, minimized, &mut latency).unwrap());
+        assert!(output.is_empty());
+        let spanning = PluginEvents {
+            editor_resized: Some((11_520, 600)),
+            ..Default::default()
+        };
+        assert!(!forward_notifications(&mut output, spanning, &mut latency).unwrap());
+        let Some(DecodedFrame::Known(frame)) = read_frame(&mut output.as_slice()).unwrap() else {
+            panic!("expected one known frame");
+        };
+        assert_eq!(
+            frame.message,
+            Message::EditorResized {
+                width: 8192,
+                height: 600
+            }
+        );
     }
 
     #[test]
