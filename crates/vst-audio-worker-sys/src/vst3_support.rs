@@ -90,6 +90,13 @@ impl Edits {
             .unwrap_or_else(|e| e.into_inner())
             .retain(|(pending, _)| *pending != id);
     }
+    /// Main-thread producer preflight; only the audio consumer can free space.
+    pub(crate) fn has_capacity(&self) -> bool {
+        self.write
+            .load(Ordering::Relaxed)
+            .wrapping_sub(self.read.load(Ordering::Acquire))
+            < CAPACITY
+    }
     pub(crate) fn push(&self, id: u32, value: f64) -> bool {
         let write = self.write.load(Ordering::Relaxed);
         if write.wrapping_sub(self.read.load(Ordering::Acquire)) == CAPACITY {

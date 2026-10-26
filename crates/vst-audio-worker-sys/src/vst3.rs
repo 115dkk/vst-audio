@@ -987,6 +987,15 @@ impl Vst3Plugin {
             .controller
             .as_ref()
             .ok_or_else(|| PluginError("no controller".into()))?;
+        // Audit #11 TD-30: reject before changing the controller or forgetting a
+        // deferred editor value (full_parameter_queue_rejects_without_changing_controller_value).
+        // This main thread is the sole producer; audio can only free queue space.
+        // IEditController forbids echoing setParamNormalized through IComponentHandler,
+        // so performEdit cannot reenter the producer here under the SDK contract.
+        // SuppressNotifications only suppresses application notifications, not queue writes.
+        if !self.shared.edits.has_capacity() {
+            return Err(PluginError("parameter queue full".into()));
+        }
         let _notifications = SuppressNotifications::enter();
         check(
             // SAFETY: main-thread live controller, validated ID and normalized value.

@@ -1,6 +1,10 @@
 #![forbid(unsafe_code)]
 
-use std::{path::PathBuf, process::Command};
+use std::{
+    path::PathBuf,
+    process::Command,
+    time::{Duration, Instant},
+};
 use vst_audio::*;
 
 const BUS_COUNT_CHANGE: &str = "VST_AUDIO_TEST_VST3_BUS_COUNT_CHANGE";
@@ -35,6 +39,83 @@ fn start_sidechain() -> Result<Started, StartError> {
         &ProcessingOptions::default(),
         None,
     )
+}
+
+#[test]
+#[ignore = "native fixtures required"]
+fn full_parameter_queue_rejects_without_changing_controller_value() {
+    let worker = PathBuf::from(std::env::var_os("VST_AUDIO_WORKER").expect("worker required"));
+    let plugin = PluginDescriptor::new(
+        PathBuf::from(std::env::var_os("VST_AUDIO_TEST_VST3").expect("VST3 fixture required")),
+        PluginFormat::Vst3,
+    );
+    let instance = Host::new(worker)
+        .spawn(&plugin, &Configuration::default(), None)
+        .unwrap();
+    let control = instance.controller();
+    let wait = |request| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(event) = instance.try_next_event() {
+                let id = match &event {
+                    HostEvent::Parameters { request, .. }
+                    | HostEvent::Completed { request }
+                    | HostEvent::RequestFailed { request, .. } => Some(*request),
+                    _ => None,
+                };
+                if id == Some(request) {
+                    break event;
+                }
+            }
+            assert!(Instant::now() < deadline, "parameter request timed out");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    };
+    let parameters = || {
+        let request = control
+            .request(vst_audio::Command::ListParameters { start: 0, count: 1 })
+            .unwrap();
+        let HostEvent::Parameters { entries, .. } = wait(request) else {
+            panic!("missing parameter page");
+        };
+        entries.into_iter().next().expect("fixture parameter")
+    };
+    let parameter = parameters();
+    assert_eq!(parameter.name, "Width");
+    assert_eq!(parameter.value, 1.0);
+    let mut accepted_value = parameter.value;
+    let mut accepted = 0;
+    // Never take/process audio: no consumer can drain these accepted edits.
+    // Discover overflow through the public reply, not the private queue capacity.
+    for attempt in 0..4096 {
+        let value = if attempt % 2 == 0 { 0.25 } else { 0.75 };
+        let request = control
+            .request(vst_audio::Command::SetParameter {
+                id: parameter.id,
+                value,
+            })
+            .unwrap();
+        match wait(request) {
+            HostEvent::Completed { .. } => {
+                accepted_value = value;
+                accepted += 1;
+            }
+            HostEvent::RequestFailed { reason, .. } => {
+                assert!(reason.contains("parameter queue full"), "{reason}");
+                assert!(accepted > 0, "no edit was admitted before overflow");
+                assert_ne!(value, accepted_value);
+                assert_eq!(
+                    parameters().value,
+                    accepted_value,
+                    "failed SetParameter changed the controller value after {accepted} accepted edits"
+                );
+                assert_eq!(instance.status(), Status::Running);
+                return;
+            }
+            event => panic!("unexpected parameter response: {event:?}"),
+        }
+    }
+    panic!("parameter queue did not reject a bounded burst without audio processing");
 }
 
 #[test]
