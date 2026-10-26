@@ -1,4 +1,4 @@
-"""Exercise two GUI event loops against the public IPC API, with real windows."""
+"""Exercise four GUI event loops against the public IPC API, with real windows."""
 import os
 from pathlib import Path
 import subprocess
@@ -35,7 +35,7 @@ def crash_reports():
 
 
 for round_ in range(1, rounds + 1):
-    for gui in ["egui", "iced"]:
+    for gui in ["egui", "iced", "slint", "tauri"]:
         for index, plugin in enumerate(fixtures):
             command = [str(gui_target / f"vst-audio-{gui}-example{extension}"),
                        "--worker", str(worker), "--plugin", str(plugin), "--smoke"]

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["common", "egui-host", "iced-host"]
+members = ["common", "egui-host", "iced-host", "slint-host", "tauri-host"]
 
 [workspace.dependencies]
 vst-audio = { path = "../../crates/vst-audio" }

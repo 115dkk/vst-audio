@@ -1,0 +1,13 @@
+[package]
+name = "vst-audio-tauri-example"
+version = "0.1.0"
+edition = "2024"
+publish = false
+[dependencies]
+vst-audio-gui-example.workspace = true
+# custom-protocol serves the embedded ui/ directory, as a released Tauri app
+# does; without it tauri is built for `tauri dev`.
+tauri = { version = "=2.12.5", features = ["custom-protocol"] }
+serde = { version = "1.0.229", features = ["derive"] }
+[build-dependencies]
+tauri-build = "=2.7.4"
