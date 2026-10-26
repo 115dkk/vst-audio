@@ -87,6 +87,7 @@ fn prepare_audio_handover(
     updates
         .push(prepared)
         .map_err(|_| "recovery audio boundary became unavailable".to_string())?;
+    shared.publish_runtime_latency(generation, latency_frames);
     shared.generation.store(generation, Ordering::Release);
     shared.set_lifecycle(Lifecycle::Replacing);
     shared.worker_pid.store(control.pid(), Ordering::Release);
@@ -470,8 +471,25 @@ pub(crate) fn supervise(
                                 emit(&events, &shared, HostEvent::ParametersChanged)
                             }
                             Message::LatencyChanged { frames } => {
-                                latency = frames;
-                                emit(&events, &shared, HostEvent::LatencyChanged(frames))
+                                if frames > recovery_config.geometry.latency_bound_frames {
+                                    shared.set_lifecycle(Lifecycle::Failed);
+                                    failure_reported = true;
+                                    emit(
+                                        &events,
+                                        &shared,
+                                        HostEvent::Failed {
+                                            reason: format!(
+                                                "runtime plugin latency {frames} exceeds prepared delay bound {}",
+                                                recovery_config.geometry.latency_bound_frames
+                                            ),
+                                        },
+                                    );
+                                } else {
+                                    latency = frames;
+                                    let generation = shared.generation.load(Ordering::Acquire);
+                                    shared.publish_runtime_latency(generation, frames);
+                                    emit(&events, &shared, HostEvent::LatencyChanged(frames));
+                                }
                             }
                             Message::Fault { text, .. } => {
                                 if let Some(request) = request {

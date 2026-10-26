@@ -710,7 +710,7 @@ fn audio_test_rig(
         capabilities,
         generation: 1,
     };
-    let shared = Shared::for_audio_test();
+    let shared = Shared::for_audio_test(plugin_latency);
     let (_updates, next) = rtrb::RingBuffer::new(2);
     let (retired, _retirements) = rtrb::RingBuffer::new(2);
     let depth = max_callback_frames.div_ceil(quantum);

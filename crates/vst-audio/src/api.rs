@@ -461,6 +461,9 @@ pub(crate) struct Shared {
     pub(crate) overflow: AtomicBool,
     next_request: AtomicU64,
     pub(crate) generation: AtomicU64,
+    runtime_latency_sequence: AtomicU64,
+    runtime_latency_generation: AtomicU64,
+    runtime_latency_frames: AtomicU32,
     pub(crate) applied_generation: AtomicU64,
     pub(crate) processed_generation: AtomicU64,
     pub(crate) history: Mutex<vst_audio_protocol::StateHistory>,
@@ -471,6 +474,26 @@ impl Shared {
     }
     pub(crate) fn lifecycle(&self) -> Lifecycle {
         Lifecycle::from_wire(self.lifecycle.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn publish_runtime_latency(&self, generation: u64, frames: u32) {
+        self.runtime_latency_sequence.fetch_add(1, Ordering::AcqRel);
+        self.runtime_latency_generation
+            .store(generation, Ordering::Relaxed);
+        self.runtime_latency_frames.store(frames, Ordering::Relaxed);
+        self.runtime_latency_sequence
+            .fetch_add(1, Ordering::Release);
+    }
+
+    pub(crate) fn runtime_latency(&self) -> Option<(u64, u32)> {
+        let before = self.runtime_latency_sequence.load(Ordering::Acquire);
+        if before & 1 != 0 {
+            return None;
+        }
+        let generation = self.runtime_latency_generation.load(Ordering::Relaxed);
+        let frames = self.runtime_latency_frames.load(Ordering::Relaxed);
+        let after = self.runtime_latency_sequence.load(Ordering::Acquire);
+        (before == after).then_some((generation, frames))
     }
 }
 #[derive(Clone, Debug)]
@@ -564,7 +587,7 @@ mod tests {
 
 #[cfg(test)]
 impl Shared {
-    pub(crate) fn for_audio_test() -> Arc<Self> {
+    pub(crate) fn for_audio_test(latency_frames: u32) -> Arc<Self> {
         Arc::new(Self {
             stop: Arc::new(AtomicBool::new(false)),
             lifecycle: AtomicU8::new(Lifecycle::Running as u8),
@@ -572,6 +595,9 @@ impl Shared {
             overflow: AtomicBool::new(false),
             next_request: AtomicU64::new(1),
             generation: AtomicU64::new(1),
+            runtime_latency_sequence: AtomicU64::new(0),
+            runtime_latency_generation: AtomicU64::new(1),
+            runtime_latency_frames: AtomicU32::new(latency_frames),
             applied_generation: AtomicU64::new(1),
             processed_generation: AtomicU64::new(0),
             history: Mutex::new(vst_audio_protocol::StateHistory::new()),
@@ -596,6 +622,7 @@ impl Instance {
         launch: Launch,
         cancel: Arc<AtomicBool>,
     ) -> Result<Self, StartError> {
+        let initial_latency = started.latency_frames;
         let shared = Arc::new(Shared {
             stop: cancel,
             lifecycle: AtomicU8::new(Lifecycle::Running as u8),
@@ -603,6 +630,9 @@ impl Instance {
             overflow: AtomicBool::new(false),
             next_request: AtomicU64::new(1),
             generation: AtomicU64::new(1),
+            runtime_latency_sequence: AtomicU64::new(0),
+            runtime_latency_generation: AtomicU64::new(1),
+            runtime_latency_frames: AtomicU32::new(initial_latency),
             applied_generation: AtomicU64::new(1),
             processed_generation: AtomicU64::new(0),
             history: Mutex::new(started.control.state_history()),

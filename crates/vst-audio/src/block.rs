@@ -206,6 +206,12 @@ impl BlockEndpoint {
     }
 
     pub(crate) fn adopt(&mut self) -> bool {
+        if let Some((latency_generation, latency_frames)) = self.shared.runtime_latency()
+            && latency_generation == self.active.generation
+        {
+            self.active.latency = latency_frames;
+        }
+
         // Never release the last Arc or a heap buffer on this thread.
         if self.retired.is_full() || self.shared.stop.load(Ordering::Acquire) {
             return false;
@@ -221,6 +227,11 @@ impl BlockEndpoint {
             .lane
             .restart(self.depth)
             .expect("replacement geometry was validated");
+        if let Some((latency_generation, latency_frames)) = self.shared.runtime_latency()
+            && latency_generation == self.active.generation
+        {
+            self.active.latency = latency_frames;
+        }
         self.shared
             .applied_generation
             .store(self.active.generation, Ordering::Release);
