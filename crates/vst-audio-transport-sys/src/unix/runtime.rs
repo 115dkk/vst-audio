@@ -432,7 +432,10 @@ impl UnixChild {
         let result = unsafe { libc::kill(-self.pid(), libc::SIGKILL) };
         if result != 0 {
             let error = io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::ESRCH) {
+            // ESRCH: the group is empty. EPERM: nothing in it can be signalled,
+            // which Darwin reports for a group of zombies, the usual state once
+            // the leader exited. Either way the leader must still be reaped.
+            if !matches!(error.raw_os_error(), Some(libc::ESRCH | libc::EPERM)) {
                 return Err(error);
             }
         }
