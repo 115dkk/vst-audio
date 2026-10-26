@@ -95,17 +95,21 @@ class Gate(unittest.TestCase):
                 g._fetch_tags()
         self.assertEqual(run.call_count, 3)
 
-    def test_rejected_bump_push_defers_release_to_new_main(self):
+    def _release_with_pushes(self, push_results, remote_main):
+        """Runs main() for a bump whose pushes return `push_results` in turn."""
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "output"
+            results = iter(push_results)
             pushes = 0
 
             def run(*args, **_kwargs):
                 nonlocal pushes
                 if args[:3] == ("git", "push", "origin"):
                     pushes += 1
-                    if pushes == 1:
-                        return subprocess.CompletedProcess([], 1, "", "non-fast-forward")
+                    code, stderr = next(results)
+                    return subprocess.CompletedProcess([], code, "", stderr)
+                if args[:3] == ("git", "ls-remote", "origin"):
+                    return subprocess.CompletedProcess([], 0, f"{remote_main}\trefs/heads/main\n", "")
                 return subprocess.CompletedProcess([], 0, "", "")
 
             def git(*args):
@@ -129,12 +133,28 @@ class Gate(unittest.TestCase):
                     mock.patch.object(g, "_write"), \
                     mock.patch.object(g, "_git", side_effect=git), \
                     mock.patch.object(g, "_fetch_tags"), \
-                    mock.patch.object(g, "_run", side_effect=run):
+                    mock.patch.object(g, "_run", side_effect=run), \
+                    mock.patch.object(g.time, "sleep"):
                 with contextlib.redirect_stdout(io.StringIO()):
                     self.assertEqual(g.main(), 0)
-            self.assertIn("should_release=false", output.read_text())
-            self.assertEqual(pushes, 1)
+            return output.read_text(), pushes
 
+    def test_rejected_bump_push_defers_release_to_new_main(self):
+        output, pushes = self._release_with_pushes([(1, "non-fast-forward")], "c" * 40)
+        self.assertIn("should_release=false", output)
+        self.assertEqual(pushes, 1)
+
+    def test_transient_push_failure_retries_while_main_is_unmoved(self):
+        # A network failure with main still at the decided head is not a moved main.
+        output, pushes = self._release_with_pushes(
+            [(128, "Could not resolve host"), (0, "")], "a" * 40)
+        self.assertIn("should_release=true", output)
+        self.assertIn(f"release_sha={'b' * 40}", output)
+        self.assertEqual(pushes, 2)
+
+    def test_push_failing_with_main_unmoved_exits(self):
+        with self.assertRaisesRegex(SystemExit, "bump push failed after 3 attempts"):
+            self._release_with_pushes([(128, "Could not resolve host")] * 3, "a" * 40)
 
 if __name__ == "__main__":
     unittest.main()
