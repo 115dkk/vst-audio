@@ -525,6 +525,12 @@ pub enum Publish {
 /// cached so the per-block path needs no [`Producer`] and no borrow of the
 /// mapping beyond each call. Every method takes the [`Region`] it works on and
 /// neither blocks, locks nor allocates; `work` is only signalled.
+///
+/// Each lane has exactly one producer and one consumer. The producer publishes
+/// only the next wrapping sequence and accesses a completed slot only after the
+/// completion counter's Acquire load. The consumer likewise accesses a slot
+/// only after observing its publication with Acquire, then calls
+/// [`Consumer::complete`] after processing it.
 #[derive(Clone, Copy, Debug)]
 pub struct Publisher {
     geometry: Geometry,
@@ -1049,6 +1055,12 @@ fn load_packet(words: &[AtomicU32], frames: u32, events: &mut EventBuffer) -> bo
     true
 }
 
+/// The worker-side half of the ring.
+///
+/// Use one consumer per lane. After [`Consumer::next_published`] observes the
+/// next sequence with Acquire, read and process that slot through the methods
+/// below, then call [`Consumer::complete`] for the same sequence before moving
+/// to the next one. These ordering and ownership rules pair with [`Publisher`].
 pub struct Consumer<'a> {
     region: Region<'a>,
     geometry: Option<Geometry>,
@@ -1108,6 +1120,8 @@ impl<'a> Consumer<'a> {
         }
     }
 
+    /// Acquires publication and returns only the next uncompleted sequence.
+    /// Slot access for that sequence must happen after this call.
     pub fn next_published(&self, lane: usize) -> Option<u32> {
         let geometry = self.geometry?;
         if lane >= geometry.lanes as usize || self.region.state() != Some(State::Ready) {
@@ -1233,6 +1247,8 @@ impl<'a> Consumer<'a> {
         true
     }
 
+    /// Releases `sequence` after all sample and packet processing has finished,
+    /// allowing the producer to read and eventually reuse the slot.
     pub fn complete(&self, lane: usize, sequence: u32) {
         let Some(geometry) = self.geometry else {
             return;
