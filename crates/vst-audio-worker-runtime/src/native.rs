@@ -33,24 +33,18 @@ fn plugin_error(error: impl std::fmt::Display) -> PluginError {
     PluginError(error.to_string())
 }
 
-fn scan_format(path: &Path) -> Result<PluginFormat, StartError> {
-    let extension = path
+/// The frozen Scan message has no format field: `.vst3` files and bundles are
+/// VST 3 and every other path is VST 2, as `Load` accepts them. VST 2 binaries
+/// keep no fixed extension (a bundle's inner executable has none), so the loader
+/// rather than the extension refuses what is not a plugin (audit #11 TD-95).
+fn scan_format(path: &Path) -> PluginFormat {
+    if path
         .extension()
-        .and_then(std::ffi::OsStr::to_str)
-        .ok_or_else(|| StartError("unknown plugin extension".into()))?;
-    if extension.eq_ignore_ascii_case("vst3") {
-        return Ok(PluginFormat::Vst3);
-    }
-    #[cfg(target_os = "windows")]
-    let vst2 = extension.eq_ignore_ascii_case("dll");
-    #[cfg(target_os = "macos")]
-    let vst2 = extension.eq_ignore_ascii_case("vst");
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let vst2 = extension.eq_ignore_ascii_case("so");
-    if vst2 {
-        Ok(PluginFormat::Vst2)
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("vst3"))
+    {
+        PluginFormat::Vst3
     } else {
-        Err(StartError(format!("unknown plugin extension: {extension}")))
+        PluginFormat::Vst2
     }
 }
 
@@ -614,7 +608,7 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
                             .transpose()
                             .map_err(error)?;
                         let reply = match message {
-                            Message::Scan { path } => match scan_format(Path::new(&path))? {
+                            Message::Scan { path } => match scan_format(Path::new(&path)) {
                                 PluginFormat::Vst3 => {
                                     let module = vst_audio_worker_sys::vst3::Vst3Module::load(
                                         Path::new(&path),
@@ -915,17 +909,17 @@ mod tests {
     }
 
     #[test]
-    fn scan_rejects_unknown_plugin_extension() {
-        assert_eq!(
-            scan_format(Path::new("plugin.vst3")).unwrap(),
-            PluginFormat::Vst3
-        );
-        assert!(
-            scan_format(Path::new("plugin.unknown"))
-                .unwrap_err()
-                .to_string()
-                .contains("unknown plugin extension")
-        );
+    fn scan_treats_every_path_but_vst3_as_vst2() {
+        assert_eq!(scan_format(Path::new("plugin.VST3")), PluginFormat::Vst3);
+        for path in [
+            "plugin.dll",
+            "plugin.so",
+            "plugin.vst",
+            "plugin.unknown",
+            "Plugin",
+        ] {
+            assert_eq!(scan_format(Path::new(path)), PluginFormat::Vst2, "{path}");
+        }
     }
 
     #[test]
