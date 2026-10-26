@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeSet;
-use std::io::Cursor;
+use std::io::{self, Cursor, Read};
 
 use vst_audio_protocol::{
     Action, Bus, BusInfo, BusKind, ClassInfo, CodecError, DecodedFrame, DisableReason, EditPhase,
@@ -44,6 +44,39 @@ fn editor_platforms_round_trip_and_reject_unknown_tags() {
             Err(CodecError::InvalidValue)
         ));
     }
+}
+
+#[test]
+fn read_frame_retries_an_interrupted_first_read() {
+    struct InterruptOnce {
+        bytes: Cursor<Vec<u8>>,
+        interrupted: bool,
+    }
+
+    impl Read for InterruptOnce {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            self.bytes.read(buffer)
+        }
+    }
+
+    let frame = Frame {
+        flags: 7,
+        request: 42,
+        message: Message::hello(),
+    };
+    let mut reader = InterruptOnce {
+        bytes: Cursor::new(encode_frame(&frame).unwrap()),
+        interrupted: false,
+    };
+
+    assert_eq!(
+        read_frame(&mut reader).unwrap(),
+        Some(DecodedFrame::Known(frame))
+    );
 }
 
 fn round_trip(message: Message) {

@@ -379,10 +379,16 @@ pub fn decode_frame(bytes: &[u8]) -> Result<DecodedFrame, CodecError> {
 pub fn read_frame(reader: &mut impl Read) -> Result<Option<DecodedFrame>, CodecError> {
     let mut length_bytes = [0_u8; 4];
     let mut first = [0_u8; 1];
-    match reader.read(&mut first) {
-        Ok(0) => return Ok(None),
-        Ok(_) => length_bytes[0] = first[0],
-        Err(error) => return Err(CodecError::Io(error)),
+    loop {
+        match reader.read(&mut first) {
+            Ok(0) => return Ok(None),
+            Ok(_) => {
+                length_bytes[0] = first[0];
+                break;
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(CodecError::Io(error)),
+        }
     }
     reader.read_exact(&mut length_bytes[1..]).map_err(map_eof)?;
     let length = u32::from_le_bytes(length_bytes) as usize;
