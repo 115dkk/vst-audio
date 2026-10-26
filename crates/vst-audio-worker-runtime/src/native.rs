@@ -287,6 +287,18 @@ impl Plugin for Vst2 {
     }
 }
 
+fn ring_validation_error(
+    expected: Geometry,
+    actual: Result<Geometry, vst_audio_ring::HeaderError>,
+) -> StartError {
+    match actual {
+        Ok(actual) => StartError(format!(
+            "ring validation failed: expected {expected:?}, actual {actual:?}"
+        )),
+        Err(error) => StartError(format!("ring validation failed: {error:?}")),
+    }
+}
+
 fn finish_audio(
     result: Result<(), StartError>,
     audio: Option<thread::JoinHandle<()>>,
@@ -568,7 +580,7 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
                                         Consumer::new(view, &*ready, [Some(&*done), None]);
                                     let result = consumer.validate_and_ready(std::process::id());
                                     let valid = result == Ok(geometry);
-                                    let _ = validated.send(valid);
+                                    let _ = validated.send(result);
                                     if !valid {
                                         consumer
                                             .fault(vst_audio_ring::Fault::LayoutMismatch as u32);
@@ -586,11 +598,11 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
                                     }
                                     processor.stop();
                                 }));
-                                if !validation
+                                let actual = validation
                                     .recv_timeout(Duration::from_secs(5))
-                                    .map_err(error)?
-                                {
-                                    return Err(StartError("ring validation failed".into()));
+                                    .map_err(error)?;
+                                if actual != Ok(geometry) {
+                                    return Err(ring_validation_error(geometry, actual));
                                 }
                                 Ok(Message::Ack)
                             }
@@ -803,6 +815,31 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
 mod tests {
     use super::*;
     use vst_audio_protocol::{BusInfo, BusKind};
+
+    #[test]
+    fn ring_validation_error_names_expected_and_actual_geometry() {
+        let expected = Geometry {
+            sample_format: vst_audio_ring::SampleFormat::F32,
+            lanes: 1,
+            slots: 2,
+            input_channels: 0,
+            output_channels: 2,
+            max_frames: 128,
+            sample_rate: 48000,
+            latency_bound_frames: 96000,
+        };
+        let actual = Geometry {
+            output_channels: 1,
+            ..expected
+        };
+
+        let message = ring_validation_error(expected, Ok(actual)).to_string();
+
+        assert!(message.contains("expected"));
+        assert!(message.contains("output_channels: 2"));
+        assert!(message.contains("actual"));
+        assert!(message.contains("output_channels: 1"));
+    }
 
     #[test]
     fn finish_reports_audio_thread_panic_without_hiding_an_earlier_error() {
