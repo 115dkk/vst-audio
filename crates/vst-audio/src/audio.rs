@@ -377,7 +377,14 @@ impl AudioEndpoint {
                     self.event_cursor += 1;
                     if valid_output {
                         event.sample_offset = current as u32;
-                        if let Some(destination) = output_events.get_mut(report.events_written) {
+                        let undeclared_bus =
+                            matches!(event.data, EventData::Midi(_) | EventData::SysEx { .. })
+                                && event.bus >= self.blocks.capabilities().output_event_buses;
+                        if undeclared_bus {
+                            report.events_dropped = report.events_dropped.saturating_add(1);
+                        } else if let Some(destination) =
+                            output_events.get_mut(report.events_written)
+                        {
                             *destination = event;
                             report.events_written += 1;
                         } else {
@@ -1573,6 +1580,65 @@ mod golden {
 
         assert_eq!(report.events_dropped, 1);
         assert_eq!(report.generation, 2);
+    }
+
+    #[test]
+    fn drops_midi_and_sysex_from_undeclared_output_event_buses() {
+        let mut rig = audio_test_rig(SampleFormat::F32, Fallback::Silence, 4, 4, 2, 1, 1, 0, 0, 0);
+        let input = [0.0; 4];
+        let mut output = [0.0; 4];
+        assert_eq!(
+            rig.endpoint
+                .process_events(
+                    4,
+                    &[&input],
+                    &mut [&mut output],
+                    Transport::default(),
+                    &[],
+                    &mut [],
+                )
+                .events_dropped,
+            0
+        );
+        let sequence = rig.consumer.next_published(0).unwrap();
+        let mut sysex = [0; vst_audio_ring::MAX_SYSEX_BYTES];
+        sysex[0] = 0xf0;
+        sysex[1] = 0xf7;
+        let mut output_packet = EventBuffer::default();
+        output_packet.push(AudioEvent::midi(0, 0, [0x90, 60, 100]));
+        output_packet.push(AudioEvent::midi(1, 1, [0x90, 61, 100]));
+        output_packet.push(AudioEvent {
+            sample_offset: 2,
+            bus: 2,
+            data: EventData::SysEx {
+                len: 2,
+                bytes: sysex,
+            },
+        });
+        assert!(rig.consumer.output_packet(0, sequence, &output_packet));
+        rig.consumer.complete(0, sequence);
+
+        let mut output_events = [AudioEvent::default(); 3];
+        let warmup = rig.endpoint.process_events(
+            4,
+            &[&input],
+            &mut [&mut output],
+            Transport::default().advanced(4, 48_000),
+            &[],
+            &mut output_events,
+        );
+        assert_eq!((warmup.events_written, warmup.events_dropped), (0, 0));
+        let report = rig.endpoint.process_events(
+            4,
+            &[&input],
+            &mut [&mut output],
+            Transport::default().advanced(8, 48_000),
+            &[],
+            &mut output_events,
+        );
+
+        assert_eq!((report.events_written, report.events_dropped), (1, 2));
+        assert_eq!(output_events[0], AudioEvent::midi(0, 0, [0x90, 60, 100]));
     }
 
     fn cost_case(fallback: Fallback, quantum: u32, callback: u32, maximum: u32) {
