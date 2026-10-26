@@ -5,13 +5,13 @@ import subprocess
 import sys
 import time
 import shutil
-from fixtures import prepare
+from fixtures import prepare, target_directory
 
 ROOT = Path(__file__).resolve().parents[1]
 worker, vst2, vst3 = prepare()
 subprocess.run(["cargo", "build", "--locked", "--manifest-path",
                 "examples/gui/Cargo.toml", "--workspace"], cwd=ROOT, check=True)
-gui_target = Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "examples/gui/target")) / "debug"
+gui_target = target_directory() / "debug"
 extension = ".exe" if sys.platform == "win32" else ""
 fixtures = [vst2, vst3]
 output = ROOT / "test-results"

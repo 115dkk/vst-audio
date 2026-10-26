@@ -13,7 +13,7 @@ import stat
 import subprocess
 import sys
 import tempfile
-from fixtures import download
+from fixtures import download, target_directory
 
 ROOT = Path(__file__).resolve().parents[1]
 PINS = {
@@ -276,7 +276,7 @@ def main():
         if options.build_only:
             return
         run("cargo", "build", "--locked", "-p", "vst-audio-worker")
-        target = Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "target"))
+        target = target_directory()
         worker = target / "debug" / ("vst-audio-worker.exe" if sys.platform == "win32" else "vst-audio-worker")
         if sys.platform == "win32":
             installed = install_software_opengl(root, paths.values())

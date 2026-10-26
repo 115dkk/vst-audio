@@ -12,7 +12,7 @@ import tarfile
 import tempfile
 import tomllib
 
-from fixtures import ROOT, prepare
+from fixtures import ROOT, prepare, target_directory
 
 worker, vst2_plugin, plugin = prepare()
 version = tomllib.loads((ROOT / "Cargo.toml").read_text())["workspace"]["package"]["version"]
@@ -64,7 +64,7 @@ try:
         shutil.copyfile(archive, artifact / archive.name)
 
     stage = "packaged worker"
-    target = Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "target")) / "package-consumer"
+    target = target_directory() / "package-consumer"
     command = ["cargo", "build", "--manifest-path",
                str(vendor / f"vst-audio-worker-{version}" / "Cargo.toml"),
                "--target-dir", str(target)]
