@@ -27,6 +27,9 @@ fn wide(text: &str, output: &mut [u16]) {
 struct Matrix {
     mode: AtomicU8,
     width: AtomicU64,
+    mapping_mode: Option<String>,
+    mapping_changed: AtomicBool,
+    right_gain: AtomicU64,
     active: AtomicBool,
     kind: u8,
     bus_count_change: Option<(i32, i32)>,
@@ -39,6 +42,9 @@ impl Matrix {
         Self {
             mode: AtomicU8::new(0),
             width: AtomicU64::new(1.0f64.to_bits()),
+            mapping_mode: std::env::var("VST_AUDIO_TEST_VST3_MAPPING_CHANGE").ok(),
+            mapping_changed: AtomicBool::new(false),
+            right_gain: AtomicU64::new(1.0f64.to_bits()),
             active: AtomicBool::new(false),
             kind,
             bus_count_change: match std::env::var("VST_AUDIO_TEST_VST3_BUS_COUNT_CHANGE").as_deref()
@@ -89,7 +95,7 @@ impl Matrix {
     }
 }
 impl Class for Matrix {
-    type Interfaces = (IComponent, IAudioProcessor, IEditController);
+    type Interfaces = (IComponent, IAudioProcessor, IEditController, IMidiMapping);
 }
 impl IPluginBaseTrait for Matrix {
     unsafe fn initialize(&self, _context: *mut FUnknown) -> tresult {
@@ -289,7 +295,7 @@ impl IAudioProcessorTrait for Matrix {
                 }
             }
         }
-        let mut points = [(0, 0.0); 256];
+        let mut points = [(0, 0, 0.0); 256];
         let mut point_count = 0;
         // SAFETY: optional parameter list is borrowed for the duration of process.
         if let Some(changes) = unsafe { ComRef::from_raw(data.inputParameterChanges) } {
@@ -304,7 +310,14 @@ impl IAudioProcessorTrait for Matrix {
                     let id = unsafe { queue.getParameterId() };
                     // SAFETY: live queue accessor.
                     let n = unsafe { queue.getPointCount() }.clamp(0, 256);
-                    if id != 0 {
+                    let right_id = if self.mapping_mode.as_deref() == Some("parameter-id")
+                        && self.mapping_changed.load(Ordering::Relaxed)
+                    {
+                        2
+                    } else {
+                        1
+                    };
+                    if id != 0 && !(self.mapping_mode.is_some() && id == right_id) {
                         continue;
                     }
                     for j in 0..n {
@@ -315,7 +328,7 @@ impl IAudioProcessorTrait for Matrix {
                         let mut value = 0.0;
                         // SAFETY: enumerated point and writable outputs.
                         if unsafe { queue.getPoint(j, &mut offset, &mut value) } == kResultOk {
-                            points[point_count] = (offset, value);
+                            points[point_count] = (offset, id, value);
                             point_count += 1;
                         }
                     }
@@ -323,9 +336,14 @@ impl IAudioProcessorTrait for Matrix {
             }
         }
         for frame in 0..data.numSamples as usize {
-            for (offset, value) in &points[..point_count] {
+            for (offset, id, value) in &points[..point_count] {
                 if *offset == frame as i32 {
-                    self.width.store(value.to_bits(), Ordering::Relaxed);
+                    let target = if *id == 0 {
+                        &self.width
+                    } else {
+                        &self.right_gain
+                    };
+                    target.store(value.to_bits(), Ordering::Relaxed);
                 }
             }
             for event in &notes[..count] {
@@ -367,7 +385,15 @@ impl IAudioProcessorTrait for Matrix {
                 // SAFETY: main output left is declared by this component.
                 unsafe { write_sample(data, 0, 0, frame, left * gain + side * 2.0) };
                 // SAFETY: main output right is declared by this component.
-                unsafe { write_sample(data, 0, 1, frame, right * gain) };
+                unsafe {
+                    write_sample(
+                        data,
+                        0,
+                        1,
+                        frame,
+                        right * gain * f64::from_bits(self.right_gain.load(Ordering::Relaxed)),
+                    )
+                };
                 // SAFETY: auxiliary output may be inactive; helper checks before writing.
                 unsafe { write_sample(data, 1, 0, frame, side * 3.0) };
             }
@@ -392,15 +418,22 @@ impl IEditControllerTrait for Matrix {
         unsafe { self.save(state) }
     }
     unsafe fn getParameterCount(&self) -> i32 {
-        1
+        if self.mapping_mode.is_some() { 2 } else { 1 }
     }
     unsafe fn getParameterInfo(&self, index: i32, info: *mut ParameterInfo) -> tresult {
-        if index != 0 || info.is_null() {
+        if !(index == 0 || (index == 1 && self.mapping_mode.is_some())) || info.is_null() {
             return kInvalidArgument;
         }
         // SAFETY: SDK output for parameter zero is a writable ParameterInfo.
         let info = unsafe { &mut *info };
-        info.id = 0;
+        info.id = if index == 1
+            && self.mapping_mode.as_deref() == Some("parameter-id")
+            && self.mapping_changed.load(Ordering::Relaxed)
+        {
+            2
+        } else {
+            index as u32
+        };
         info.stepCount = 0;
         info.defaultNormalizedValue = 1.0;
         info.unitId = 0;
@@ -428,15 +461,39 @@ impl IEditControllerTrait for Matrix {
     unsafe fn plainParamToNormalized(&self, _: u32, value: f64) -> f64 {
         value
     }
-    unsafe fn getParamNormalized(&self, _: u32) -> f64 {
-        f64::from_bits(self.width.load(Ordering::Relaxed))
+    unsafe fn getParamNormalized(&self, id: u32) -> f64 {
+        let target = if id == 0 {
+            &self.width
+        } else {
+            &self.right_gain
+        };
+        f64::from_bits(target.load(Ordering::Relaxed))
     }
     unsafe fn setParamNormalized(&self, id: u32, value: f64) -> tresult {
-        if id != 0 || !value.is_finite() {
+        if (id != 0 && !(self.mapping_mode.is_some() && id <= 2)) || !value.is_finite() {
             return kInvalidArgument;
         }
-        self.width
-            .store(value.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+        let target = if id == 0 {
+            &self.width
+        } else {
+            &self.right_gain
+        };
+        target.store(value.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+        // Main-thread request deterministically switches the live mapping after
+        // take_processor; mapping_restart_changes_reach_new_parameter_audio, audit #11 TD-31.
+        if id == 0
+            && self.mapping_mode.is_some()
+            && !self.mapping_changed.swap(true, Ordering::Relaxed)
+            && let Some(handler) = self.handler.borrow().as_ref()
+        {
+            let flag = if self.mapping_mode.as_deref() == Some("parameter-id") {
+                RestartFlags_::kParamIDMappingChanged
+            } else {
+                RestartFlags_::kMidiCCAssignmentChanged
+            };
+            // SAFETY: retained host handler invoked on the controller's main thread.
+            let _ = unsafe { handler.restartComponent(flag) };
+        }
         kResultOk
     }
     unsafe fn setComponentHandler(&self, handler: *mut IComponentHandler) -> tresult {
@@ -459,6 +516,35 @@ impl IEditControllerTrait for Matrix {
         .to_com_ptr::<IPlugView>()
         .expect("view interface")
         .into_raw()
+    }
+}
+impl IMidiMappingTrait for Matrix {
+    unsafe fn getMidiControllerAssignment(
+        &self,
+        bus: i32,
+        channel: i16,
+        controller: i16,
+        id: *mut ParamID,
+    ) -> tresult {
+        if self.mapping_mode.is_none()
+            || bus != 0
+            || channel != 0
+            || controller != 7
+            || id.is_null()
+        {
+            return kResultFalse;
+        }
+        let changed = self.mapping_changed.load(Ordering::Relaxed);
+        let target = if !changed {
+            0
+        } else if self.mapping_mode.as_deref() == Some("parameter-id") {
+            2
+        } else {
+            1
+        };
+        // SAFETY: nonnull writable SDK ParamID output, borrowed for this call.
+        unsafe { *id = target };
+        kResultOk
     }
 }
 struct View {

@@ -265,7 +265,16 @@ impl Vst3Module {
             .ok_or_else(|| PluginError("null VST 3 instance".into()))
     }
 }
+#[derive(Default)]
+struct MappingSnapshot {
+    midi: Vec<(u32, u32, u32)>,
+    writable_ids: Vec<u32>,
+    known_ids: Vec<u32>,
+}
 struct Shared {
+    // Main thread replaces/drops the snapshot only with admission closed and
+    // busy drained. Audio borrows it only inside the admitted busy scope.
+    mappings: std::cell::UnsafeCell<MappingSnapshot>,
     processor: ComPtr<IAudioProcessor>,
     admitted: AtomicBool,
     busy: AtomicBool,
@@ -274,6 +283,13 @@ struct Shared {
     edits: Arc<Edits>,
     _library: Arc<ModuleLibrary>,
 }
+// SAFETY: processor access follows the SDK's existing main/audio thread contract;
+// all remaining shared state is atomic or internally synchronized. The sole
+// UnsafeCell is main-thread-written only under control(): SeqCst admission closes
+// entry and busy drains existing readers; audio rechecks admission after acquiring
+// busy and releases it only after its snapshot borrow ends. No snapshot reference
+// escapes that scope, and only the main-thread Vst3Plugin can replace it.
+unsafe impl Sync for Shared {}
 struct Admission<'a>(&'a Shared);
 impl Drop for Admission<'_> {
     fn drop(&mut self) {
@@ -405,6 +421,7 @@ impl Vst3Plugin {
             .to_com_ptr()
             .expect("handler interface");
         let shared = Arc::new(Shared {
+            mappings: std::cell::UnsafeCell::new(MappingSnapshot::default()),
             processor,
             admitted: AtomicBool::new(true),
             busy: AtomicBool::new(false),
@@ -799,24 +816,7 @@ impl Vst3Plugin {
             let _ = unsafe { self.component.setActive(0) };
         }
     }
-    pub fn take_processor(&mut self) -> Result<Vst3Processor, PluginError> {
-        if self.processor_taken || self.max_frames == 0 {
-            return Err(PluginError(
-                "VST 3 processor already taken or not configured".into(),
-            ));
-        }
-        self.processor_taken = true;
-        let setup = self.setup.as_ref().expect("configured").clone();
-        let changes = Changes::new();
-        let pointer = changes.to_com_ptr().expect("parameter changes");
-        let output_changes = Changes::new();
-        let output_pointer = output_changes
-            .to_com_ptr()
-            .expect("output parameter changes");
-        let input_events = crate::vst3_events::EventList::new();
-        let input_events_ptr = input_events.to_com_ptr().expect("input event list");
-        let output_events = crate::vst3_events::EventList::new();
-        let output_events_ptr = output_events.to_com_ptr().expect("output event list");
+    fn build_mappings(&mut self) -> Result<MappingSnapshot, PluginError> {
         let mut mappings = Vec::new();
         if let Some(mapping) = self
             .controller
@@ -885,9 +885,11 @@ impl Vst3Plugin {
         }
         mappings.sort_unstable_by_key(|p| p.0);
         let mut parameter_ids = Vec::new();
+        let mut known_ids = Vec::new();
         let mut start = 0;
         loop {
             let (total, page) = self.parameters(start, 32)?;
+            known_ids.extend(page.iter().map(|p| p.id));
             parameter_ids.extend(page.into_iter().filter(|p| !p.read_only).map(|p| p.id));
             start += 32;
             if start >= total {
@@ -896,6 +898,47 @@ impl Vst3Plugin {
         }
         parameter_ids.sort_unstable();
         parameter_ids.dedup();
+        Ok(MappingSnapshot {
+            midi: mappings,
+            writable_ids: parameter_ids,
+            known_ids,
+        })
+    }
+    fn rebuild_mappings(&mut self) -> Result<(), PluginError> {
+        let shared = self.shared.clone();
+        let _control = shared.control();
+        // VST3 controllers may change CC assignments and IDs at runtime (audit
+        // #11 TD-31; mapping_restart_changes_reach_new_parameter_audio).
+        let snapshot = self.build_mappings()?;
+        shared
+            .edits
+            .set_known_parameters(snapshot.known_ids.iter().copied());
+        // SAFETY: the unique main-thread owner holds control admission, which
+        // closes new audio entry and waits for busy=false. Audio references end
+        // before releasing busy, so replacing AND dropping the old Vecs here
+        // cannot overlap a reader and never allocates/frees on the audio thread.
+        unsafe { *shared.mappings.get() = snapshot };
+        Ok(())
+    }
+    pub fn take_processor(&mut self) -> Result<Vst3Processor, PluginError> {
+        if self.processor_taken || self.max_frames == 0 {
+            return Err(PluginError(
+                "VST 3 processor already taken or not configured".into(),
+            ));
+        }
+        self.rebuild_mappings()?;
+        self.processor_taken = true;
+        let setup = self.setup.as_ref().expect("configured").clone();
+        let changes = Changes::new();
+        let pointer = changes.to_com_ptr().expect("parameter changes");
+        let output_changes = Changes::new();
+        let output_pointer = output_changes
+            .to_com_ptr()
+            .expect("output parameter changes");
+        let input_events = crate::vst3_events::EventList::new();
+        let input_events_ptr = input_events.to_com_ptr().expect("input event list");
+        let output_events = crate::vst3_events::EventList::new();
+        let output_events_ptr = output_events.to_com_ptr().expect("output event list");
         Ok(Vst3Processor {
             shared: self.shared.clone(),
             changes,
@@ -906,8 +949,6 @@ impl Vst3Plugin {
             input_events_ptr,
             output_events,
             output_events_ptr,
-            mappings,
-            parameter_ids,
             inputs: vst_audio_protocol::ProcessingSetup::channels(&setup.inputs) as usize,
             outputs: vst_audio_protocol::ProcessingSetup::channels(&setup.outputs) as usize,
             frames: self.max_frames,
@@ -1705,8 +1746,19 @@ impl Vst3Plugin {
         }
     }
     pub fn take_events(&mut self) -> PluginEvents {
-        self.shared.edits.flush_deferred();
         let flags = self.shared.edits.flags.swap(0, Ordering::AcqRel);
+        let mapping_failed = if flags & 8 != 0 {
+            if let Err(error) = self.rebuild_mappings() {
+                eprintln!("VST3 mapping rebuild failed: {error}");
+                self.shared.closed.store(true, Ordering::SeqCst);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        self.shared.edits.flush_deferred();
         let latency_changed = if flags & 2 != 0 {
             // SAFETY: SDK latency notification handled on main thread, live processor.
             self.info.latency = unsafe { self.shared.processor.getLatencySamples() };
@@ -1738,7 +1790,9 @@ impl Vst3Plugin {
             parameter_edits: self.shared.edits.notifications.drain(),
             latency_changed,
             editor_closed: std::mem::take(&mut self.closed_editor),
-            fault: if flags & 4 != 0 {
+            fault: if mapping_failed {
+                Some("VST 3 mapping rebuild failed")
+            } else if flags & 4 != 0 {
                 Some("bus layout changed")
             } else if flags & 16 != 0 {
                 Some("VST 3 audio processing failed")
@@ -1754,6 +1808,10 @@ impl Drop for Vst3Plugin {
         self.deactivate();
         let _control = self.shared.control();
         self.shared.closed.store(true, Ordering::SeqCst);
+        // SAFETY: control admission is closed and busy drained; closed prevents
+        // any later audio entry. Reclaim Vec storage here even if the processor
+        // retains the last Shared reference and eventually drops it on audio.
+        unsafe { *self.shared.mappings.get() = MappingSnapshot::default() };
         if let Some((a, b)) = self.connection.take() {
             // SAFETY: main-thread connected endpoints still retained through disconnect.
             let _ = unsafe { a.disconnect(b.as_ptr()) };
@@ -1784,8 +1842,6 @@ pub struct Vst3Processor {
     input_events_ptr: ComPtr<IEventList>,
     output_events: ComWrapper<crate::vst3_events::EventList>,
     output_events_ptr: ComPtr<IEventList>,
-    mappings: Vec<(u32, u32, u32)>,
-    parameter_ids: Vec<u32>,
     inputs: usize,
     outputs: usize,
     frames: usize,
@@ -1898,6 +1954,10 @@ impl Vst3Processor {
                 }
                 self.processing = true;
             }
+            // SAFETY: this audio handle has acquired busy and rechecked admission.
+            // Main-thread snapshot replacement closes admission and waits for busy
+            // to clear; this borrow ends before the release below, including errors.
+            let mappings = unsafe { &*self.shared.mappings.get() };
             let mut start = 0;
             let mut base_context = *context;
             let mut context_origin = 0;
@@ -1941,8 +2001,8 @@ impl Vst3Processor {
                     context,
                     self.setup.sample_rate,
                     &self.changes,
-                    &self.mappings,
-                    &self.parameter_ids,
+                    &mappings.midi,
+                    &mappings.writable_ids,
                     &mut output.dropped,
                 );
                 let mut input_pointers = [std::ptr::null_mut(); 64];

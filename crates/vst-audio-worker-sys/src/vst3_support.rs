@@ -47,13 +47,32 @@ impl Edits {
             deferred: Mutex::new(Vec::new()),
         }
     }
-    /// Installs the controller's enumerated IDs on the main thread before attaching
-    /// its handler. The audio consumer never accesses this set.
+    /// Installs enumerated IDs on the main thread, before attaching its handler or
+    /// while audio admission is closed and the consumer has left its busy scope.
+    /// The audio consumer never accesses this set.
     pub fn set_known_parameters(&self, ids: impl IntoIterator<Item = u32>) {
-        *self
+        let mut known = self
             .known_parameters
             .lock()
-            .unwrap_or_else(|e| e.into_inner()) = ids.into_iter().collect();
+            .unwrap_or_else(|e| e.into_inner());
+        *known = ids.into_iter().collect();
+        self.deferred
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(id, _)| known.contains(id));
+        // Admission excludes the usual consumer: compact queued edits without
+        // retaining stale IDs, preserving order and the latest surviving values.
+        let mut pending = [(0, 0.0); CAPACITY];
+        let mut count = 0;
+        while let Some(edit) = self.pop() {
+            if known.contains(&edit.0) {
+                pending[count] = edit;
+                count += 1;
+            }
+        }
+        for &(id, value) in &pending[..count] {
+            let _ = self.push(id, value);
+        }
     }
     /// Queues an editor edit for the processor. A burst larger than the queue
     /// keeps each parameter's latest value for the next main-thread flush, so the
@@ -632,6 +651,11 @@ impl IComponentHandlerTrait for Handler {
         }
         if flags & RestartFlags_::kIoChanged != 0 {
             self.0.flags.fetch_or(4, Ordering::Release);
+        }
+        if flags & (RestartFlags_::kMidiCCAssignmentChanged | RestartFlags_::kParamIDMappingChanged)
+            != 0
+        {
+            self.0.flags.fetch_or(8 | 1, Ordering::Release);
         }
         kResultOk
     }

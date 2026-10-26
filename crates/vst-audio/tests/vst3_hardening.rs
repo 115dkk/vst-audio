@@ -120,6 +120,139 @@ fn full_parameter_queue_rejects_without_changing_controller_value() {
 
 #[test]
 #[ignore = "native fixtures required"]
+fn mapping_restart_changes_reach_new_parameter_audio() {
+    const MODE: &str = "VST_AUDIO_TEST_VST3_MAPPING_CHANGE";
+    let Ok(mode) = std::env::var(MODE) else {
+        let mut failures = Vec::new();
+        for mode in ["midi-cc", "parameter-id"] {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "mapping_restart_changes_reach_new_parameter_audio",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env(MODE, mode)
+                .output()
+                .unwrap();
+            if !output.status.success() {
+                failures.push(format!(
+                    "{mode}: {}\n{}\n{}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+        return;
+    };
+    let worker = PathBuf::from(std::env::var_os("VST_AUDIO_WORKER").expect("worker required"));
+    let host = Host::new(worker);
+    let mut plugin = PluginDescriptor::new(
+        PathBuf::from(std::env::var_os("VST_AUDIO_ADVANCED_VST3").expect("advanced VST3 required")),
+        PluginFormat::Vst3,
+    );
+    plugin.class_id = Some(
+        host.scan(&plugin)
+            .unwrap()
+            .into_iter()
+            .find(|class| class.name == "Test sidechain")
+            .unwrap()
+            .id,
+    );
+    let mut instance = host
+        .spawn(&plugin, &Configuration::default(), None)
+        .unwrap();
+    let mut audio = instance.take_audio().unwrap();
+    let control = instance.controller();
+    let wait = |request| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(event) = instance.try_next_event() {
+                match event {
+                    HostEvent::Completed { request: id }
+                    | HostEvent::Parameters { request: id, .. }
+                        if id == request =>
+                    {
+                        break;
+                    }
+                    HostEvent::RequestFailed { reason, .. } => panic!("{reason}"),
+                    _ => {}
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "mapping control request timed out"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    };
+    let mut check_audio = |events: &[AudioEvent], expected_left: f32, expected_right: f32| {
+        let ones = [1.0; 128];
+        let zeros = [0.0; 128];
+        let mut left = [0.0; 128];
+        let mut right = [0.0; 128];
+        let mut aux = [0.0; 128];
+        let mut received = [AudioEvent::default(); 4];
+        for block in 0..5 {
+            let report = audio.process_events(
+                128,
+                &[&ones, &ones, &zeros],
+                &mut [&mut left, &mut right, &mut aux],
+                Transport::default(),
+                if block == 0 { events } else { &[] },
+                &mut received,
+            );
+            if block == 4 {
+                assert_eq!(report.status, AudioStatus::Processed, "{mode}");
+                for frame in 0..128 {
+                    assert!(
+                        (left[frame] - expected_left).abs() < 1e-6,
+                        "{mode}: left[{frame}]={} expected {expected_left}",
+                        left[frame]
+                    );
+                    assert!(
+                        (right[frame] - expected_right).abs() < 1e-6,
+                        "{mode}: right[{frame}]={} expected {expected_right}",
+                        right[frame]
+                    );
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    // Before the restart, CC7 controls Width and silences both main channels.
+    check_audio(&[AudioEvent::midi(0, 0, [0xb0, 7, 0])], 0.0, 0.0);
+    wait(
+        control
+            .request(vst_audio::Command::SetParameter { id: 0, value: 1.0 })
+            .unwrap(),
+    );
+    // A subsequent control round is a barrier past restartComponent handling.
+    wait(
+        control
+            .request(vst_audio::Command::ListParameters { start: 0, count: 2 })
+            .unwrap(),
+    );
+    // The same CC must now change Right Gain, leaving Width and left sound intact.
+    check_audio(&[AudioEvent::midi(0, 0, [0xb0, 7, 0])], 1.0, 0.0);
+    if mode == "parameter-id" {
+        check_audio(
+            &[AudioEvent {
+                sample_offset: 0,
+                bus: 0,
+                data: EventData::Parameter { id: 2, value: 0.5 },
+            }],
+            1.0,
+            0.5,
+        );
+    }
+    assert_eq!(instance.status(), Status::Running);
+}
+
+#[test]
+#[ignore = "native fixtures required"]
 fn bus_count_changes_during_negotiation_are_rejected() {
     if let Ok(mode) = std::env::var(BUS_COUNT_CHANGE) {
         let error = start_sidechain().expect_err("changed bus count must reject public start");
