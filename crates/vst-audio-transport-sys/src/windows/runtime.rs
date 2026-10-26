@@ -428,8 +428,9 @@ impl ChildProcess {
         }
         // SAFETY: this is the live primary thread created suspended above.
         if unsafe { ResumeThread(raw(&thread)) } == u32::MAX {
+            let error = windows::core::Error::from_thread();
             let _ = child.terminate(3);
-            return Err(windows::core::Error::from_thread());
+            return Err(error);
         }
         Ok(child)
     }
