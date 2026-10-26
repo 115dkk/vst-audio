@@ -55,7 +55,12 @@ SHIP = (
 )
 # Every crate embeds the workspace README.
 SHIP_ALWAYS = ("README.md",)
-NOT_SHIPPED = ("*.md", "crates/vst-audio-testplugin/*", "crates/vst-audio-test-advanced/*")
+NOT_SHIPPED = (
+    "*.md",
+    "crates/vst-audio-testplugin/*",
+    "crates/vst-audio-test-advanced/*",
+    "crates/vst-audio-test-window/*",
+)
 NOT_SHIPPED_DIRS = ("tests", "benches", "fuzz", "examples")
 
 TAG_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")

@@ -37,6 +37,8 @@ class Gate(unittest.TestCase):
         self.assertTrue(g.ships("Cargo.lock"))
         self.assertFalse(g.ships("crates/vst-audio/tests/native.rs"))
         self.assertFalse(g.ships("crates/vst-audio-testplugin/src/lib.rs"))
+        self.assertFalse(g.ships("crates/vst-audio-test-advanced/src/lib.rs"))
+        self.assertFalse(g.ships("crates/vst-audio-test-window/src/lib.rs"))
         self.assertFalse(g.ships("docs/roadmap.md"))
         self.assertFalse(g.ships(".github/workflows/ci.yml"))
 
