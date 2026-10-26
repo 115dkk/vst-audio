@@ -15,7 +15,7 @@ import urllib.error
 from fixtures import ROOT, download, prepare, target_directory
 
 def run(*args, **options):
-    subprocess.run(list(map(str,args)),cwd=ROOT,check=True,**options)
+    return subprocess.run(list(map(str,args)),cwd=ROOT,check=True,**options)
 
 def digest(path): return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -115,8 +115,10 @@ def main():
         env=dict(os.environ,VST_AUDIO_WORKER=str(extracted_worker),VST_AUDIO_TEST_VST2=str(vst2),VST_AUDIO_TEST_VST3=str(vst3))
         # Actual archived release executable: both formats, numeric DSP, editor,
         # crash/hang/state lifecycle. No binary is loaded by the parent.
-        run("cargo","test","--locked","-p","vst-audio","--test","native","--","--ignored","--test-threads=1","--skip","third_party_vst3",env=env)
-        summary={**manifest,"archive":archive.name,"archive_sha256":digest(archive),"native_tests":"20 passed","passed":True}
+        native_command=["cargo","test","--locked","-p","vst-audio","--test","native","--","--ignored","--test-threads=1","--skip","third_party_vst3"]
+        native=run(*native_command,env=env)
+        summary={**manifest,"archive":archive.name,"archive_sha256":digest(archive),
+                 "native_tests":{"command":native_command,"exit_status":native.returncode},"passed":True}
         (artifact/(name+".json")).write_text(json.dumps(summary,indent=2))
         (artifact/(name+".sha256")).write_text(f"{summary['archive_sha256']}  {archive.name}\n")
         print(json.dumps(summary,indent=2))

@@ -7,8 +7,9 @@ four native CI targets. AddressSanitizer and fuzzing use the separately pinned
 `python tools/package_worker.py` builds an optimized native worker, collects
 dependency license texts, writes a version/target/protocol manifest, and creates
 a ZIP plus SHA-256 file under `target/distributions`. It extracts that ZIP into
-a fresh directory and executes the archived release worker against 20 native
-VST2/VST3 tests, including numeric DSP, editor lifecycle, state and failure.
+a fresh directory and executes the archived release worker with the ignored
+native VST2/VST3 suite, including numeric DSP, editor lifecycle, state and
+failure. The summary records the exact test command and its exit status.
 On Linux use `xvfb-run -a python3 tools/package_worker.py`.
 
 The worker is an executable on Windows/Linux and an AppKit `.app` helper on
