@@ -79,7 +79,7 @@ impl OrphanedWatch {
     }
 }
 
-fn prepare_audio_handover(
+fn install_recovered_worker(
     started: Started,
     expected_geometry: vst_audio_ring::Geometry,
     expected_setup: &vst_audio_protocol::ProcessingSetup,
@@ -301,16 +301,7 @@ pub(crate) fn supervise(
             // Dropping the old process kills it; its audio mapping remains owned
             // until the callback hands it back through the retirement queue.
             drop(control.take());
-            for (_, request) in std::mem::take(&mut pending) {
-                emit(
-                    &events,
-                    &shared,
-                    HostEvent::RequestFailed {
-                        request,
-                        reason: "worker replaced".into(),
-                    },
-                );
-            }
+            fail_pending(&mut pending, &events, &shared, "worker replaced");
             let state = {
                 let history = shared.history.lock().unwrap_or_else(|e| e.into_inner());
                 if previous {
@@ -322,7 +313,7 @@ pub(crate) fn supervise(
             };
             let result = launch.start(state.as_deref(), shared.stop.clone());
             match result {
-                Ok(started) => match prepare_audio_handover(
+                Ok(started) => match install_recovered_worker(
                     started,
                     recovery_config.geometry,
                     &recovery_config.setup,
@@ -642,16 +633,7 @@ pub(crate) fn supervise(
             respawn_requested = false;
         }
         if respawn_requested && !stopping && control.is_some() {
-            for (_, request) in std::mem::take(&mut pending) {
-                emit(
-                    &events,
-                    &shared,
-                    HostEvent::RequestFailed {
-                        request,
-                        reason: "worker replaced".into(),
-                    },
-                );
-            }
+            fail_pending(&mut pending, &events, &shared, "worker replaced");
             let mut old_control = control.take().expect("respawn has a control");
             let base_ms = old_control.elapsed_ms();
             let taken_at = Instant::now();
@@ -664,16 +646,7 @@ pub(crate) fn supervise(
                 drop(control.take());
             }
             prepared_generation = None;
-            for (_, request) in std::mem::take(&mut pending) {
-                emit(
-                    &events,
-                    &shared,
-                    HostEvent::RequestFailed {
-                        request,
-                        reason: "worker exited".into(),
-                    },
-                );
-            }
+            fail_pending(&mut pending, &events, &shared, "worker exited");
             if stopping {
                 shared.set_lifecycle(Lifecycle::Stopped);
                 emit(&events, &shared, HostEvent::Stopped);
@@ -720,7 +693,7 @@ pub(crate) fn supervise(
             let state = orphan.watch.states.respawn_state();
             *shared.history.lock().unwrap_or_else(|e| e.into_inner()) = orphan.watch.states.clone();
             match launch.start(state.as_deref(), shared.stop.clone()) {
-                Ok(started) => match prepare_audio_handover(
+                Ok(started) => match install_recovered_worker(
                     started,
                     recovery_config.geometry,
                     &recovery_config.setup,
@@ -790,7 +763,7 @@ pub(crate) fn supervise(
                 *shared.history.lock().unwrap_or_else(|e| e.into_inner()) =
                     orphan.watch.states.clone();
                 match launch.start(state.as_deref(), shared.stop.clone()) {
-                    Ok(started) => match prepare_audio_handover(
+                    Ok(started) => match install_recovered_worker(
                         started,
                         recovery_config.geometry,
                         &recovery_config.setup,
