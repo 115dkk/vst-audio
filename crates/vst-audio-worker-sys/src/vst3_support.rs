@@ -1,9 +1,4 @@
-#![allow(
-    unsafe_code,
-    non_snake_case,
-    clippy::multiple_unsafe_ops_per_block,
-    clippy::undocumented_unsafe_blocks
-)]
+#![allow(unsafe_code, non_snake_case)]
 //! Host-owned COM objects. Controller callbacks are UI-thread-only (SDK threading model).
 use crate::{
     editor::EditorWindow,
@@ -11,7 +6,7 @@ use crate::{
     state_buffer::StateBuffer,
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ffi::{c_char, c_void},
     io::{Seek, SeekFrom, Write},
     rc::Rc,
@@ -26,6 +21,7 @@ use vst3::{Class, ComRef, ComWrapper, Steinberg::Vst::*, Steinberg::*};
 use vst3::{wl_display, wl_surface, xdg_surface, xdg_toplevel};
 
 pub(crate) const CAPACITY: usize = 256;
+const DEFERRED_EDIT_LIMIT: usize = 16_384;
 
 pub(crate) struct Edits {
     slots: [(AtomicU32, AtomicU64); CAPACITY],
@@ -33,6 +29,8 @@ pub(crate) struct Edits {
     write: AtomicUsize,
     pub flags: AtomicU32,
     pub notifications: Notifications,
+    // Initialized and queried on the main thread only, never by the audio consumer.
+    known_parameters: Mutex<HashSet<u32>>,
     // Editor edits that did not fit the processor queue, latest value per ID.
     // Main thread only; flushed in order before newer edits are queued.
     deferred: Mutex<Vec<(u32, f64)>>,
@@ -45,20 +43,54 @@ impl Edits {
             write: AtomicUsize::new(0),
             flags: AtomicU32::new(0),
             notifications: Notifications::new(),
+            known_parameters: Mutex::new(HashSet::new()),
             deferred: Mutex::new(Vec::new()),
+        }
+    }
+    /// Installs enumerated IDs on the main thread, before attaching its handler or
+    /// while audio admission is closed and the consumer has left its busy scope.
+    /// The audio consumer never accesses this set.
+    pub fn set_known_parameters(&self, ids: impl IntoIterator<Item = u32>) {
+        let mut known = self
+            .known_parameters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *known = ids.into_iter().collect();
+        self.deferred
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(id, _)| known.contains(id));
+        // Admission excludes the usual consumer: compact queued edits without
+        // retaining stale IDs, preserving order and the latest surviving values.
+        let mut pending = [(0, 0.0); CAPACITY];
+        let mut count = 0;
+        while let Some(edit) = self.pop() {
+            if known.contains(&edit.0) {
+                pending[count] = edit;
+                count += 1;
+            }
+        }
+        for &(id, value) in &pending[..count] {
+            let _ = self.push(id, value);
         }
     }
     /// Queues an editor edit for the processor. A burst larger than the queue
     /// keeps each parameter's latest value for the next main-thread flush, so the
     /// processor never stays on a value the editor already replaced.
-    fn push_edit(&self, id: u32, value: f64) {
+    fn push_edit(&self, id: u32, value: f64, known_count: usize) {
         let mut deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
         if deferred.is_empty() && self.push(id, value) {
             return;
         }
+        let has_capacity = deferred.len() < known_count.min(DEFERRED_EDIT_LIMIT);
         match deferred.iter_mut().find(|(pending, _)| *pending == id) {
             Some(entry) => entry.1 = value,
-            None => deferred.push((id, value)),
+            None if has_capacity => {
+                deferred.push((id, value));
+            }
+            None => {
+                self.flags.fetch_or(1, Ordering::Release);
+            }
         }
     }
     /// Moves deferred editor edits into the processor queue as space frees.
@@ -70,12 +102,29 @@ impl Edits {
             .count();
         deferred.drain(..sent);
     }
+    /// Main thread only, with audio admission closed and no active consumer.
+    /// State replacement supersedes processor edits, not notification history.
+    pub fn clear_pending_edits(&self) {
+        self.read
+            .store(self.write.load(Ordering::Acquire), Ordering::Release);
+        self.deferred
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
     /// An application value supersedes an older deferred editor value.
     pub fn forget_deferred(&self, id: u32) {
         self.deferred
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|(pending, _)| *pending != id);
+    }
+    /// Main-thread producer preflight; only the audio consumer can free space.
+    pub(crate) fn has_capacity(&self) -> bool {
+        self.write
+            .load(Ordering::Relaxed)
+            .wrapping_sub(self.read.load(Ordering::Acquire))
+            < CAPACITY
     }
     pub(crate) fn push(&self, id: u32, value: f64) -> bool {
         let write = self.write.load(Ordering::Relaxed);
@@ -572,7 +621,15 @@ impl IComponentHandlerTrait for Handler {
         kResultOk
     }
     unsafe fn performEdit(&self, id: u32, value: f64) -> tresult {
-        if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+        let known = self
+            .0
+            .known_parameters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Faulty VST3 controllers can invent IDs (audit #11 TD-33). Reject them
+        // before either queue: perform_edit_unknown_id_flood_requests_refresh_without_retaining_edits
+        // reproduces the unbounded overflow that otherwise follows.
+        if !known.contains(&id) || !value.is_finite() || !(0.0..=1.0).contains(&value) {
             self.0.flags.fetch_or(1, Ordering::Release);
             return kInvalidArgument;
         }
@@ -583,7 +640,7 @@ impl IComponentHandlerTrait for Handler {
         });
         // Test only: never enable __test-drop-editor-edits in distribution builds.
         if !cfg!(feature = "__test-drop-editor-edits") {
-            self.0.push_edit(id, value);
+            self.0.push_edit(id, value, known.len());
         }
         kResultOk
     }
@@ -604,6 +661,11 @@ impl IComponentHandlerTrait for Handler {
         }
         if flags & RestartFlags_::kIoChanged != 0 {
             self.0.flags.fetch_or(4, Ordering::Release);
+        }
+        if flags & (RestartFlags_::kMidiCCAssignmentChanged | RestartFlags_::kParamIDMappingChanged)
+            != 0
+        {
+            self.0.flags.fetch_or(8 | 1, Ordering::Release);
         }
         kResultOk
     }
@@ -791,6 +853,62 @@ impl IPlugFrameTrait for Frame {
 mod tests {
     use super::*;
 
+    #[test]
+    fn perform_edit_unknown_id_flood_requests_refresh_without_retaining_edits() {
+        let edits = Arc::new(Edits::new());
+        let handler = ComWrapper::new(Handler(edits.clone()))
+            .to_com_ptr::<IComponentHandler>()
+            .unwrap();
+        // Audit #11 TD-33: a faulty controller invents thousands of parameter IDs,
+        // including callbacks before the host has installed its metadata IDs.
+        for id in 10_000..14_096 {
+            // SAFETY: retained host handler called synchronously on its main thread;
+            // performEdit takes scalar arguments and validates the foreign ID.
+            let _ = unsafe { handler.performEdit(id, 0.5) };
+        }
+        assert_eq!(edits.deferred.lock().unwrap().len(), 0);
+        assert_eq!(edits.pop(), None);
+        assert!(edits.notifications.drain().is_empty());
+        assert_eq!(edits.flags.load(Ordering::Acquire) & 1, 1);
+    }
+
+    #[cfg(not(feature = "__test-drop-editor-edits"))]
+    #[test]
+    fn perform_edit_known_overflow_keeps_latest_values_during_unknown_id_flood() {
+        let edits = Arc::new(Edits::new());
+        edits.set_known_parameters([7, 19]);
+        let handler = ComWrapper::new(Handler(edits.clone()))
+            .to_com_ptr::<IComponentHandler>()
+            .unwrap();
+        for _ in 0..256 {
+            // SAFETY: retained handler on its main thread, scalar known ID/value.
+            let _ = unsafe { handler.performEdit(7, 0.25) };
+        }
+        for (id, value) in [(7, 0.5), (19, 0.5), (7, 0.75), (19, 1.0)] {
+            // SAFETY: retained handler on its main thread, scalar known ID/value.
+            let _ = unsafe { handler.performEdit(id, value) };
+        }
+        assert_eq!(edits.deferred.lock().unwrap().len(), 2);
+        assert_eq!(edits.notifications.drain().len(), 260);
+        for id in 10_000..14_096 {
+            // SAFETY: retained handler on its main thread; the concrete host rejects
+            // these scalar IDs without invoking foreign plugin code.
+            assert_eq!(unsafe { handler.performEdit(id, 0.5) }, kInvalidArgument);
+        }
+        assert_eq!(edits.deferred.lock().unwrap().len(), 2);
+        assert!(edits.notifications.drain().is_empty());
+        assert_eq!(edits.flags.load(Ordering::Acquire) & 1, 1);
+        for _ in 0..256 {
+            assert_eq!(edits.pop(), Some((7, 0.25)));
+        }
+        assert_eq!(edits.pop(), None);
+        edits.flush_deferred();
+        assert_eq!(edits.pop(), Some((7, 0.75)));
+        assert_eq!(edits.pop(), Some((19, 1.0)));
+        assert_eq!(edits.pop(), None);
+        assert!(edits.deferred.lock().unwrap().is_empty());
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn wayland_host_query_obeys_policy_and_identity() {
@@ -832,9 +950,12 @@ mod tests {
         let message = unsafe { vst3::ComPtr::<IMessage>::from_raw(pointer.cast()) }.unwrap();
         // SAFETY: terminated string remains readable through this synchronous call.
         unsafe { message.setMessageID(c"editor".as_ptr()) };
-        // SAFETY: retained message returns its copied terminated identifier.
+        // SAFETY: message retains the live IMessage interface for this call.
+        let id = unsafe { message.getMessageID() };
         assert_eq!(
-            unsafe { std::ffi::CStr::from_ptr(message.getMessageID()) },
+            // SAFETY: setMessageID copied a terminated identifier; message is still
+            // retained and its ID has not been changed since obtaining this pointer.
+            unsafe { std::ffi::CStr::from_ptr(id) },
             c"editor"
         );
         // SAFETY: retained message owns one stable attribute-list object.
@@ -843,33 +964,41 @@ mod tests {
         assert_eq!(attributes, unsafe { message.getAttributes() });
         // SAFETY: borrowed pointer remains valid while message is retained.
         let attributes = unsafe { ComRef::from_raw(attributes) }.unwrap();
-        // SAFETY: terminated IDs and writable scalar outputs satisfy the interface contract.
-        unsafe {
-            assert_eq!(attributes.setInt(c"int".as_ptr(), -17), kResultOk);
-            assert_eq!(attributes.setFloat(c"float".as_ptr(), 3.25), kResultOk);
-        }
+        assert_eq!(
+            // SAFETY: message retains attributes and the static ID is NUL-terminated.
+            unsafe { attributes.setInt(c"int".as_ptr(), -17) },
+            kResultOk
+        );
+        assert_eq!(
+            // SAFETY: message retains attributes and the static ID is NUL-terminated.
+            unsafe { attributes.setFloat(c"float".as_ptr(), 3.25) },
+            kResultOk
+        );
         let mut integer = 0;
         let mut float = 0.0;
-        // SAFETY: terminated IDs and writable scalar outputs satisfy the interface contract.
-        unsafe {
-            assert_eq!(attributes.getInt(c"int".as_ptr(), &mut integer), kResultOk);
-            assert_eq!(
-                attributes.getFloat(c"float".as_ptr(), &mut float),
-                kResultOk
-            );
-        }
+        assert_eq!(
+            // SAFETY: retained attributes, terminated ID, and an exclusive writable i64 output.
+            unsafe { attributes.getInt(c"int".as_ptr(), &mut integer) },
+            kResultOk
+        );
+        assert_eq!(
+            // SAFETY: retained attributes, terminated ID, and an exclusive writable f64 output.
+            unsafe { attributes.getFloat(c"float".as_ptr(), &mut float) },
+            kResultOk
+        );
         assert_eq!(integer, -17);
         assert_eq!(float, 3.25);
 
         let text = [b'a' as TChar, b'b' as TChar, b'c' as TChar, 0];
-        // SAFETY: text is terminated and ID is static and terminated.
         assert_eq!(
+            // SAFETY: message retains attributes; text and the static ID are terminated.
             unsafe { attributes.setString(c"text".as_ptr(), text.as_ptr()) },
             kResultOk
         );
         let mut truncated = [99 as TChar; 2];
-        // SAFETY: output has exactly the advertised byte capacity.
         assert_eq!(
+            // SAFETY: message retains attributes, the ID is terminated, and the
+            // exclusive TChar output has exactly the advertised byte capacity.
             unsafe {
                 attributes.getString(
                     c"text".as_ptr(),
@@ -882,8 +1011,9 @@ mod tests {
         assert_eq!(truncated, [b'a' as TChar, 0]);
 
         let binary = [1_u8, 2, 3, 4];
-        // SAFETY: input points to four readable bytes.
         assert_eq!(
+            // SAFETY: message retains attributes, the ID is terminated, and binary
+            // supplies the advertised four readable bytes for the synchronous copy.
             unsafe {
                 attributes.setBinary(
                     c"data".as_ptr(),
@@ -895,26 +1025,29 @@ mod tests {
         );
         let mut data = std::ptr::null();
         let mut size = 0;
-        // SAFETY: both outputs are writable and the ID is terminated.
         assert_eq!(
+            // SAFETY: message retains attributes; both outputs are exclusive and
+            // writable for their types, and the static ID is terminated.
             unsafe { attributes.getBinary(c"data".as_ptr(), &mut data, &mut size) },
             kResultOk
         );
         assert_eq!(size, 4);
-        // SAFETY: returned pointer remains valid until this value is replaced or the list dies.
         assert_eq!(
+            // SAFETY: getBinary returned four initialized bytes. The list is
+            // retained by message and this value has not been replaced.
             unsafe { std::slice::from_raw_parts(data.cast::<u8>(), 4) },
             binary
         );
-        // SAFETY: setting an unrelated scalar does not replace the binary value.
         assert_eq!(
+            // SAFETY: message retains attributes and the static ID is terminated.
             unsafe { attributes.setInt(c"other".as_ptr(), 1) },
             kResultOk
         );
         let mut same_data = std::ptr::null();
         let mut same_size = 0;
-        // SAFETY: both outputs are writable and the ID is terminated.
         assert_eq!(
+            // SAFETY: message retains attributes; both outputs are exclusive and
+            // writable for their types, and the static ID is terminated.
             unsafe { attributes.getBinary(c"data".as_ptr(), &mut same_data, &mut same_size) },
             kResultOk
         );
@@ -925,30 +1058,37 @@ mod tests {
     fn host_attributes_reject_missing_null_and_limits() {
         let attributes = HostAttributeList::default();
         let mut integer = 0;
-        // SAFETY: terminated missing key and writable output.
         assert_eq!(
+            // SAFETY: terminated missing key and exclusive writable i64 output.
             unsafe { attributes.getInt(c"missing".as_ptr(), &mut integer) },
             kResultFalse
         );
-        // SAFETY: deliberately null arguments exercise validation without dereferencing them.
-        unsafe {
-            assert_eq!(attributes.setInt(std::ptr::null(), 1), kInvalidArgument);
-            assert_eq!(
-                attributes.getInt(c"value".as_ptr(), std::ptr::null_mut()),
-                kInvalidArgument
-            );
-            assert_eq!(
-                attributes.setString(c"value".as_ptr(), std::ptr::null()),
-                kInvalidArgument
-            );
-            assert_eq!(
-                attributes.setBinary(c"value".as_ptr(), std::ptr::null(), 0),
-                kInvalidArgument
-            );
-        }
-        let byte = 0_u8;
-        // SAFETY: oversized input is rejected before the one-byte pointer can be read.
         assert_eq!(
+            // SAFETY: this concrete implementation rejects a null ID in bounded_bytes
+            // before dereferencing it; no foreign implementation is called.
+            unsafe { attributes.setInt(std::ptr::null(), 1) },
+            kInvalidArgument
+        );
+        assert_eq!(
+            // SAFETY: getInt rejects the null output before any pointer access.
+            unsafe { attributes.getInt(c"value".as_ptr(), std::ptr::null_mut()) },
+            kInvalidArgument
+        );
+        assert_eq!(
+            // SAFETY: setString rejects the null string before any pointer access.
+            unsafe { attributes.setString(c"value".as_ptr(), std::ptr::null()) },
+            kInvalidArgument
+        );
+        assert_eq!(
+            // SAFETY: setBinary rejects the null data before any pointer access,
+            // including for this zero-byte request.
+            unsafe { attributes.setBinary(c"value".as_ptr(), std::ptr::null(), 0) },
+            kInvalidArgument
+        );
+        let byte = 0_u8;
+        assert_eq!(
+            // SAFETY: this concrete setBinary rejects oversized input before
+            // forming a slice or reading the deliberately undersized buffer.
             unsafe {
                 attributes.setBinary(
                     c"large".as_ptr(),
@@ -963,8 +1103,8 @@ mod tests {
             // SAFETY: each CString is terminated and remains live for the call.
             assert_eq!(unsafe { attributes.setInt(key.as_ptr(), 1) }, kResultOk);
         }
-        // SAFETY: static terminated key exceeds the item limit by one.
         assert_eq!(
+            // SAFETY: the static key is terminated and remains readable for the call.
             unsafe { attributes.setInt(c"one-too-many".as_ptr(), 1) },
             kOutOfMemory
         );
@@ -983,14 +1123,27 @@ mod tests {
                 kResultOk
             );
             let unknown = pointer.cast::<FUnknown>();
-            // SAFETY: successful creation returned a live FUnknown-derived interface.
-            let after_add = unsafe { ((*(*unknown).vtbl).addRef)(unknown) };
+            // SAFETY: successful creation returned a live FUnknown-derived interface
+            // with one owned reference and the FUnknown-compatible vtable prefix.
+            let vtbl = unsafe { (*unknown).vtbl };
+            // SAFETY: the live host-created COM object has an initialized FUnknown vtable.
+            let add_ref = unsafe { (*vtbl).addRef };
+            // SAFETY: add_ref belongs to this live interface, whose creation reference is held.
+            let after_add = unsafe { add_ref(unknown) };
             assert_eq!(after_add, 2);
-            // SAFETY: balance the explicit addRef while retaining the creation reference.
-            let after_release = unsafe { ((*(*unknown).vtbl).release)(unknown) };
+            // SAFETY: the creation reference and explicit addRef keep unknown alive.
+            let vtbl = unsafe { (*unknown).vtbl };
+            // SAFETY: the retained host-created COM object's vtable is initialized and readable.
+            let release = unsafe { (*vtbl).release };
+            // SAFETY: release belongs to unknown; balance addRef, retaining the creation reference.
+            let after_release = unsafe { release(unknown) };
             assert_eq!(after_release, 1);
-            // SAFETY: release the original creation reference exactly once.
-            assert_eq!(unsafe { ((*(*unknown).vtbl).release)(unknown) }, 0);
+            // SAFETY: the original creation reference still keeps unknown alive.
+            let vtbl = unsafe { (*unknown).vtbl };
+            // SAFETY: the retained host-created COM object's vtable is initialized and readable.
+            let release = unsafe { (*vtbl).release };
+            // SAFETY: release the original reference exactly once; unknown is not used afterwards.
+            assert_eq!(unsafe { release(unknown) }, 0);
         }
     }
 

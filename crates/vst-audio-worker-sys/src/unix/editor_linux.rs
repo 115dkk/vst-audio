@@ -278,13 +278,27 @@ impl EditorWindow {
         self.window as usize
     }
     pub fn pump(&self) -> bool {
+        if self.closed.get() {
+            return true;
+        }
         let parent = match self.parent {
             Some(vst_audio_protocol::ParentWindow::X11 { window }) => u32::try_from(window).ok(),
             _ => None,
         };
         // The shared connection also carries events for windows this editor
         // replaced; only this window and its parent concern it.
-        while let Ok(Some(event)) = self.connection.poll_for_event() {
+        loop {
+            let event = match self.connection.poll_for_event() {
+                Ok(Some(event)) => event,
+                Ok(None) => break,
+                Err(error) => {
+                    // An exited X server is not an empty queue (audit #11 TD-34;
+                    // x11_disconnect_closes_editor_and_preserves_audio).
+                    eprintln!("X11 editor event polling failed: {error}");
+                    self.closed.set(true);
+                    break;
+                }
+            };
             match event {
                 Event::ClientMessage(event)
                     if event.window == self.window

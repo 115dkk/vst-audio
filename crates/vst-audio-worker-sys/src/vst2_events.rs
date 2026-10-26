@@ -198,16 +198,37 @@ impl CallbackEvents {
             let declared = usize::try_from(size).unwrap_or(0);
             let event = match kind {
                 1 => {
-                    // SAFETY: MIDI event tag denotes the fixed MIDI layout.
-                    let raw = unsafe { &*pointer.cast::<MidiEvent>() };
-                    if raw.offset < 0 || raw.size < 24 {
+                    // A violating VST2 short-header plugin must not cause a full
+                    // MidiEvent reference or payload read before size validation.
+                    // Regression: short_midi_header_is_dropped_and_worker_keeps_processing
+                    // (audit #11 TD-06).
+                    let raw = pointer.cast::<MidiEvent>();
+                    if !raw.is_aligned() || declared < size_of::<MidiEvent>() {
                         self.dropped.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
+                    // SAFETY: the aligned record's declared size covers offset;
+                    // the plugin must keep the declared bytes readable during the callback.
+                    let offset = unsafe {
+                        raw.wrapping_byte_add(std::mem::offset_of!(MidiEvent, offset))
+                            .cast::<i32>()
+                            .read()
+                    };
+                    if offset < 0 {
+                        self.dropped.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    // SAFETY: the validated size covers these three MIDI bytes;
+                    // a byte array requires no additional alignment.
+                    let data = unsafe {
+                        raw.wrapping_byte_add(std::mem::offset_of!(MidiEvent, data))
+                            .cast::<[u8; 3]>()
+                            .read()
+                    };
                     Event::midi(
-                        (raw.offset as u32).saturating_add(self.base.load(Ordering::Relaxed)),
+                        (offset as u32).saturating_add(self.base.load(Ordering::Relaxed)),
                         0,
-                        [raw.data[0], raw.data[1], raw.data[2]],
+                        data,
                     )
                 }
                 6 => {

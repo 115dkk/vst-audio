@@ -265,7 +265,16 @@ impl Vst3Module {
             .ok_or_else(|| PluginError("null VST 3 instance".into()))
     }
 }
+#[derive(Default)]
+struct MappingSnapshot {
+    midi: Vec<(u32, u32, u32)>,
+    writable_ids: Vec<u32>,
+    known_ids: Vec<u32>,
+}
 struct Shared {
+    // Main thread replaces/drops the snapshot only with admission closed and
+    // busy drained. Audio borrows it only inside the admitted busy scope.
+    mappings: std::cell::UnsafeCell<MappingSnapshot>,
     processor: ComPtr<IAudioProcessor>,
     admitted: AtomicBool,
     busy: AtomicBool,
@@ -274,6 +283,13 @@ struct Shared {
     edits: Arc<Edits>,
     _library: Arc<ModuleLibrary>,
 }
+// SAFETY: processor access follows the SDK's existing main/audio thread contract;
+// all remaining shared state is atomic or internally synchronized. The sole
+// UnsafeCell is main-thread-written only under control(): SeqCst admission closes
+// entry and busy drains existing readers; audio rechecks admission after acquiring
+// busy and releases it only after its snapshot borrow ends. No snapshot reference
+// escapes that scope, and only the main-thread Vst3Plugin can replace it.
+unsafe impl Sync for Shared {}
 struct Admission<'a>(&'a Shared);
 impl Drop for Admission<'_> {
     fn drop(&mut self) {
@@ -405,6 +421,7 @@ impl Vst3Plugin {
             .to_com_ptr()
             .expect("handler interface");
         let shared = Arc::new(Shared {
+            mappings: std::cell::UnsafeCell::new(MappingSnapshot::default()),
             processor,
             admitted: AtomicBool::new(true),
             busy: AtomicBool::new(false),
@@ -475,6 +492,23 @@ impl Vst3Plugin {
             }
         }
         if let Some(controller) = &plugin.controller {
+            // SAFETY: initialized controller queried on its creating main thread.
+            let count = unsafe { controller.getParameterCount() };
+            if !(0..=16_384).contains(&count) {
+                return Err(PluginError("invalid parameter count".into()));
+            }
+            let mut ids = Vec::with_capacity(count as usize);
+            for index in 0..count {
+                // SAFETY: ParameterInfo is a plain fixed-array/integer/float SDK record.
+                let mut info: ParameterInfo = unsafe { std::mem::zeroed() };
+                check(
+                    // SAFETY: enumerated index and writable output on the controller thread.
+                    unsafe { controller.getParameterInfo(index, &mut info) },
+                    "getParameterInfo",
+                )?;
+                ids.push(info.id);
+            }
+            plugin.shared.edits.set_known_parameters(ids);
             check(
                 // SAFETY: main-thread controller and retained host handler.
                 unsafe { controller.setComponentHandler(plugin.handler.as_ptr()) },
@@ -689,6 +723,16 @@ impl Vst3Plugin {
             )
         };
         self.refresh_buses()?;
+        // A plugin may change bus counts in setBusArrangements while retaining an equal
+        // layout prefix; zip alone would accept it. The advanced VST3 violating fixture
+        // reproduces this in bus_count_changes_during_negotiation_are_rejected (audit #11 TD-07).
+        if configuration.inputs.len() != self.info.input_buses.len()
+            || configuration.outputs.len() != self.info.output_buses.len()
+        {
+            return Err(PluginError(
+                "plugin changed bus count during arrangement negotiation".into(),
+            ));
+        }
         for (requested, actual) in configuration
             .inputs
             .iter()
@@ -772,24 +816,7 @@ impl Vst3Plugin {
             let _ = unsafe { self.component.setActive(0) };
         }
     }
-    pub fn take_processor(&mut self) -> Result<Vst3Processor, PluginError> {
-        if self.processor_taken || self.max_frames == 0 {
-            return Err(PluginError(
-                "VST 3 processor already taken or not configured".into(),
-            ));
-        }
-        self.processor_taken = true;
-        let setup = self.setup.as_ref().expect("configured").clone();
-        let changes = Changes::new();
-        let pointer = changes.to_com_ptr().expect("parameter changes");
-        let output_changes = Changes::new();
-        let output_pointer = output_changes
-            .to_com_ptr()
-            .expect("output parameter changes");
-        let input_events = crate::vst3_events::EventList::new();
-        let input_events_ptr = input_events.to_com_ptr().expect("input event list");
-        let output_events = crate::vst3_events::EventList::new();
-        let output_events_ptr = output_events.to_com_ptr().expect("output event list");
+    fn build_mappings(&mut self) -> Result<MappingSnapshot, PluginError> {
         let mut mappings = Vec::new();
         if let Some(mapping) = self
             .controller
@@ -858,9 +885,11 @@ impl Vst3Plugin {
         }
         mappings.sort_unstable_by_key(|p| p.0);
         let mut parameter_ids = Vec::new();
+        let mut known_ids = Vec::new();
         let mut start = 0;
         loop {
             let (total, page) = self.parameters(start, 32)?;
+            known_ids.extend(page.iter().map(|p| p.id));
             parameter_ids.extend(page.into_iter().filter(|p| !p.read_only).map(|p| p.id));
             start += 32;
             if start >= total {
@@ -869,6 +898,47 @@ impl Vst3Plugin {
         }
         parameter_ids.sort_unstable();
         parameter_ids.dedup();
+        Ok(MappingSnapshot {
+            midi: mappings,
+            writable_ids: parameter_ids,
+            known_ids,
+        })
+    }
+    fn rebuild_mappings(&mut self) -> Result<(), PluginError> {
+        let shared = self.shared.clone();
+        let _control = shared.control();
+        // VST3 controllers may change CC assignments and IDs at runtime (audit
+        // #11 TD-31; mapping_restart_changes_reach_new_parameter_audio).
+        let snapshot = self.build_mappings()?;
+        shared
+            .edits
+            .set_known_parameters(snapshot.known_ids.iter().copied());
+        // SAFETY: the unique main-thread owner holds control admission, which
+        // closes new audio entry and waits for busy=false. Audio references end
+        // before releasing busy, so replacing AND dropping the old Vecs here
+        // cannot overlap a reader and never allocates/frees on the audio thread.
+        unsafe { *shared.mappings.get() = snapshot };
+        Ok(())
+    }
+    pub fn take_processor(&mut self) -> Result<Vst3Processor, PluginError> {
+        if self.processor_taken || self.max_frames == 0 {
+            return Err(PluginError(
+                "VST 3 processor already taken or not configured".into(),
+            ));
+        }
+        self.rebuild_mappings()?;
+        self.processor_taken = true;
+        let setup = self.setup.as_ref().expect("configured").clone();
+        let changes = Changes::new();
+        let pointer = changes.to_com_ptr().expect("parameter changes");
+        let output_changes = Changes::new();
+        let output_pointer = output_changes
+            .to_com_ptr()
+            .expect("output parameter changes");
+        let input_events = crate::vst3_events::EventList::new();
+        let input_events_ptr = input_events.to_com_ptr().expect("input event list");
+        let output_events = crate::vst3_events::EventList::new();
+        let output_events_ptr = output_events.to_com_ptr().expect("output event list");
         Ok(Vst3Processor {
             shared: self.shared.clone(),
             changes,
@@ -879,8 +949,6 @@ impl Vst3Plugin {
             input_events_ptr,
             output_events,
             output_events_ptr,
-            mappings,
-            parameter_ids,
             inputs: vst_audio_protocol::ProcessingSetup::channels(&setup.inputs) as usize,
             outputs: vst_audio_protocol::ProcessingSetup::channels(&setup.outputs) as usize,
             frames: self.max_frames,
@@ -960,6 +1028,15 @@ impl Vst3Plugin {
             .controller
             .as_ref()
             .ok_or_else(|| PluginError("no controller".into()))?;
+        // Audit #11 TD-30: reject before changing the controller or forgetting a
+        // deferred editor value (full_parameter_queue_rejects_without_changing_controller_value).
+        // This main thread is the sole producer; audio can only free queue space.
+        // IEditController forbids echoing setParamNormalized through IComponentHandler,
+        // so performEdit cannot reenter the producer here under the SDK contract.
+        // SuppressNotifications only suppresses application notifications, not queue writes.
+        if !self.shared.edits.has_capacity() {
+            return Err(PluginError("parameter queue full".into()));
+        }
         let _notifications = SuppressNotifications::enter();
         check(
             // SAFETY: main-thread live controller, validated ID and normalized value.
@@ -1006,6 +1083,10 @@ impl Vst3Plugin {
     }
     pub fn set_state(&mut self, component: &[u8], controller: &[u8]) -> Result<(), PluginError> {
         let _control = self.shared.control();
+        // Audit #11 TD-08: the basic VST3 fixture reproduces old edits overriding
+        // restored state in restore_state_discards_queued_and_deferred_vst3_edits.
+        // Admission is closed and the audio consumer has left its busy scope.
+        self.shared.edits.clear_pending_edits();
         let _notifications = SuppressNotifications::enter();
         let stream = Stream::try_from_slice(component)
             .map_err(|_| PluginError("out of memory for plugin state".into()))?;
@@ -1084,23 +1165,15 @@ impl Vst3Plugin {
         }
         result
     }
-    fn attach_editor(
-        &mut self,
-        parent: Option<vst_audio_protocol::ParentWindow>,
-        scaling: EditorScaling,
+    fn select_editor_backend(
+        &self,
+        view: &ComPtr<IPlugView>,
+        _parent: Option<vst_audio_protocol::ParentWindow>,
+        _scaling: EditorScaling,
         _force_x11: bool,
         _attempted_wayland: &mut bool,
         _restore: Option<&vst_audio_protocol::EditorStatus>,
-    ) -> Result<(), PluginError> {
-        let controller = self
-            .controller
-            .as_ref()
-            .ok_or_else(|| PluginError("no VST 3 controller".into()))?;
-        // SAFETY: controller queried on main thread with SDK editor view name.
-        let pointer = unsafe { controller.createView(ViewType::kEditor) };
-        // SAFETY: createView transfers an owned interface reference, nullable for no editor.
-        let view = unsafe { ComPtr::from_raw(pointer) }
-            .ok_or_else(|| PluginError("no VST 3 editor".into()))?;
+    ) -> Result<&'static std::ffi::CStr, PluginError> {
         let platform = crate::editor_platform();
         #[cfg(target_os = "linux")]
         let platform = {
@@ -1108,9 +1181,9 @@ impl Vst3Plugin {
             // A stretched editor goes to the desktop's XWayland, which the
             // compositor scales; a native Wayland view is never stretched.
             let native = !_force_x11
-                && parent.is_none()
+                && _parent.is_none()
                 && wayland_allowed()
-                && scaling != EditorScaling::Stretch;
+                && _scaling != EditorScaling::Stretch;
             // SAFETY: retained main-thread view, static SDK platform identifier.
             let supported = native
                 && unsafe { view.isPlatformTypeSupported(kPlatformTypeWaylandSurfaceID) }
@@ -1139,6 +1212,12 @@ impl Vst3Plugin {
             unsafe { view.isPlatformTypeSupported(platform.as_ptr()) },
             "native editor support",
         )?;
+        Ok(platform)
+    }
+    fn initial_editor_size(
+        view: &ComPtr<IPlugView>,
+        restore: Option<&vst_audio_protocol::EditorStatus>,
+    ) -> Result<(ViewRect, i32, i32), PluginError> {
         let mut size = ViewRect {
             left: 0,
             top: 0,
@@ -1147,7 +1226,7 @@ impl Vst3Plugin {
         };
         // SAFETY: writable view rectangle, queried before attachment.
         check(unsafe { view.getSize(&mut size) }, "getSize")?;
-        if let Some(status) = _restore {
+        if let Some(status) = restore {
             size = ViewRect {
                 left: 0,
                 top: 0,
@@ -1172,6 +1251,77 @@ impl Vst3Plugin {
             .checked_sub(size.top)
             .filter(|v| (1..=8192).contains(v))
             .ok_or_else(|| PluginError("invalid editor height".into()))?;
+        Ok((size, width, height))
+    }
+    fn negotiate_editor_scale(
+        view: &ComPtr<IPlugView>,
+        window: &EditorWindow,
+        scaling: EditorScaling,
+        restore: Option<&vst_audio_protocol::EditorStatus>,
+        size: &mut ViewRect,
+    ) -> Result<Option<f32>, PluginError> {
+        if !cfg!(target_os = "macos")
+            && editor_scaling::requests_scale(scaling)
+            && let Some(interface) = view.cast::<IPlugViewContentScaleSupport>()
+        {
+            let requested =
+                restore.map_or_else(|| editor_scaling::platform_scale(window), |s| s.scale);
+            let _dpi = editor_scaling::scope(window);
+            // SAFETY: live pre-attachment interface and finite platform/previously accepted scale.
+            if unsafe { interface.setContentScaleFactor(requested) } == kResultOk {
+                // Plugins may change their preferred dimensions when accepting scale.
+                // SAFETY: retained view and writable rectangle, before attached().
+                check(unsafe { view.getSize(size) }, "scaled getSize")?;
+                if let Some(saved) = restore {
+                    *size = ViewRect {
+                        left: 0,
+                        top: 0,
+                        right: saved.width as i32,
+                        bottom: saved.height as i32,
+                    };
+                    if saved.resize_supported {
+                        check(
+                            // SAFETY: live fresh view, writable restored rectangle.
+                            unsafe { view.checkSizeConstraint(size) },
+                            "checkSizeConstraint",
+                        )?;
+                    }
+                }
+                let (width, height) = view_dimensions(size)?;
+                window
+                    .resize(width, height)
+                    .map_err(|e| PluginError(e.to_string()))?;
+                return Ok(Some(requested));
+            }
+        }
+        Ok(None)
+    }
+    fn attach_editor(
+        &mut self,
+        parent: Option<vst_audio_protocol::ParentWindow>,
+        scaling: EditorScaling,
+        _force_x11: bool,
+        _attempted_wayland: &mut bool,
+        _restore: Option<&vst_audio_protocol::EditorStatus>,
+    ) -> Result<(), PluginError> {
+        let controller = self
+            .controller
+            .as_ref()
+            .ok_or_else(|| PluginError("no VST 3 controller".into()))?;
+        // SAFETY: controller queried on main thread with SDK editor view name.
+        let pointer = unsafe { controller.createView(ViewType::kEditor) };
+        // SAFETY: createView transfers an owned interface reference, nullable for no editor.
+        let view = unsafe { ComPtr::from_raw(pointer) }
+            .ok_or_else(|| PluginError("no VST 3 editor".into()))?;
+        let platform = self.select_editor_backend(
+            &view,
+            parent,
+            scaling,
+            _force_x11,
+            _attempted_wayland,
+            _restore,
+        )?;
+        let (mut size, width, height) = Self::initial_editor_size(&view, _restore)?;
         #[allow(unused_mut)]
         let mut window = Rc::new(match parent {
             Some(parent) => EditorWindow::open_embedded(parent, width, height)
@@ -1224,47 +1374,15 @@ impl Vst3Plugin {
         };
         // SAFETY: frame is retained locally and owns the native window; guard clears on failure.
         check(unsafe { view.setFrame(frame.as_ptr()) }, "setFrame")?;
-        let mut applied_scale = 1.0;
-        let mut accepted = false;
-        let mut effective = EditorScaling::Off;
-        if !cfg!(target_os = "macos")
-            && editor_scaling::requests_scale(scaling)
-            && let Some(interface) = view.cast::<IPlugViewContentScaleSupport>()
-        {
-            let requested =
-                _restore.map_or_else(|| editor_scaling::platform_scale(&window), |s| s.scale);
-            let _dpi = editor_scaling::scope(&window);
-            // SAFETY: live pre-attachment interface and finite platform/previously accepted scale.
-            if unsafe { interface.setContentScaleFactor(requested) } == kResultOk {
-                applied_scale = requested;
-                accepted = true;
-                effective = EditorScaling::Plugin;
-                // Plugins may change their preferred dimensions when accepting scale.
-                // SAFETY: retained view and writable rectangle, before attached().
-                check(unsafe { view.getSize(&mut size) }, "scaled getSize")?;
-                if let Some(saved) = _restore {
-                    size = ViewRect {
-                        left: 0,
-                        top: 0,
-                        right: saved.width as i32,
-                        bottom: saved.height as i32,
-                    };
-                    if saved.resize_supported {
-                        check(
-                            // SAFETY: live fresh view, writable restored rectangle.
-                            unsafe { view.checkSizeConstraint(&mut size) },
-                            "checkSizeConstraint",
-                        )?;
-                    }
-                }
-                let (width, height) = view_dimensions(&size)?;
-                window
-                    .resize(width, height)
-                    .map_err(|e| PluginError(e.to_string()))?;
-            }
-        }
+        let applied_scale =
+            Self::negotiate_editor_scale(&view, &window, scaling, _restore, &mut size)?;
+        let accepted = applied_scale.is_some();
+        let effective = if accepted {
+            EditorScaling::Plugin
+        } else {
+            editor_scaling::fallback(scaling, parent)
+        };
         if !accepted {
-            effective = editor_scaling::fallback(scaling, parent);
             #[cfg(windows)]
             if effective == EditorScaling::Stretch && scaling != EditorScaling::Stretch {
                 // View has not been attached. Release its old frame/window and
@@ -1313,7 +1431,7 @@ impl Vst3Plugin {
             mode: scaling,
             scaling: effective,
             scale_supported,
-            scale: applied_scale,
+            scale: applied_scale.unwrap_or(1.0),
             #[cfg(target_os = "linux")]
             output_scale: window.wayland().map_or(1.0, |w| w.scale()),
             view,
@@ -1541,7 +1659,9 @@ impl Vst3Plugin {
                 self.closed_editor = true;
             }
             self.module.run_loop.poll();
-            if self.module.wayland.pump(&self.module.run_loop).is_err() {
+            if let Err(error) = self.module.wayland.pump(&self.module.run_loop) {
+                // Reset retires this connection, so its pump failure is logged only once.
+                eprintln!("VST3 Wayland pump failed on main thread: {error}");
                 if self
                     .editor
                     .as_ref()
@@ -1607,9 +1727,20 @@ impl Vst3Plugin {
                             .checked_sub(rect.top)
                             .filter(|v| (1..=8192).contains(v))
                     {
-                        let _ = window.resize(width, height);
-                        // SAFETY: constrained rectangle remains live during the UI callback.
-                        let _ = unsafe { editor.view.onSize(&mut rect) };
+                        // take_size consumes the request: log each failed operation once.
+                        let result = window
+                            .resize(width, height)
+                            .map_err(|error| PluginError(format!("window.resize: {error}")))
+                            .and_then(|()| {
+                                // SAFETY: constrained rectangle remains live during the UI callback.
+                                check(unsafe { editor.view.onSize(&mut rect) }, "view.onSize")
+                            });
+                        if let Err(error) = result {
+                            eprintln!("VST3 Wayland resize failed on main thread: {error}");
+                            // Zero is not a valid editor size. Invalidate the cache so
+                            // take_events re-reports the actual native size, even unchanged.
+                            self.editor_size = Some((0, 0));
+                        }
                     }
                 }
             }
@@ -1632,8 +1763,19 @@ impl Vst3Plugin {
         }
     }
     pub fn take_events(&mut self) -> PluginEvents {
-        self.shared.edits.flush_deferred();
         let flags = self.shared.edits.flags.swap(0, Ordering::AcqRel);
+        let mapping_failed = if flags & 8 != 0 {
+            if let Err(error) = self.rebuild_mappings() {
+                eprintln!("VST3 mapping rebuild failed: {error}");
+                self.shared.closed.store(true, Ordering::SeqCst);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        self.shared.edits.flush_deferred();
         let latency_changed = if flags & 2 != 0 {
             // SAFETY: SDK latency notification handled on main thread, live processor.
             self.info.latency = unsafe { self.shared.processor.getLatencySamples() };
@@ -1641,11 +1783,18 @@ impl Vst3Plugin {
         } else {
             None
         };
-        let size = self
-            .editor
-            .as_ref()
-            .and_then(|editor| editor.window.status().ok())
-            .map(|(_, w, h)| (w, h));
+        let size = match self.editor.as_ref().map(|editor| editor.window.status()) {
+            Some(Ok((_, width, height))) => Some((width, height)),
+            Some(Err(error)) => {
+                // X11 can disconnect between pump and status (audit #11 TD-34;
+                // x11_disconnect_closes_editor_and_preserves_audio).
+                eprintln!("VST3 editor status failed: {error}");
+                self.editor = None;
+                self.closed_editor = true;
+                None
+            }
+            None => None,
+        };
         let resized = if self.editor_size.is_some() && size != self.editor_size {
             size
         } else {
@@ -1658,7 +1807,9 @@ impl Vst3Plugin {
             parameter_edits: self.shared.edits.notifications.drain(),
             latency_changed,
             editor_closed: std::mem::take(&mut self.closed_editor),
-            fault: if flags & 4 != 0 {
+            fault: if mapping_failed {
+                Some("VST 3 mapping rebuild failed")
+            } else if flags & 4 != 0 {
                 Some("bus layout changed")
             } else if flags & 16 != 0 {
                 Some("VST 3 audio processing failed")
@@ -1674,6 +1825,10 @@ impl Drop for Vst3Plugin {
         self.deactivate();
         let _control = self.shared.control();
         self.shared.closed.store(true, Ordering::SeqCst);
+        // SAFETY: control admission is closed and busy drained; closed prevents
+        // any later audio entry. Reclaim Vec storage here even if the processor
+        // retains the last Shared reference and eventually drops it on audio.
+        unsafe { *self.shared.mappings.get() = MappingSnapshot::default() };
         if let Some((a, b)) = self.connection.take() {
             // SAFETY: main-thread connected endpoints still retained through disconnect.
             let _ = unsafe { a.disconnect(b.as_ptr()) };
@@ -1704,8 +1859,6 @@ pub struct Vst3Processor {
     input_events_ptr: ComPtr<IEventList>,
     output_events: ComWrapper<crate::vst3_events::EventList>,
     output_events_ptr: ComPtr<IEventList>,
-    mappings: Vec<(u32, u32, u32)>,
-    parameter_ids: Vec<u32>,
     inputs: usize,
     outputs: usize,
     frames: usize,
@@ -1818,6 +1971,10 @@ impl Vst3Processor {
                 }
                 self.processing = true;
             }
+            // SAFETY: this audio handle has acquired busy and rechecked admission.
+            // Main-thread snapshot replacement closes admission and waits for busy
+            // to clear; this borrow ends before the release below, including errors.
+            let mappings = unsafe { &*self.shared.mappings.get() };
             let mut start = 0;
             let mut base_context = *context;
             let mut context_origin = 0;
@@ -1861,8 +2018,8 @@ impl Vst3Processor {
                     context,
                     self.setup.sample_rate,
                     &self.changes,
-                    &self.mappings,
-                    &self.parameter_ids,
+                    &mappings.midi,
+                    &mappings.writable_ids,
                     &mut output.dropped,
                 );
                 let mut input_pointers = [std::ptr::null_mut(); 64];

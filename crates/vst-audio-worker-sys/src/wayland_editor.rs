@@ -38,17 +38,20 @@ fn flush(connection: &Connection) -> io::Result<()> {
 
 #[derive(Default)]
 pub(crate) struct WaylandHost {
-    connection: RefCell<Option<Connection>>,
+    connection: RefCell<Option<Rc<Session>>>,
     references: Cell<usize>,
     // A connection replaced while a plugin still held its display, with the
     // plugin's open count. It is released once the plugin closes it; freeing it
     // earlier would leave the plugin a dangling pointer.
-    retired: RefCell<Vec<(Connection, usize)>>,
+    retired: RefCell<Vec<(Rc<Session>, usize)>>,
 }
 impl WaylandHost {
     pub fn connection(&self) -> io::Result<Connection> {
-        if let Some(connection) = self.connection.borrow().as_ref() {
-            return Ok(connection.clone());
+        Ok(self.session()?.connection.clone())
+    }
+    fn session(&self) -> io::Result<Rc<Session>> {
+        if let Some(session) = self.connection.borrow().as_ref() {
+            return Ok(session.clone());
         }
         if !crate::linux_editor::wayland_allowed() || !crate::linux_editor::wayland_session() {
             return Err(err("no Wayland session is available"));
@@ -63,8 +66,23 @@ impl WaylandHost {
             ));
         }
         let connection = Connection::connect_to_env().map_err(err)?;
-        *self.connection.borrow_mut() = Some(connection.clone());
-        Ok(connection)
+        let queue = connection.new_event_queue();
+        let registry = connection.display().get_registry(&queue.handle(), ());
+        let session = Rc::new(Session {
+            inner: RefCell::new(Inner {
+                queue,
+                state: State::default(),
+            }),
+            _registry: registry,
+            connection,
+        });
+        {
+            let mut inner = session.inner.borrow_mut();
+            let Inner { queue, state } = &mut *inner;
+            queue.roundtrip(state).map_err(err)?;
+        }
+        *self.connection.borrow_mut() = Some(session.clone());
+        Ok(session)
     }
     pub fn open(&self) -> *mut c_void {
         match self.connection() {
@@ -79,7 +97,7 @@ impl WaylandHost {
         let mut retired = self.retired.borrow_mut();
         if let Some(index) = retired
             .iter()
-            .position(|(c, _)| c.backend().display_ptr().cast::<c_void>() == display)
+            .position(|(c, _)| c.connection.backend().display_ptr().cast::<c_void>() == display)
         {
             retired[index].1 -= 1;
             if retired[index].1 == 0 {
@@ -100,7 +118,7 @@ impl WaylandHost {
         self.connection
             .borrow()
             .as_ref()
-            .is_some_and(|c| c.backend().display_ptr().cast::<c_void>() == display)
+            .is_some_and(|c| c.connection.backend().display_ptr().cast::<c_void>() == display)
     }
     // Call only after removed()/frame teardown: guest proxies still borrow this display.
     pub fn reset(&self) {
@@ -113,9 +131,10 @@ impl WaylandHost {
         }
     }
     pub fn pump(&self, run_loop: &crate::linux_runloop::RunLoop) -> io::Result<()> {
-        let Some(connection) = self.connection.borrow().clone() else {
+        let Some(session) = self.connection.borrow().clone() else {
             return Ok(());
         };
+        let connection = &session.connection;
         let backend = connection.backend();
         let fd = backend.poll_fd().as_raw_fd();
         // The run loop has called registered foreign handlers first. Never read
@@ -137,7 +156,10 @@ impl WaylandHost {
             }
         }
         backend.dispatch_inner_queue().map_err(err)?;
-        flush(&connection)
+        let mut inner = session.inner.borrow_mut();
+        let Inner { queue, state } = &mut *inner;
+        queue.dispatch_pending(state).map_err(err)?;
+        flush(connection)
     }
 }
 fn readable(fd: i32) -> bool {
@@ -198,8 +220,36 @@ struct Inner {
     queue: EventQueue<State>,
     state: State,
 }
-pub(crate) struct Window {
+// The registry and its globals outlive each parent window, including hide/show.
+struct Session {
     inner: RefCell<Inner>,
+    _registry: wl_registry::WlRegistry,
+    connection: Connection,
+}
+impl Drop for Session {
+    fn drop(&mut self) {
+        let state = &mut self.inner.get_mut().state;
+        if let Some(wm) = &state.wm {
+            wm.destroy();
+        }
+        if let Some(manager) = &state.decorations {
+            manager.destroy();
+        }
+        if let Some(activation) = &state.activation {
+            activation.destroy();
+        }
+        for (output, _, _) in state.outputs.values() {
+            if output.version() >= 3 {
+                output.release();
+            }
+        }
+        // Registry, compositor v6 and shm v1 have no destructor request.
+        // Their server objects live until this connection is disconnected.
+        let _ = self.connection.flush();
+    }
+}
+pub(crate) struct Window {
+    session: Rc<Session>,
     connection: Connection,
     surface: wl_surface::WlSurface,
     xdg: xdg_surface::XdgSurface,
@@ -225,12 +275,12 @@ impl Window {
         height: i32,
         resizable: bool,
     ) -> io::Result<Self> {
-        let connection = host.connection()?;
-        let mut queue = connection.new_event_queue();
+        let session = host.session()?;
+        let connection = session.connection.clone();
+        let mut inner = session.inner.borrow_mut();
+        let Inner { queue, state } = &mut *inner;
+        queue.dispatch_pending(state).map_err(err)?;
         let qh = queue.handle();
-        connection.display().get_registry(&qh, ());
-        let mut state = State::default();
-        queue.roundtrip(&mut state).map_err(err)?;
         if state.wm.is_none() || state.shm.is_none() {
             return Err(err("xdg-shell or wl_shm is unavailable"));
         }
@@ -258,8 +308,9 @@ impl Window {
         });
         state.surface = Some(surface.clone());
         surface.commit();
+        drop(inner);
         let window = Self {
-            inner: RefCell::new(Inner { queue, state }),
+            session,
             connection,
             surface,
             xdg,
@@ -282,7 +333,7 @@ impl Window {
     }
     fn wait_configure(&self) -> io::Result<()> {
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !self.inner.borrow().state.configured {
+        while !self.session.inner.borrow().state.configured {
             flush(&self.connection)?;
             let backend = self.connection.backend();
             if let Some(read) = backend.prepare_read()
@@ -300,19 +351,19 @@ impl Window {
         Ok(())
     }
     fn roundtrip(&self) -> io::Result<()> {
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.session.inner.borrow_mut();
         let Inner { queue, state } = &mut *inner;
         queue.roundtrip(state).map_err(err)?;
         Ok(())
     }
     fn dispatch(&self) -> io::Result<()> {
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.session.inner.borrow_mut();
         let Inner { queue, state } = &mut *inner;
         queue.dispatch_pending(state).map_err(err)?;
         Ok(())
     }
     fn draw(&self) -> io::Result<()> {
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.session.inner.borrow_mut();
         let scale = inner.state.scale();
         let (width, height) = self.dimensions.get();
         let (w, h) = (width * scale, height * scale);
@@ -380,28 +431,31 @@ impl Window {
             return true;
         }
         if self.visible.get()
-            && (self.inner.borrow().state.redraw
-                || self.inner.borrow().state.scale() != self.scale.get())
+            && (self.session.inner.borrow().state.redraw
+                || self.session.inner.borrow().state.scale() != self.scale.get())
             && self.draw().is_err()
         {
             return true;
         }
-        self.inner.borrow().state.closed
+        self.session.inner.borrow().state.closed
     }
     pub fn commit(&self) -> io::Result<()> {
         self.surface.commit();
         flush(&self.connection)
     }
     pub fn take_size(&self) -> Option<(i32, i32)> {
-        self.inner.borrow_mut().state.pending_size.take()
+        self.session.inner.borrow_mut().state.pending_size.take()
     }
     pub fn scale(&self) -> f32 {
         self.scale.get() as f32
     }
     pub fn resize(&self, w: i32, h: i32) -> io::Result<()> {
-        self.dimensions.set((w, h));
-        if self.visible.get() {
-            self.draw()?;
+        let previous = self.dimensions.replace((w, h));
+        if self.visible.get()
+            && let Err(error) = self.draw()
+        {
+            self.dimensions.set(previous);
+            return Err(error);
         }
         Ok(())
     }
@@ -414,9 +468,10 @@ impl Window {
         }
     }
     pub fn focus(&self) -> io::Result<()> {
-        let inner = self.inner.borrow();
+        let inner = self.session.inner.borrow();
         if let Some(activation) = &inner.state.activation {
-            let token = activation.get_activation_token(&inner.queue.handle(), ());
+            let token =
+                activation.get_activation_token(&inner.queue.handle(), self.surface.clone());
             token.set_app_id("vst-audio-worker".into());
             token.set_surface(&self.surface);
             token.commit();
@@ -424,7 +479,7 @@ impl Window {
         flush(&self.connection)
     }
     pub fn request_close(&self) -> io::Result<()> {
-        self.inner.borrow_mut().state.closed = true;
+        self.session.inner.borrow_mut().state.closed = true;
         Ok(())
     }
     pub fn status(&self) -> io::Result<(bool, u32, u32)> {
@@ -452,23 +507,19 @@ impl Drop for Window {
         self.toplevel.destroy();
         self.xdg.destroy();
         self.surface.destroy();
-        let state = &mut self.inner.get_mut().state;
+        let mut inner = self.session.inner.borrow_mut();
+        let state = &mut inner.state;
         for buffer in state.buffers.drain(..) {
             buffer.proxy.destroy();
         }
-        if let Some(wm) = &state.wm {
-            wm.destroy();
-        }
-        if let Some(manager) = &state.decorations {
-            manager.destroy();
-        }
-        if let Some(activation) = &state.activation {
-            activation.destroy();
-        }
-        for (output, _, _) in state.outputs.values() {
-            if output.version() >= 3 {
-                output.release();
-            }
+        state.surface = None;
+        state.preferred_scale = None;
+        state.configured = false;
+        state.closed = false;
+        state.pending_size = None;
+        state.redraw = false;
+        for (_, _, entered) in state.outputs.values_mut() {
+            *entered = false;
         }
         let _ = self.connection.flush();
     }
@@ -504,7 +555,11 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                 _ => {}
             },
             wl_registry::Event::GlobalRemove { name } => {
-                s.outputs.remove(&name);
+                if let Some((output, _, _)) = s.outputs.remove(&name)
+                    && output.version() >= 3
+                {
+                    output.release();
+                }
             }
             _ => {}
         }
@@ -513,12 +568,16 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
 impl Dispatch<wl_surface::WlSurface, ()> for State {
     fn event(
         s: &mut Self,
-        _: &wl_surface::WlSurface,
+        surface: &wl_surface::WlSurface,
         event: wl_surface::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+        // The connection queue may still contain events from the removed parent.
+        if s.surface.as_ref() != Some(surface) {
+            return;
+        }
         match event {
             wl_surface::Event::PreferredBufferScale { factor } => s.preferred_scale = Some(factor),
             wl_surface::Event::Enter { output } => {
@@ -580,7 +639,9 @@ impl Dispatch<xdg_surface::XdgSurface, ()> for State {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let xdg_surface::Event::Configure { serial } = event {
+        if xdg.is_alive()
+            && let xdg_surface::Event::Configure { serial } = event
+        {
             xdg.ack_configure(serial);
             s.configured = true;
         }
@@ -589,12 +650,15 @@ impl Dispatch<xdg_surface::XdgSurface, ()> for State {
 impl Dispatch<xdg_toplevel::XdgToplevel, ()> for State {
     fn event(
         s: &mut Self,
-        _: &xdg_toplevel::XdgToplevel,
+        toplevel: &xdg_toplevel::XdgToplevel,
         event: xdg_toplevel::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+        if !toplevel.is_alive() {
+            return;
+        }
         match event {
             xdg_toplevel::Event::Close => s.closed = true,
             xdg_toplevel::Event::Configure { width, height, .. } if width > 0 && height > 0 => {
@@ -620,17 +684,19 @@ impl Dispatch<wl_buffer::WlBuffer, ()> for State {
         }
     }
 }
-impl Dispatch<xdg_activation_token_v1::XdgActivationTokenV1, ()> for State {
+impl Dispatch<xdg_activation_token_v1::XdgActivationTokenV1, wl_surface::WlSurface> for State {
     fn event(
         s: &mut Self,
         proxy: &xdg_activation_token_v1::XdgActivationTokenV1,
         event: xdg_activation_token_v1::Event,
-        _: &(),
+        surface: &wl_surface::WlSurface,
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
         if let xdg_activation_token_v1::Event::Done { token } = event {
-            if let (Some(activation), Some(surface)) = (&s.activation, &s.surface) {
+            if s.surface.as_ref() == Some(surface)
+                && let Some(activation) = &s.activation
+            {
                 activation.activate(token, surface);
             }
             proxy.destroy();
