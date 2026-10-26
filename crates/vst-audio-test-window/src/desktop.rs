@@ -169,11 +169,25 @@ impl Drop for Apartment {
 }
 thread_local! { static COM: Apartment = Apartment::new(); }
 /// Bounds of the first named UIA descendant, optionally restricted by class.
+/// `Ok(None)` while it is absent; `Err` only for a failing UI Automation call.
 pub fn find_named(
     top: u64,
     name: &str,
     class: Option<&str>,
 ) -> windows::core::Result<Option<Rect>> {
+    match search_named(top, name, class) {
+        // UIA reports no match as success with a null element, which windows-rs
+        // returns as an error carrying S_OK; a window that closed meanwhile reports
+        // UIA_E_ELEMENTNOTAVAILABLE. Neither is a failure of the search.
+        Err(error)
+            if error.code().is_ok() || error.code().0 as u32 == UIA_E_ELEMENTNOTAVAILABLE =>
+        {
+            Ok(None)
+        }
+        result => result,
+    }
+}
+fn search_named(top: u64, name: &str, class: Option<&str>) -> windows::core::Result<Option<Rect>> {
     COM.with(|_| {});
     // SAFETY: COM is initialized on this thread; result is retained only within this call.
     let automation: IUIAutomation =

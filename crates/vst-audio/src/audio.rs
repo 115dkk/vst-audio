@@ -1,5 +1,7 @@
 //! Variable callback adapter. Only bounded copies/atomics run in this module.
-use crate::{BlockEndpoint, Fallback, PluginControl, StartError, Started, api::Shared};
+use crate::{
+    BlockEndpoint, Fallback, PluginControl, StartError, StartErrorKind, Started, api::Shared,
+};
 #[cfg(test)]
 use crate::{BlockStatus, api::Lifecycle};
 use std::sync::Arc;
@@ -71,7 +73,6 @@ pub struct AudioEndpoint {
     blocks: BlockEndpoint,
     fallback: Fallback,
     max_callback_frames: u32,
-    stream_position: u64,
     fill: usize,
     output_at: usize,
     ready: bool,
@@ -80,6 +81,7 @@ pub struct AudioEndpoint {
     output32: Vec<f32>,
     output64: Vec<f64>,
     pending: Box<EventBuffer>,
+    pending_input_events: u32,
     delivered: Box<EventBuffer>,
     event_cursor: usize,
     pending_context: Transport,
@@ -102,29 +104,36 @@ impl AudioEndpoint {
     ) -> Result<Self, StartError> {
         let g = active.geometry;
         let q = g.max_frames as usize;
-        let blocks = BlockEndpoint::new(active, depth, shared, next, retired)
-            .map_err(|error| StartError(format!("invalid block endpoint: {error:?}")))?;
-        let history_len =
-            g.latency_bound_frames
-                .checked_add((depth + 1).saturating_mul(g.max_frames))
-                .and_then(|frames| frames.checked_add(1))
-                .ok_or_else(|| StartError("fallback delay overflow".into()))? as usize;
+        let blocks = BlockEndpoint::new(active, depth, shared, next, retired).map_err(|error| {
+            StartError::new(
+                StartErrorKind::InvalidInput,
+                format!("invalid block endpoint: {error:?}"),
+            )
+        })?;
+        let history_len = g
+            .latency_bound_frames
+            .checked_add((depth + 1).saturating_mul(g.max_frames))
+            .and_then(|frames| frames.checked_add(1))
+            .ok_or_else(|| StartError::new(StartErrorKind::Start, "fallback delay overflow"))?
+            as usize;
         let history_samples = if fallback == Fallback::DelayedInput {
             history_len
                 .checked_mul(g.output_channels as usize)
-                .ok_or_else(|| StartError("fallback size overflow".into()))?
+                .ok_or_else(|| StartError::new(StartErrorKind::Start, "fallback size overflow"))?
         } else {
             0
         };
         if history_samples > 8 * 1024 * 1024 {
-            return Err(StartError("fallback delay exceeds 64 MiB budget".into()));
+            return Err(StartError::new(
+                StartErrorKind::Start,
+                "fallback delay exceeds 64 MiB budget",
+            ));
         }
         let f32 = g.sample_format == SampleFormat::F32;
         Ok(Self {
             blocks,
             fallback,
             max_callback_frames,
-            stream_position: 0,
             fill: 0,
             output_at: 0,
             ready: false,
@@ -161,6 +170,7 @@ impl AudioEndpoint {
                 }
             ],
             pending: Box::default(),
+            pending_input_events: 0,
             delivered: Box::default(),
             event_cursor: 0,
             pending_context: Transport::default(),
@@ -355,6 +365,7 @@ impl AudioEndpoint {
                         context_origin = current;
                     }
                     self.pending.push(event);
+                    self.pending_input_events = self.pending_input_events.saturating_add(1);
                     event_index += 1;
                 }
                 let output_at = self.output_at + current - frame;
@@ -366,7 +377,14 @@ impl AudioEndpoint {
                     self.event_cursor += 1;
                     if valid_output {
                         event.sample_offset = current as u32;
-                        if let Some(destination) = output_events.get_mut(report.events_written) {
+                        let undeclared_bus =
+                            matches!(event.data, EventData::Midi(_) | EventData::SysEx { .. })
+                                && event.bus >= self.blocks.capabilities().output_event_buses;
+                        if undeclared_bus {
+                            report.events_dropped = report.events_dropped.saturating_add(1);
+                        } else if let Some(destination) =
+                            output_events.get_mut(report.events_written)
+                        {
                             *destination = event;
                             report.events_written += 1;
                         } else {
@@ -414,10 +432,9 @@ impl AudioEndpoint {
             self.history_at = (self.history_at + segment) % self.history_len;
             self.fill += segment;
             self.output_at += segment;
-            self.stream_position = self.stream_position.saturating_add(segment as u64);
             frame += segment;
             if self.fill == q {
-                self.finish_quantum();
+                report.events_dropped = report.events_dropped.saturating_add(self.finish_quantum());
                 self.fill = 0;
                 self.output_at = 0;
             }
@@ -426,10 +443,13 @@ impl AudioEndpoint {
         report.generation = self.blocks.generation();
         report
     }
-    fn finish_quantum(&mut self) {
+    fn finish_quantum(&mut self) -> u32 {
+        let mut events_dropped = 0u32;
         // Never release the last Arc or a heap buffer on this thread.
         if self.blocks.adopt() {
+            events_dropped = events_dropped.saturating_add(self.pending_input_events);
             self.pending.clear();
+            self.pending_input_events = 0;
             self.ready = false;
         }
         self.delivered.clear();
@@ -437,7 +457,8 @@ impl AudioEndpoint {
         self.ready = false;
         let geometry = self.blocks.geometry();
         self.pending.sort_by_offset();
-        let status = self.blocks.process_slots_after_adopt(
+        let pending_input_events = self.pending_input_events;
+        let (status, published) = self.blocks.process_slots_after_adopt(
             |slot| {
                 for channel in 0..geometry.input_channels as usize {
                     let range = channel * slot.frames()..(channel + 1) * slot.frames();
@@ -473,6 +494,11 @@ impl AudioEndpoint {
             self.delivered.sort_by_offset();
         }
         self.pending.clear();
+        self.pending_input_events = 0;
+        if !published {
+            events_dropped = events_dropped.saturating_add(pending_input_events);
+        }
+        events_dropped
     }
 }
 trait Sample: Copy {
@@ -631,6 +657,7 @@ fn equivalent(a: Transport, b: Transport) -> bool {
 struct AudioTestRig {
     endpoint: AudioEndpoint,
     consumer: vst_audio_ring::Consumer<'static>,
+    updates: rtrb::Producer<PreparedAudio>,
     shared: Arc<Shared>,
     sequence_origin: u32,
 }
@@ -710,8 +737,8 @@ fn audio_test_rig(
         capabilities,
         generation: 1,
     };
-    let shared = Shared::for_audio_test();
-    let (_updates, next) = rtrb::RingBuffer::new(2);
+    let shared = Shared::for_audio_test(plugin_latency);
+    let (updates, next) = rtrb::RingBuffer::new(2);
     let (retired, _retirements) = rtrb::RingBuffer::new(2);
     let depth = max_callback_frames.div_ceil(quantum);
     let endpoint = AudioEndpoint::new(
@@ -727,6 +754,7 @@ fn audio_test_rig(
     AudioTestRig {
         endpoint,
         consumer,
+        updates,
         shared,
         sequence_origin,
     }
@@ -743,173 +771,173 @@ mod golden {
     use vst_audio_ring::{Consumer, EventBuffer};
 
     const EXPECTED: &[(&str, u64)] = &[
-        ("F32-Silence-q128-m128-2to6-p0-b0", 0x0820c6ac774486ea),
-        ("F32-Silence-q128-m128-2to6-p0-b64", 0x0820c6ac774486ea),
-        ("F32-Silence-q128-m128-2to6-p64-b64", 0x8b13dc3b0853ba2a),
-        ("F32-Silence-q128-m128-2to6-p64-b128", 0x8b13dc3b0853ba2a),
-        ("F32-Silence-q128-m128-6to2-p0-b0", 0x3c4df9776db30149),
-        ("F32-Silence-q128-m128-6to2-p0-b64", 0x3c4df9776db30149),
-        ("F32-Silence-q128-m128-6to2-p64-b64", 0x10f75eb12b76ec09),
-        ("F32-Silence-q128-m128-6to2-p64-b128", 0x10f75eb12b76ec09),
-        ("F32-Silence-q128-m480-2to6-p0-b0", 0xd1a56451f76fe40e),
-        ("F32-Silence-q128-m480-2to6-p0-b64", 0xd1a56451f76fe40e),
-        ("F32-Silence-q128-m480-2to6-p64-b64", 0x5617f64b02735b4e),
-        ("F32-Silence-q128-m480-2to6-p64-b128", 0x5617f64b02735b4e),
-        ("F32-Silence-q128-m480-6to2-p0-b0", 0x44d0873cccdfb962),
-        ("F32-Silence-q128-m480-6to2-p0-b64", 0x44d0873cccdfb962),
-        ("F32-Silence-q128-m480-6to2-p64-b64", 0x66da111651261022),
-        ("F32-Silence-q128-m480-6to2-p64-b128", 0x66da111651261022),
-        ("F32-Silence-q480-m480-2to6-p0-b0", 0x903df8655256ed03),
-        ("F32-Silence-q480-m480-2to6-p0-b64", 0x903df8655256ed03),
-        ("F32-Silence-q480-m480-2to6-p64-b64", 0xca706bed2c38cc22),
-        ("F32-Silence-q480-m480-2to6-p64-b128", 0xca706bed2c38cc22),
-        ("F32-Silence-q480-m480-6to2-p0-b0", 0x194c136806b19281),
-        ("F32-Silence-q480-m480-6to2-p0-b64", 0x194c136806b19281),
-        ("F32-Silence-q480-m480-6to2-p64-b64", 0xc9520910c13fe24e),
-        ("F32-Silence-q480-m480-6to2-p64-b128", 0xc9520910c13fe24e),
-        ("F32-DelayedInput-q128-m128-2to6-p0-b0", 0x5ede60171eee306b),
-        ("F32-DelayedInput-q128-m128-2to6-p0-b64", 0x5ede60171eee306b),
+        ("F32-Silence-q128-m128-2to6-p0-b0", 0x61f560d47c69e994),
+        ("F32-Silence-q128-m128-2to6-p0-b64", 0x61f560d47c69e994),
+        ("F32-Silence-q128-m128-2to6-p64-b64", 0x8458c1966a1ab7d4),
+        ("F32-Silence-q128-m128-2to6-p64-b128", 0x8458c1966a1ab7d4),
+        ("F32-Silence-q128-m128-6to2-p0-b0", 0x334a67a7df3a231e),
+        ("F32-Silence-q128-m128-6to2-p0-b64", 0x334a67a7df3a231e),
+        ("F32-Silence-q128-m128-6to2-p64-b64", 0xe07ee88de0c324de),
+        ("F32-Silence-q128-m128-6to2-p64-b128", 0xe07ee88de0c324de),
+        ("F32-Silence-q128-m480-2to6-p0-b0", 0xac9d486a3ddf787a),
+        ("F32-Silence-q128-m480-2to6-p0-b64", 0xac9d486a3ddf787a),
+        ("F32-Silence-q128-m480-2to6-p64-b64", 0xf8a4b74e037bcaba),
+        ("F32-Silence-q128-m480-2to6-p64-b128", 0xf8a4b74e037bcaba),
+        ("F32-Silence-q128-m480-6to2-p0-b0", 0x387ed2a5c7c41aa2),
+        ("F32-Silence-q128-m480-6to2-p0-b64", 0x387ed2a5c7c41aa2),
+        ("F32-Silence-q128-m480-6to2-p64-b64", 0xc05e6e3abb489962),
+        ("F32-Silence-q128-m480-6to2-p64-b128", 0xc05e6e3abb489962),
+        ("F32-Silence-q480-m480-2to6-p0-b0", 0xd94aff9b765784eb),
+        ("F32-Silence-q480-m480-2to6-p0-b64", 0xd94aff9b765784eb),
+        ("F32-Silence-q480-m480-2to6-p64-b64", 0x2cef0d9d41b61fca),
+        ("F32-Silence-q480-m480-2to6-p64-b128", 0x2cef0d9d41b61fca),
+        ("F32-Silence-q480-m480-6to2-p0-b0", 0x8d5da8eb140bf813),
+        ("F32-Silence-q480-m480-6to2-p0-b64", 0x8d5da8eb140bf813),
+        ("F32-Silence-q480-m480-6to2-p64-b64", 0x645639c317f64fc4),
+        ("F32-Silence-q480-m480-6to2-p64-b128", 0x645639c317f64fc4),
+        ("F32-DelayedInput-q128-m128-2to6-p0-b0", 0xcbe1229d2dff53c5),
+        ("F32-DelayedInput-q128-m128-2to6-p0-b64", 0xcbe1229d2dff53c5),
         (
             "F32-DelayedInput-q128-m128-2to6-p64-b64",
-            0x013caaeb474301e2,
+            0x72c529fe43f342b0,
         ),
         (
             "F32-DelayedInput-q128-m128-2to6-p64-b128",
-            0x013caaeb474301e2,
+            0x72c529fe43f342b0,
         ),
-        ("F32-DelayedInput-q128-m128-6to2-p0-b0", 0x6b1954cfa0cb2c9b),
-        ("F32-DelayedInput-q128-m128-6to2-p0-b64", 0x6b1954cfa0cb2c9b),
+        ("F32-DelayedInput-q128-m128-6to2-p0-b0", 0xac21e53979ae0000),
+        ("F32-DelayedInput-q128-m128-6to2-p0-b64", 0xac21e53979ae0000),
         (
             "F32-DelayedInput-q128-m128-6to2-p64-b64",
-            0x836a2e81184f91b1,
+            0xf5778e90da11edca,
         ),
         (
             "F32-DelayedInput-q128-m128-6to2-p64-b128",
-            0x836a2e81184f91b1,
+            0xf5778e90da11edca,
         ),
-        ("F32-DelayedInput-q128-m480-2to6-p0-b0", 0x5592054970c76a08),
-        ("F32-DelayedInput-q128-m480-2to6-p0-b64", 0x5592054970c76a08),
+        ("F32-DelayedInput-q128-m480-2to6-p0-b0", 0x1758b81a8cc426d0),
+        ("F32-DelayedInput-q128-m480-2to6-p0-b64", 0x1758b81a8cc426d0),
         (
             "F32-DelayedInput-q128-m480-2to6-p64-b64",
-            0xa7c9ea3cc78265d7,
+            0xeaaf430787cf0fab,
         ),
         (
             "F32-DelayedInput-q128-m480-2to6-p64-b128",
-            0xa7c9ea3cc78265d7,
+            0xeaaf430787cf0fab,
         ),
-        ("F32-DelayedInput-q128-m480-6to2-p0-b0", 0x9a2d81ac41cb384c),
-        ("F32-DelayedInput-q128-m480-6to2-p0-b64", 0x9a2d81ac41cb384c),
+        ("F32-DelayedInput-q128-m480-6to2-p0-b0", 0x769d51b41ef39db4),
+        ("F32-DelayedInput-q128-m480-6to2-p0-b64", 0x769d51b41ef39db4),
         (
             "F32-DelayedInput-q128-m480-6to2-p64-b64",
-            0xf20caf7530899cf9,
+            0x80e52995da43199d,
         ),
         (
             "F32-DelayedInput-q128-m480-6to2-p64-b128",
-            0xf20caf7530899cf9,
+            0x80e52995da43199d,
         ),
-        ("F32-DelayedInput-q480-m480-2to6-p0-b0", 0xd00baf3103e91327),
-        ("F32-DelayedInput-q480-m480-2to6-p0-b64", 0xd00baf3103e91327),
+        ("F32-DelayedInput-q480-m480-2to6-p0-b0", 0x1a7a4569ecb8bb83),
+        ("F32-DelayedInput-q480-m480-2to6-p0-b64", 0x1a7a4569ecb8bb83),
         (
             "F32-DelayedInput-q480-m480-2to6-p64-b64",
-            0x7a17986dd273edc7,
+            0xfb3664123c0b7d0b,
         ),
         (
             "F32-DelayedInput-q480-m480-2to6-p64-b128",
-            0x7a17986dd273edc7,
+            0xfb3664123c0b7d0b,
         ),
-        ("F32-DelayedInput-q480-m480-6to2-p0-b0", 0x1317527bee0f819f),
-        ("F32-DelayedInput-q480-m480-6to2-p0-b64", 0x1317527bee0f819f),
+        ("F32-DelayedInput-q480-m480-6to2-p0-b0", 0xf329e8f35af46169),
+        ("F32-DelayedInput-q480-m480-6to2-p0-b64", 0xf329e8f35af46169),
         (
             "F32-DelayedInput-q480-m480-6to2-p64-b64",
-            0xeced742eb9717f5f,
+            0x6121dfe535b13b5d,
         ),
         (
             "F32-DelayedInput-q480-m480-6to2-p64-b128",
-            0xeced742eb9717f5f,
+            0x6121dfe535b13b5d,
         ),
-        ("F64-Silence-q128-m128-2to6-p0-b0", 0x03ea9977c5c54411),
-        ("F64-Silence-q128-m128-2to6-p0-b64", 0x03ea9977c5c54411),
-        ("F64-Silence-q128-m128-2to6-p64-b64", 0x487f42854fd07351),
-        ("F64-Silence-q128-m128-2to6-p64-b128", 0x487f42854fd07351),
-        ("F64-Silence-q128-m128-6to2-p0-b0", 0xcd0ac7efdd0d904b),
-        ("F64-Silence-q128-m128-6to2-p0-b64", 0xcd0ac7efdd0d904b),
-        ("F64-Silence-q128-m128-6to2-p64-b64", 0x109287c4211c858b),
-        ("F64-Silence-q128-m128-6to2-p64-b128", 0x109287c4211c858b),
-        ("F64-Silence-q128-m480-2to6-p0-b0", 0x8c3af4440d5f07d7),
-        ("F64-Silence-q128-m480-2to6-p0-b64", 0x8c3af4440d5f07d7),
-        ("F64-Silence-q128-m480-2to6-p64-b64", 0xe3df5497b1549517),
-        ("F64-Silence-q128-m480-2to6-p64-b128", 0xe3df5497b1549517),
-        ("F64-Silence-q128-m480-6to2-p0-b0", 0xb225a527e0e51077),
-        ("F64-Silence-q128-m480-6to2-p0-b64", 0xb225a527e0e51077),
-        ("F64-Silence-q128-m480-6to2-p64-b64", 0x13e4e6cbc912f4b7),
-        ("F64-Silence-q128-m480-6to2-p64-b128", 0x13e4e6cbc912f4b7),
-        ("F64-Silence-q480-m480-2to6-p0-b0", 0x4b9f7b70bc01093a),
-        ("F64-Silence-q480-m480-2to6-p0-b64", 0x4b9f7b70bc01093a),
-        ("F64-Silence-q480-m480-2to6-p64-b64", 0x966b6ff78658aae3),
-        ("F64-Silence-q480-m480-2to6-p64-b128", 0x966b6ff78658aae3),
-        ("F64-Silence-q480-m480-6to2-p0-b0", 0xca5d782cb2494a07),
-        ("F64-Silence-q480-m480-6to2-p0-b64", 0xca5d782cb2494a07),
-        ("F64-Silence-q480-m480-6to2-p64-b64", 0x4c17590155768b54),
-        ("F64-Silence-q480-m480-6to2-p64-b128", 0x4c17590155768b54),
-        ("F64-DelayedInput-q128-m128-2to6-p0-b0", 0xda0a25c8f91c2d34),
-        ("F64-DelayedInput-q128-m128-2to6-p0-b64", 0xda0a25c8f91c2d34),
+        ("F64-Silence-q128-m128-2to6-p0-b0", 0x4adff2a1a15b42e3),
+        ("F64-Silence-q128-m128-2to6-p0-b64", 0x4adff2a1a15b42e3),
+        ("F64-Silence-q128-m128-2to6-p64-b64", 0xb95a6808b8f0f323),
+        ("F64-Silence-q128-m128-2to6-p64-b128", 0xb95a6808b8f0f323),
+        ("F64-Silence-q128-m128-6to2-p0-b0", 0x9c3c0ff8619c2830),
+        ("F64-Silence-q128-m128-6to2-p0-b64", 0x9c3c0ff8619c2830),
+        ("F64-Silence-q128-m128-6to2-p64-b64", 0xb6e208c7d000f670),
+        ("F64-Silence-q128-m128-6to2-p64-b128", 0xb6e208c7d000f670),
+        ("F64-Silence-q128-m480-2to6-p0-b0", 0x133498a6c02fc34f),
+        ("F64-Silence-q128-m480-2to6-p0-b64", 0x133498a6c02fc34f),
+        ("F64-Silence-q128-m480-2to6-p64-b64", 0x2cf24d14fb7a458f),
+        ("F64-Silence-q128-m480-2to6-p64-b128", 0x2cf24d14fb7a458f),
+        ("F64-Silence-q128-m480-6to2-p0-b0", 0x0bbc03543b4d1703),
+        ("F64-Silence-q128-m480-6to2-p0-b64", 0x0bbc03543b4d1703),
+        ("F64-Silence-q128-m480-6to2-p64-b64", 0x6633f03e49b34343),
+        ("F64-Silence-q128-m480-6to2-p64-b128", 0x6633f03e49b34343),
+        ("F64-Silence-q480-m480-2to6-p0-b0", 0xffbc312aed1afbe2),
+        ("F64-Silence-q480-m480-2to6-p0-b64", 0xffbc312aed1afbe2),
+        ("F64-Silence-q480-m480-2to6-p64-b64", 0xae5849f8a949491b),
+        ("F64-Silence-q480-m480-2to6-p64-b128", 0xae5849f8a949491b),
+        ("F64-Silence-q480-m480-6to2-p0-b0", 0x21ce35cbf2bf1f89),
+        ("F64-Silence-q480-m480-6to2-p0-b64", 0x21ce35cbf2bf1f89),
+        ("F64-Silence-q480-m480-6to2-p64-b64", 0xd5054bb2f6b4234a),
+        ("F64-Silence-q480-m480-6to2-p64-b128", 0xd5054bb2f6b4234a),
+        ("F64-DelayedInput-q128-m128-2to6-p0-b0", 0x537f29287b042696),
+        ("F64-DelayedInput-q128-m128-2to6-p0-b64", 0x537f29287b042696),
         (
             "F64-DelayedInput-q128-m128-2to6-p64-b64",
-            0xb438f9928047eb00,
+            0xd58a4e687e8508ce,
         ),
         (
             "F64-DelayedInput-q128-m128-2to6-p64-b128",
-            0xb438f9928047eb00,
+            0xd58a4e687e8508ce,
         ),
-        ("F64-DelayedInput-q128-m128-6to2-p0-b0", 0x6fdc52fd52019d89),
-        ("F64-DelayedInput-q128-m128-6to2-p0-b64", 0x6fdc52fd52019d89),
+        ("F64-DelayedInput-q128-m128-6to2-p0-b0", 0xced55188a64270ce),
+        ("F64-DelayedInput-q128-m128-6to2-p0-b64", 0xced55188a64270ce),
         (
             "F64-DelayedInput-q128-m128-6to2-p64-b64",
-            0xe632a880026d4a6e,
+            0x675a5665d4fbad69,
         ),
         (
             "F64-DelayedInput-q128-m128-6to2-p64-b128",
-            0xe632a880026d4a6e,
+            0x675a5665d4fbad69,
         ),
-        ("F64-DelayedInput-q128-m480-2to6-p0-b0", 0x4b0e753c2ebd7f38),
-        ("F64-DelayedInput-q128-m480-2to6-p0-b64", 0x4b0e753c2ebd7f38),
+        ("F64-DelayedInput-q128-m480-2to6-p0-b0", 0xf46626865cd5aa38),
+        ("F64-DelayedInput-q128-m480-2to6-p0-b64", 0xf46626865cd5aa38),
         (
             "F64-DelayedInput-q128-m480-2to6-p64-b64",
-            0x77f5f4584a7827b1,
+            0x6e2d2de29876f84d,
         ),
         (
             "F64-DelayedInput-q128-m480-2to6-p64-b128",
-            0x77f5f4584a7827b1,
+            0x6e2d2de29876f84d,
         ),
-        ("F64-DelayedInput-q128-m480-6to2-p0-b0", 0x4c6bdfe4fc78ca08),
-        ("F64-DelayedInput-q128-m480-6to2-p0-b64", 0x4c6bdfe4fc78ca08),
+        ("F64-DelayedInput-q128-m480-6to2-p0-b0", 0x742cc39d726030ec),
+        ("F64-DelayedInput-q128-m480-6to2-p0-b64", 0x742cc39d726030ec),
         (
             "F64-DelayedInput-q128-m480-6to2-p64-b64",
-            0x5fed323c731e3ba6,
+            0x4f40c734200432a2,
         ),
         (
             "F64-DelayedInput-q128-m480-6to2-p64-b128",
-            0x5fed323c731e3ba6,
+            0x4f40c734200432a2,
         ),
-        ("F64-DelayedInput-q480-m480-2to6-p0-b0", 0x74d88039e6c27642),
-        ("F64-DelayedInput-q480-m480-2to6-p0-b64", 0x74d88039e6c27642),
+        ("F64-DelayedInput-q480-m480-2to6-p0-b0", 0x3ddccfdf4ce9fb46),
+        ("F64-DelayedInput-q480-m480-2to6-p0-b64", 0x3ddccfdf4ce9fb46),
         (
             "F64-DelayedInput-q480-m480-2to6-p64-b64",
-            0x31271e5dc3897ca3,
+            0xb36283e7249dfdef,
         ),
         (
             "F64-DelayedInput-q480-m480-2to6-p64-b128",
-            0x31271e5dc3897ca3,
+            0xb36283e7249dfdef,
         ),
-        ("F64-DelayedInput-q480-m480-6to2-p0-b0", 0x7462d6eea5d6beee),
-        ("F64-DelayedInput-q480-m480-6to2-p0-b64", 0x7462d6eea5d6beee),
+        ("F64-DelayedInput-q480-m480-6to2-p0-b0", 0x39c0b741e3e42754),
+        ("F64-DelayedInput-q480-m480-6to2-p0-b64", 0x39c0b741e3e42754),
         (
             "F64-DelayedInput-q480-m480-6to2-p64-b64",
-            0xe057355cd479e0c3,
+            0x5c6de5d492180d51,
         ),
         (
             "F64-DelayedInput-q480-m480-6to2-p64-b128",
-            0xe057355cd479e0c3,
+            0x5c6de5d492180d51,
         ),
     ];
 
@@ -1474,6 +1502,143 @@ mod golden {
             })
             .collect::<Vec<_>>();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn reports_input_events_dropped_while_processing_gate_is_closed() {
+        let mut rig = audio_test_rig(SampleFormat::F32, Fallback::Silence, 4, 4, 2, 1, 1, 0, 0, 0);
+        rig.shared.set_lifecycle(Lifecycle::Failed);
+        let input = [0.0; 4];
+        let mut output = [0.0; 4];
+        let event = AudioEvent::midi(2, 0, [0x90, 60, 100]);
+
+        let report = rig.endpoint.process_events(
+            4,
+            &[&input],
+            &mut [&mut output],
+            Transport::default(),
+            &[event],
+            &mut [],
+        );
+
+        assert_eq!(report.status, AudioStatus::Fallback);
+        assert_eq!(report.events_dropped, 1);
+        assert!(rig.consumer.next_published(0).is_none());
+    }
+
+    #[test]
+    fn reports_input_events_dropped_when_the_ring_is_full() {
+        let mut rig = audio_test_rig(SampleFormat::F32, Fallback::Silence, 4, 4, 2, 1, 1, 0, 0, 0);
+        let input = [0.0; 4];
+        let event = AudioEvent::midi(2, 0, [0x90, 60, 100]);
+        for expected_dropped in [0, 0, 1] {
+            let mut output = [0.0; 4];
+            let report = rig.endpoint.process_events(
+                4,
+                &[&input],
+                &mut [&mut output],
+                Transport::default(),
+                &[event],
+                &mut [],
+            );
+            assert_eq!(report.events_dropped, expected_dropped);
+        }
+    }
+
+    #[test]
+    fn reports_pending_input_events_dropped_at_recovery_adoption() {
+        let mut rig = audio_test_rig(SampleFormat::F32, Fallback::Silence, 4, 4, 2, 1, 1, 0, 0, 0);
+        let input = [0.0; 2];
+        let mut output = [0.0; 2];
+        let event = AudioEvent::midi(1, 0, [0x90, 60, 100]);
+        let transport = Transport::default();
+        let first = rig.endpoint.process_events(
+            2,
+            &[&input],
+            &mut [&mut output],
+            transport,
+            &[event],
+            &mut [],
+        );
+        assert_eq!(first.events_dropped, 0);
+
+        let replacement =
+            audio_test_rig(SampleFormat::F32, Fallback::Silence, 4, 4, 2, 1, 1, 0, 0, 0);
+        let mut next = replacement.endpoint.into_blocks().active;
+        next.generation = 2;
+        rig.updates.push(next).unwrap();
+        rig.shared.generation.store(2, Ordering::Release);
+
+        let report = rig.endpoint.process_events(
+            2,
+            &[&input],
+            &mut [&mut output],
+            transport.advanced(2, 48_000),
+            &[],
+            &mut [],
+        );
+
+        assert_eq!(report.events_dropped, 1);
+        assert_eq!(report.generation, 2);
+    }
+
+    #[test]
+    fn drops_midi_and_sysex_from_undeclared_output_event_buses() {
+        let mut rig = audio_test_rig(SampleFormat::F32, Fallback::Silence, 4, 4, 2, 1, 1, 0, 0, 0);
+        let input = [0.0; 4];
+        let mut output = [0.0; 4];
+        assert_eq!(
+            rig.endpoint
+                .process_events(
+                    4,
+                    &[&input],
+                    &mut [&mut output],
+                    Transport::default(),
+                    &[],
+                    &mut [],
+                )
+                .events_dropped,
+            0
+        );
+        let sequence = rig.consumer.next_published(0).unwrap();
+        let mut sysex = [0; vst_audio_ring::MAX_SYSEX_BYTES];
+        sysex[0] = 0xf0;
+        sysex[1] = 0xf7;
+        let mut output_packet = EventBuffer::default();
+        output_packet.push(AudioEvent::midi(0, 0, [0x90, 60, 100]));
+        output_packet.push(AudioEvent::midi(1, 1, [0x90, 61, 100]));
+        output_packet.push(AudioEvent {
+            sample_offset: 2,
+            bus: 2,
+            data: EventData::SysEx {
+                len: 2,
+                bytes: sysex,
+            },
+        });
+        assert!(rig.consumer.output_packet(0, sequence, &output_packet));
+        rig.consumer.complete(0, sequence);
+
+        let mut output_events = [AudioEvent::default(); 3];
+        let warmup = rig.endpoint.process_events(
+            4,
+            &[&input],
+            &mut [&mut output],
+            Transport::default().advanced(4, 48_000),
+            &[],
+            &mut output_events,
+        );
+        assert_eq!((warmup.events_written, warmup.events_dropped), (0, 0));
+        let report = rig.endpoint.process_events(
+            4,
+            &[&input],
+            &mut [&mut output],
+            Transport::default().advanced(8, 48_000),
+            &[],
+            &mut output_events,
+        );
+
+        assert_eq!((report.events_written, report.events_dropped), (1, 2));
+        assert_eq!(output_events[0], AudioEvent::midi(0, 0, [0x90, 60, 100]));
     }
 
     fn cost_case(fallback: Fallback, quantum: u32, callback: u32, maximum: u32) {

@@ -1,10 +1,11 @@
 //! GUI- and executor-independent application API.
 use crate::audio::{AudioEndpoint, PreparedAudio};
 use crate::{
-    Architecture, BlockEndpoint, PluginFormat, PluginProcess, StartError, Started,
+    Architecture, BlockEndpoint, PluginFormat, PluginProcess, StartError, StartErrorKind, Started,
     plugin_architectures,
 };
 use std::{
+    cell::Cell,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -99,10 +100,13 @@ impl Configuration {
     fn callback_geometry(&self) -> Result<(u32, u32, u32), StartError> {
         let maximum = self.max_callback_frames.unwrap_or(self.quantum);
         if maximum == 0 || self.quantum == 0 {
-            return Err(StartError(format!(
-                "max_callback_frames {maximum} and quantum {} must both be nonzero",
-                self.quantum
-            )));
+            return Err(StartError::new(
+                StartErrorKind::InvalidInput,
+                format!(
+                    "max_callback_frames {maximum} and quantum {} must both be nonzero",
+                    self.quantum
+                ),
+            ));
         }
         let depth = maximum / self.quantum + u32::from(!maximum.is_multiple_of(self.quantum));
         let required = depth.saturating_add(1);
@@ -110,11 +114,14 @@ impl Configuration {
             .slots
             .unwrap_or_else(|| required.checked_next_power_of_two().unwrap_or(u32::MAX));
         if slots < required || slots > crate::MAX_SLOTS || !slots.is_power_of_two() {
-            return Err(StartError(format!(
-                "max_callback_frames {maximum} with quantum {} requires at least {required} slots; slots {slots} must be a power of two and not exceed MAX_SLOTS ({})",
-                self.quantum,
-                crate::MAX_SLOTS
-            )));
+            return Err(StartError::new(
+                StartErrorKind::InvalidInput,
+                format!(
+                    "max_callback_frames {maximum} with quantum {} requires at least {required} slots; slots {slots} must be a power of two and not exceed MAX_SLOTS ({})",
+                    self.quantum,
+                    crate::MAX_SLOTS
+                ),
+            ));
         }
         Ok((maximum, depth, slots))
     }
@@ -205,14 +212,17 @@ impl Host {
         }) {
             return Ok(worker.clone());
         }
-        Err(StartError(format!(
-            "plugin is built for {}; no worker for those architectures is configured",
-            architectures
-                .iter()
-                .map(|architecture| architecture.name())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )))
+        Err(StartError::new(
+            StartErrorKind::Start,
+            format!(
+                "plugin is built for {}; no worker for those architectures is configured",
+                architectures
+                    .iter()
+                    .map(|architecture| architecture.name())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ))
     }
     pub fn worker_path(&self) -> &Path {
         &self.worker
@@ -252,7 +262,10 @@ impl Host {
     ) -> Result<Instance, StartError> {
         if matches!(config.recovery,RecoveryPolicy::Automatic{attempts,backoff_ms} if attempts>8||backoff_ms>60000)
         {
-            return Err(StartError("invalid recovery policy".into()));
+            return Err(StartError::new(
+                StartErrorKind::InvalidInput,
+                "invalid recovery policy",
+            ));
         }
         let (max_callback_frames, depth, _) = config.callback_geometry()?;
         let launch = Launch {
@@ -318,8 +331,9 @@ impl LoadTask {
                 result.map(Some)
             }
             Err(mpsc::TryRecvError::Empty) => Ok(None),
-            Err(mpsc::TryRecvError::Disconnected) => Err(StartError(
-                "load task disconnected or already consumed".into(),
+            Err(mpsc::TryRecvError::Disconnected) => Err(StartError::new(
+                StartErrorKind::Disconnected,
+                "load task disconnected or already consumed",
             )),
         }
     }
@@ -348,6 +362,9 @@ pub enum Command {
     },
     SaveState,
     RestoreState(Vec<u8>),
+    /// Start a new worker from the newest saved state, or the one before it with
+    /// `use_previous`. Accepted while `Failed` and also while `Running`, where it
+    /// deliberately replaces the healthy worker: a forced restart.
     Recover {
         use_previous: bool,
     },
@@ -461,6 +478,9 @@ pub(crate) struct Shared {
     pub(crate) overflow: AtomicBool,
     next_request: AtomicU64,
     pub(crate) generation: AtomicU64,
+    // The runtime latency and the low 32 bits of its generation in one word, so
+    // the audio thread never reads a torn pair (audit #11 TD-05).
+    runtime_latency: AtomicU64,
     pub(crate) applied_generation: AtomicU64,
     pub(crate) processed_generation: AtomicU64,
     pub(crate) history: Mutex<vst_audio_protocol::StateHistory>,
@@ -472,6 +492,20 @@ impl Shared {
     pub(crate) fn lifecycle(&self) -> Lifecycle {
         Lifecycle::from_wire(self.lifecycle.load(Ordering::Acquire))
     }
+
+    pub(crate) fn publish_runtime_latency(&self, generation: u64, frames: u32) {
+        self.runtime_latency
+            .store(runtime_latency_word(generation, frames), Ordering::Release);
+    }
+
+    /// The latest runtime latency, if it belongs to `generation`.
+    pub(crate) fn runtime_latency(&self, generation: u64) -> Option<u32> {
+        let word = self.runtime_latency.load(Ordering::Acquire);
+        ((word >> 32) as u32 == generation as u32).then_some(word as u32)
+    }
+}
+fn runtime_latency_word(generation: u64, frames: u32) -> u64 {
+    u64::from(generation as u32) << 32 | u64::from(frames)
 }
 #[derive(Clone, Debug)]
 pub struct Controller {
@@ -485,7 +519,10 @@ impl Controller {
         if let Command::RestoreState(state) = &command
             && state.len() > vst_audio_protocol::MAX_STATE_BODY_BYTES
         {
-            return Err(StartError("state too large".into()));
+            return Err(StartError::new(
+                StartErrorKind::InvalidInput,
+                "state too large",
+            ));
         }
         if self.status() != Status::Running
             && !matches!(
@@ -493,17 +530,24 @@ impl Controller {
                 (Command::Recover { .. }, Status::Failed) | (Command::Shutdown, _)
             )
         {
-            return Err(StartError("plugin is not running".into()));
+            return Err(StartError::new(
+                StartErrorKind::NotRunning,
+                "plugin is not running",
+            ));
         }
         let id = self
             .shared
             .next_request
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-            .map_err(|_| StartError("request counter exhausted".into()))?;
+            .map_err(|_| StartError::new(StartErrorKind::Start, "request counter exhausted"))?;
         let id = RequestId(id);
-        self.requests
-            .try_send((id, command))
-            .map_err(|_| StartError("control queue full or closed".into()))?;
+        self.requests.try_send((id, command)).map_err(|error| {
+            let kind = match error {
+                mpsc::TrySendError::Full(_) => StartErrorKind::QueueFull,
+                mpsc::TrySendError::Disconnected(_) => StartErrorKind::Disconnected,
+            };
+            StartError::new(kind, "control queue full or closed")
+        })?;
         Ok(id)
     }
     /// Current worker identity; may change after recovery.
@@ -523,6 +567,82 @@ mod tests {
     use super::*;
 
     #[test]
+    fn notification_queue_dequeues_after_reporting_loss_under_pressure() {
+        let shared = Shared::for_audio_test(0);
+        let (send, events) = mpsc::sync_channel(2);
+        send.send(HostEvent::Stopped).unwrap();
+        let queue = NotificationQueue::new(events, shared.clone());
+
+        shared.overflow.store(true, Ordering::Release);
+        assert!(matches!(
+            queue.try_next(),
+            Some(HostEvent::NotificationsLost)
+        ));
+        shared.overflow.store(true, Ordering::Release);
+        assert!(matches!(queue.try_next(), Some(HostEvent::Stopped)));
+        assert!(matches!(
+            queue.try_next(),
+            Some(HostEvent::NotificationsLost)
+        ));
+    }
+
+    #[test]
+    fn runtime_latency_is_read_whole_for_its_generation() {
+        let shared = Shared::for_audio_test(64);
+        assert_eq!(shared.runtime_latency(1), Some(64));
+        shared.publish_runtime_latency(2, 128);
+        assert_eq!(shared.runtime_latency(1), None);
+        assert_eq!(shared.runtime_latency(2), Some(128));
+        // Only the generation's low 32 bits are kept; equality still holds past them.
+        let late = (1 << 32) + 5;
+        shared.publish_runtime_latency(late, 256);
+        assert_eq!(shared.runtime_latency(late), Some(256));
+        assert_eq!(shared.runtime_latency(2), None);
+    }
+
+    #[test]
+    fn controller_request_distinguishes_full_and_disconnected_queues() {
+        let shared = Shared::for_audio_test(0);
+        let (requests, receive) = mpsc::sync_channel(1);
+        let controller = Controller { requests, shared };
+
+        controller.request(Command::SaveState).unwrap();
+        let full = controller.request(Command::SaveState).unwrap_err();
+        assert_eq!(full.kind(), crate::StartErrorKind::QueueFull);
+        assert_eq!(full.to_string(), "control queue full or closed");
+
+        drop(receive);
+        let disconnected = controller.request(Command::SaveState).unwrap_err();
+        assert_eq!(disconnected.kind(), crate::StartErrorKind::Disconnected);
+        assert_eq!(disconnected.to_string(), "control queue full or closed");
+    }
+
+    #[test]
+    fn controller_request_reports_invalid_input_and_not_running() {
+        let shared = Shared::for_audio_test(0);
+        let (requests, _receive) = mpsc::sync_channel(1);
+        let controller = Controller {
+            requests,
+            shared: shared.clone(),
+        };
+
+        let invalid = controller
+            .request(Command::RestoreState(vec![
+                0;
+                vst_audio_protocol::MAX_STATE_BODY_BYTES
+                    + 1
+            ]))
+            .unwrap_err();
+        assert_eq!(invalid.kind(), StartErrorKind::InvalidInput);
+        assert_eq!(invalid.to_string(), "state too large");
+
+        shared.set_lifecycle(Lifecycle::Stopped);
+        let not_running = controller.request(Command::SaveState).unwrap_err();
+        assert_eq!(not_running.kind(), StartErrorKind::NotRunning);
+        assert_eq!(not_running.to_string(), "plugin is not running");
+    }
+
+    #[test]
     fn callback_slots_are_power_of_two_and_cover_depth_plus_one() {
         let config = Configuration {
             quantum: 128,
@@ -536,7 +656,7 @@ mod tests {
             ..Default::default()
         };
         let error = invalid.callback_geometry().unwrap_err();
-        assert!(error.0.contains("must be a power of two"));
+        assert!(error.to_string().contains("must be a power of two"));
     }
 
     #[test]
@@ -564,7 +684,7 @@ mod tests {
 
 #[cfg(test)]
 impl Shared {
-    pub(crate) fn for_audio_test() -> Arc<Self> {
+    pub(crate) fn for_audio_test(latency_frames: u32) -> Arc<Self> {
         Arc::new(Self {
             stop: Arc::new(AtomicBool::new(false)),
             lifecycle: AtomicU8::new(Lifecycle::Running as u8),
@@ -572,6 +692,7 @@ impl Shared {
             overflow: AtomicBool::new(false),
             next_request: AtomicU64::new(1),
             generation: AtomicU64::new(1),
+            runtime_latency: AtomicU64::new(runtime_latency_word(1, latency_frames)),
             applied_generation: AtomicU64::new(1),
             processed_generation: AtomicU64::new(0),
             history: Mutex::new(vst_audio_protocol::StateHistory::new()),
@@ -582,12 +703,63 @@ impl Shared {
 /// Owns one worker's lifetime. Drop on a control thread. Dropping this owner
 /// requests teardown even if cloned controllers or its audio endpoint remain.
 #[derive(Debug)]
+struct NotificationQueue {
+    events: mpsc::Receiver<HostEvent>,
+    shared: Arc<Shared>,
+    reported_loss: Cell<bool>,
+}
+impl NotificationQueue {
+    fn new(events: mpsc::Receiver<HostEvent>, shared: Arc<Shared>) -> Self {
+        Self {
+            events,
+            shared,
+            reported_loss: Cell::new(false),
+        }
+    }
+
+    fn try_next(&self) -> Option<HostEvent> {
+        if !self.reported_loss.get() && self.shared.overflow.swap(false, Ordering::AcqRel) {
+            self.reported_loss.set(true);
+            return Some(HostEvent::NotificationsLost);
+        }
+
+        if let Ok(event) = self.events.try_recv() {
+            self.reported_loss.set(false);
+            return Some(event);
+        }
+
+        if self.reported_loss.replace(false) && self.shared.overflow.swap(false, Ordering::AcqRel) {
+            self.reported_loss.set(true);
+            return Some(HostEvent::NotificationsLost);
+        }
+
+        None
+    }
+}
+
+#[derive(Debug)]
 pub struct Instance {
     controller: Controller,
-    events: mpsc::Receiver<HostEvent>,
+    notifications: NotificationQueue,
     audio: Option<AudioEndpoint>,
 }
 impl Instance {
+    #[cfg(all(test, unix))]
+    pub(crate) fn for_supervision_test(
+        requests: mpsc::SyncSender<(RequestId, Command)>,
+        events: mpsc::Receiver<HostEvent>,
+        shared: Arc<Shared>,
+    ) -> Self {
+        Self {
+            controller: Controller {
+                requests,
+                shared: shared.clone(),
+            },
+            notifications: NotificationQueue::new(events, shared),
+            audio: None,
+        }
+    }
+
     fn new(
         started: Started,
         fallback: Fallback,
@@ -596,6 +768,7 @@ impl Instance {
         launch: Launch,
         cancel: Arc<AtomicBool>,
     ) -> Result<Self, StartError> {
+        let initial_latency = started.latency_frames;
         let shared = Arc::new(Shared {
             stop: cancel,
             lifecycle: AtomicU8::new(Lifecycle::Running as u8),
@@ -603,6 +776,7 @@ impl Instance {
             overflow: AtomicBool::new(false),
             next_request: AtomicU64::new(1),
             generation: AtomicU64::new(1),
+            runtime_latency: AtomicU64::new(runtime_latency_word(1, initial_latency)),
             applied_generation: AtomicU64::new(1),
             processed_generation: AtomicU64::new(0),
             history: Mutex::new(started.control.state_history()),
@@ -612,8 +786,12 @@ impl Instance {
             geometry: started.geometry,
             setup: started.setup.clone(),
         };
-        let (prepared, control) = PreparedAudio::from_started(started, 1)
-            .map_err(|error| StartError(format!("invalid block lane: {error:?}")))?;
+        let (prepared, control) = PreparedAudio::from_started(started, 1).map_err(|error| {
+            StartError::new(
+                StartErrorKind::InvalidInput,
+                format!("invalid block lane: {error:?}"),
+            )
+        })?;
         let (updates, next) = rtrb::RingBuffer::new(2);
         let (retired, retirements) = rtrb::RingBuffer::new(2);
         let audio = AudioEndpoint::new(
@@ -641,10 +819,13 @@ impl Instance {
                     recovery,
                 )
             })
-            .map_err(|e| StartError(e.to_string()))?;
+            .map_err(|e| StartError::new(StartErrorKind::Io, e.to_string()))?;
         Ok(Self {
-            controller: Controller { requests, shared },
-            events,
+            controller: Controller {
+                requests,
+                shared: shared.clone(),
+            },
+            notifications: NotificationQueue::new(events, shared),
             audio: Some(audio),
         })
     }
@@ -663,16 +844,7 @@ impl Instance {
         self.audio.take().map(AudioEndpoint::into_blocks)
     }
     pub fn try_next_event(&self) -> Option<HostEvent> {
-        if self
-            .controller
-            .shared
-            .overflow
-            .swap(false, Ordering::AcqRel)
-        {
-            Some(HostEvent::NotificationsLost)
-        } else {
-            self.events.try_recv().ok()
-        }
+        self.notifications.try_next()
     }
 }
 impl Drop for Instance {

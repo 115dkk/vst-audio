@@ -172,12 +172,16 @@ impl BlockEndpoint {
         self.gate_open()
     }
 
-    pub(crate) fn process_slots_after_adopt<W, R>(&mut self, write: W, read: R) -> BlockStatus
+    pub(crate) fn process_slots_after_adopt<W, R>(
+        &mut self,
+        write: W,
+        read: R,
+    ) -> (BlockStatus, bool)
     where
         W: FnOnce(&mut SlotWriter<'_>),
         R: FnOnce(SlotReader<'_>),
     {
-        self.process_ready(write, read)
+        self.process_ready_with_publication(write, read)
     }
 
     fn gate_open(&self) -> bool {
@@ -190,22 +194,35 @@ impl BlockEndpoint {
         W: FnOnce(&mut SlotWriter<'_>),
         R: FnOnce(SlotReader<'_>),
     {
+        self.process_ready_with_publication(write, read).0
+    }
+
+    fn process_ready_with_publication<W, R>(&mut self, write: W, read: R) -> (BlockStatus, bool)
+    where
+        W: FnOnce(&mut SlotWriter<'_>),
+        R: FnOnce(SlotReader<'_>),
+    {
         if !self.gate_open() {
             self.active.lane.skip();
-            return BlockStatus::Missed;
+            return (BlockStatus::Missed, false);
         }
         let exchange = self.active.lane.process(write, read);
-        if exchange.delivered {
+        let status = if exchange.delivered {
             self.shared
                 .processed_generation
                 .store(self.active.generation, Ordering::Release);
             BlockStatus::Delivered
         } else {
             BlockStatus::Missed
-        }
+        };
+        (status, exchange.published)
     }
 
     pub(crate) fn adopt(&mut self) -> bool {
+        if let Some(latency) = self.shared.runtime_latency(self.active.generation) {
+            self.active.latency = latency;
+        }
+
         // Never release the last Arc or a heap buffer on this thread.
         if self.retired.is_full() || self.shared.stop.load(Ordering::Acquire) {
             return false;
@@ -221,6 +238,9 @@ impl BlockEndpoint {
             .lane
             .restart(self.depth)
             .expect("replacement geometry was validated");
+        if let Some(latency) = self.shared.runtime_latency(self.active.generation) {
+            self.active.latency = latency;
+        }
         self.shared
             .applied_generation
             .store(self.active.generation, Ordering::Release);

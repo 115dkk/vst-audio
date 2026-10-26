@@ -242,8 +242,11 @@ fn in_process_event_wakes_for_signal_and_peer_loss_under_race() {
         for _ in 0..1_000 {
             let event = Arc::new(InProcessEvent::new());
             let waiter = Arc::clone(&event);
+            // The signal always comes, so a correct event returns at once. A short
+            // bound would only measure scheduling: a loaded runner can delay the
+            // signalling thread past it, which is not a lost wakeup.
             let waiting = thread::spawn(move || {
-                vst_audio_ring::Wait::wait(waiter.as_ref(), Duration::from_millis(20))
+                vst_audio_ring::Wait::wait(waiter.as_ref(), Duration::from_secs(5))
             });
             thread::yield_now();
             if peer_loss {

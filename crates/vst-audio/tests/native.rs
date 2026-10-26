@@ -684,10 +684,12 @@ fn vst3_bus_arrangements_end_at_stereo_in_surround_out() {
     assert_eq!(started.output_wave_bits, [1, 2, 4, 8, 16, 32]);
 }
 
-/// A third-party VST 3 upmixer the CI job decrypts from the repository
-/// (`tools/ci/private/`, ADR 0035). It is not open source: the job never
-/// uploads or logs the file, and without the secret the variable is unset and
-/// this test passes without doing anything.
+/// A third-party VST 3 upmixer that Spatial SoftReceiver's plughost CI job
+/// decrypts from that repository (its `tools/ci/private/` and ADR 0035) and
+/// loads through its own worker. It is not open source: that job never uploads
+/// or logs the file. This repository's CI skips the test
+/// (`tools/native_tests.py`), and without the variable it passes without doing
+/// anything. Softreceiver calls it by name: keep the name.
 #[test]
 #[ignore = "needs vst-audio-worker and the decrypted third-party plugin; run by the plughost CI job"]
 fn third_party_vst3_scans_starts_and_processes() {

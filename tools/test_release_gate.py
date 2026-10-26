@@ -122,6 +122,7 @@ class Gate(unittest.TestCase):
                 return "b" * 40
 
             with mock.patch.dict(os.environ, {
+                "GITHUB_ACTIONS": "true",
                 "GITHUB_SHA": "a" * 40,
                 "GITHUB_REF": "refs/heads/main",
                 "GITHUB_OUTPUT": str(output),
@@ -138,6 +139,18 @@ class Gate(unittest.TestCase):
                 with contextlib.redirect_stdout(io.StringIO()):
                     self.assertEqual(g.main(), 0)
             return output.read_text(), pushes
+
+    def test_refuses_to_run_outside_github_actions(self):
+        # main() commits and pushes to main; a local run must never do that.
+        with mock.patch.dict(os.environ, {"GITHUB_ACTIONS": ""}, clear=False), \
+                mock.patch.object(g, "_run") as run, mock.patch.object(g, "_git") as git, \
+                mock.patch.object(g, "_write") as write, \
+                mock.patch.object(g, "published_on_crates_io", return_value=False):
+            with self.assertRaisesRegex(SystemExit, "release workflow"):
+                g.main()
+        run.assert_not_called()
+        git.assert_not_called()
+        write.assert_not_called()
 
     def test_rejected_bump_push_defers_release_to_new_main(self):
         output, pushes = self._release_with_pushes([(1, "non-fast-forward")], "c" * 40)
