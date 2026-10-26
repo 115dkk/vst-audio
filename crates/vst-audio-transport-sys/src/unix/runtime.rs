@@ -437,76 +437,175 @@ pub fn spawn_handles(
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let mut descriptors = Vec::new();
-        for value in values {
-            // Event tokens carry their read/write descriptors in two 32-bit halves.
-            descriptors.push((value & 0xffff_ffff) as i32);
-            if value >> 32 != 0 {
-                descriptors.push((value >> 32) as i32);
-            }
-        }
-        let mut command = Command::new(exe);
-        // A compositor-provided socket descriptor is not among the selected
-        // descriptors, so its number must not reach the worker as WAYLAND_SOCKET:
-        // libwayland would otherwise claim whichever descriptor has that number.
-        command.env_remove("WAYLAND_SOCKET");
-        if let Some(temporary) = sandbox.temporary() {
-            for key in ["TMPDIR", "TMP", "TEMP"] {
-                command.env(key, temporary);
-            }
-        }
-        command
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit());
-        let prepare = move || {
-            // SAFETY: async-signal-safe syscall in the fork child, before exec.
-            if unsafe { libc::setpgid(0, 0) } != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            inherit_only(&descriptors)
-        };
-        // SAFETY: prepare uses only async-signal-safe syscalls and preallocated data.
-        unsafe { command.pre_exec(prepare) };
-        let child = command.spawn()?;
-        Ok(ChildProcess {
-            child: Mutex::new(Some(child)),
-            _parent: parent,
-            sandbox: Some(sandbox),
+        spawn_handles_unix(
+            exe,
+            args,
+            values,
+            parent,
+            sandbox,
             #[cfg(test)]
-            suppress_termination: false,
-        })
+            false,
+        )
     }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn spawn_handles_unix(
+    exe: &Path,
+    args: &[OsString],
+    values: &[u64],
+    parent: ParentHandle,
+    sandbox: crate::sandbox::SandboxLaunch,
+    #[cfg(test)] force_fallback: bool,
+) -> io::Result<ChildProcess> {
+    let mut descriptors = Vec::new();
+    for value in values {
+        // Event tokens carry their read/write descriptors in two 32-bit halves.
+        descriptors.push((value & 0xffff_ffff) as i32);
+        if value >> 32 != 0 {
+            descriptors.push((value >> 32) as i32);
+        }
+    }
+    let mut command = Command::new(exe);
+    // A compositor-provided socket descriptor is not among the selected
+    // descriptors, so its number must not reach the worker as WAYLAND_SOCKET:
+    // libwayland would otherwise claim whichever descriptor has that number.
+    command.env_remove("WAYLAND_SOCKET");
+    if let Some(temporary) = sandbox.temporary() {
+        for key in ["TMPDIR", "TMP", "TEMP"] {
+            command.env(key, temporary);
+        }
+    }
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
+    // Preparation errors matter only if close_range is unavailable in the child.
+    let fallback =
+        prepare_cloexec_fallback().map_err(|error| error.raw_os_error().unwrap_or(libc::EIO));
+    let prepare = move || {
+        // SAFETY: async-signal-safe syscall in the fork child, before exec.
+        if unsafe { libc::setpgid(0, 0) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        inherit_only(
+            &descriptors,
+            &fallback,
+            #[cfg(test)]
+            force_fallback,
+        )
+    };
+    // SAFETY: prepare uses only async-signal-safe syscalls and preallocated data.
+    unsafe { command.pre_exec(prepare) };
+    let child = command.spawn()?;
+    Ok(ChildProcess {
+        child: Mutex::new(Some(child)),
+        _parent: parent,
+        sandbox: Some(sandbox),
+        #[cfg(test)]
+        suppress_termination: false,
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+struct CloexecFallback {
+    end: i32,
+    high: Vec<i32>,
+}
+
+#[cfg(not(target_os = "macos"))]
+fn descriptor_limit() -> io::Result<libc::rlimit> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: limit points to writable initialized storage for one rlimit.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(limit)
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_cloexec_fallback() -> io::Result<CloexecFallback> {
+    // A soft limit can be raised by another thread. The hard limit covers new
+    // descriptors, including std's error pipe created after this snapshot.
+    let end = i32::try_from(descriptor_limit()?.rlim_max)
+        .map_err(|_| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
+    let mut high = Vec::new();
+    for entry in std::fs::read_dir("/proc/self/fd")? {
+        let name = entry?.file_name();
+        let fd = name
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+            .filter(|fd| *fd >= 0)
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EIO))?;
+        if fd >= end && fd >= 3 {
+            high.push(fd);
+        }
+    }
+    // Audit #11 TD-44: preexisting fds survive even lowering the hard limit. Keep them
+    // separately; see fallback_excludes_descriptor_opened_before_limit_was_lowered.
+    Ok(CloexecFallback { end, high })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn prepare_cloexec_fallback() -> io::Result<CloexecFallback> {
+    Err(io::Error::from_raw_os_error(libc::ENOTSUP))
 }
 
 /// Marks every descriptor from 3 upwards close-on-exec, then clears the flag on
 /// the selection. Nothing is closed before exec, so std's own error pipe and the
 /// selected descriptors stay valid. Runs in the fork child: raw syscalls only.
 #[cfg(not(target_os = "macos"))]
-fn inherit_only(descriptors: &[i32]) -> io::Result<()> {
-    if !mark_all_cloexec() {
-        let mut limit = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        // SAFETY: writable initialized rlimit record; no allocation.
-        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
-            return Err(io::Error::last_os_error());
+fn inherit_only(
+    descriptors: &[i32],
+    fallback: &Result<CloexecFallback, i32>,
+    #[cfg(test)] force_fallback: bool,
+) -> io::Result<()> {
+    #[cfg(not(test))]
+    let force_fallback = false;
+    if force_fallback || !mark_all_cloexec() {
+        let fallback = fallback
+            .as_ref()
+            .map_err(|error| io::Error::from_raw_os_error(*error))?;
+        // No parent threads remain in this fork child's descriptor table. Refuse
+        // a raised hard limit: the prepared coverage no longer proves completeness.
+        // This covers ordinary concurrent opens/dups and soft-limit changes, not
+        // privileged peers raising then restoring the hard limit during preparation.
+        if descriptor_limit()?.rlim_max > fallback.end as libc::rlim_t {
+            return Err(io::Error::from_raw_os_error(libc::EAGAIN));
         }
-        // Kernels without close_range (before 5.11) walk the table instead. The
-        // cap keeps an unlimited soft limit from turning this into a long loop.
-        let end = limit.rlim_cur.min(1 << 20) as i32;
-        for fd in 3..end {
-            // SAFETY: flag-only operation; a closed descriptor merely yields EBADF.
-            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+        for fd in (3..fallback.end).chain(fallback.high.iter().copied()) {
+            if let Err(error) = set_cloexec(fd, true)
+                && error.raw_os_error() != Some(libc::EBADF)
+            {
+                return Err(error);
+            }
         }
     }
     for fd in descriptors {
-        // SAFETY: selected inherited descriptor, no allocation or pointer access.
-        if unsafe { libc::fcntl(*fd, libc::F_SETFD, 0) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        set_cloexec(*fd, false)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_cloexec(fd: i32, cloexec: bool) -> io::Result<()> {
+    // SAFETY: scalar-only query; fcntl validates fd, including unselected holes.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let flags = if cloexec {
+        flags | libc::FD_CLOEXEC
+    } else {
+        flags & !libc::FD_CLOEXEC
+    };
+    // SAFETY: flag-only operation on a queried fd, with every other flag preserved.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags) } < 0 {
+        return Err(io::Error::last_os_error());
     }
     Ok(())
 }
@@ -837,6 +936,79 @@ mod tests {
         let panic = legacy.expect_err("legacy wait must panic on ECHILD");
         let message = panic.downcast_ref::<String>().unwrap();
         assert!(message.contains("failed to wait for child process exit"));
+    }
+
+    #[test]
+    fn fallback_excludes_descriptor_opened_before_limit_was_lowered() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "runtime::tests::lowered_limit_spawn_subprocess",
+                "--ignored",
+                "--nocapture",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "isolated descriptor regression failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+    }
+
+    #[test]
+    #[ignore = "rlimit mutation runs only in an isolated subprocess"]
+    fn lowered_limit_spawn_subprocess() {
+        use std::io::Read;
+
+        let file = File::open("/dev/null").unwrap();
+        // SAFETY: file is an owned open fd; F_DUPFD returns a new inheritable fd.
+        let high = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, 256) };
+        assert!(
+            high >= 256,
+            "could not create high fd: {}",
+            io::Error::last_os_error()
+        );
+        // SAFETY: successful F_DUPFD returned unique ownership of high.
+        let high = unsafe { OwnedFd::from_raw_fd(high) };
+        let limit = libc::rlimit {
+            rlim_cur: 64,
+            rlim_max: 128,
+        };
+        // SAFETY: initialized readable rlimit; only this isolated test process is affected.
+        let result = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) };
+        assert_eq!(result, 0, "could not lower descriptor limit");
+        for force_fallback in [true, false] {
+            let mut selected = Pipe::create(true).unwrap();
+            let script = format!(
+                "if test -e /proc/self/fd/{}; then exit 73; fi; printf selected-ok > /proc/self/fd/{}",
+                high.as_raw_fd(),
+                selected.child_value()
+            );
+            let sandbox = crate::sandbox::SandboxLaunch::new(None, Path::new("/bin/sh")).unwrap();
+            let child = spawn_handles_unix(
+                Path::new("/bin/sh"),
+                &[OsString::from("-c"), OsString::from(script)],
+                &[selected.child_value() as u64],
+                parent_handle().unwrap(),
+                sandbox,
+                force_fallback,
+            )
+            .expect("descriptor filtering must spawn successfully");
+            assert!(child.wait(Duration::from_secs(10)), "probe did not exit");
+            assert_eq!(
+                child.exit_code().unwrap(),
+                Some(0),
+                "high unselected descriptor leaked (force_fallback={force_fallback})"
+            );
+            drop(selected.child);
+            let mut received = [0; 11];
+            selected.parent.read_exact(&mut received).unwrap();
+            assert_eq!(&received, b"selected-ok", "selected fd was not usable");
+        }
     }
 
     #[test]
