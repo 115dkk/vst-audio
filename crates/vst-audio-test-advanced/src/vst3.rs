@@ -29,6 +29,8 @@ struct Matrix {
     width: AtomicU64,
     active: AtomicBool,
     kind: u8,
+    bus_count_change: Option<(i32, i32)>,
+    arrangements_set: AtomicBool,
     gate: AtomicU64,
     handler: RefCell<Option<ComPtr<IComponentHandler>>>,
 }
@@ -39,6 +41,15 @@ impl Matrix {
             width: AtomicU64::new(1.0f64.to_bits()),
             active: AtomicBool::new(false),
             kind,
+            bus_count_change: match std::env::var("VST_AUDIO_TEST_VST3_BUS_COUNT_CHANGE").as_deref()
+            {
+                Ok("input-add") => Some((0, 3)),
+                Ok("output-add") => Some((1, 3)),
+                Ok("input-drop") => Some((0, 1)),
+                Ok("output-drop") => Some((1, 1)),
+                _ => None,
+            },
+            arrangements_set: AtomicBool::new(false),
             gate: AtomicU64::new(0),
             handler: RefCell::new(None),
         }
@@ -116,6 +127,12 @@ impl IComponentTrait for Matrix {
             return 0;
         }
         if self.kind == 1 {
+            if self.arrangements_set.load(Ordering::Relaxed)
+                && let Some((changed_direction, count)) = self.bus_count_change
+                && direction == changed_direction
+            {
+                return count;
+            }
             2
         } else if direction == 0 {
             0
@@ -181,6 +198,9 @@ impl IComponentTrait for Matrix {
 impl IAudioProcessorTrait for Matrix {
     unsafe fn setBusArrangements(&self, _: *mut u64, ni: i32, _: *mut u64, no: i32) -> tresult {
         if (self.kind == 0 && ni == 0 && no == 1) || (self.kind == 1 && ni == 2 && no == 2) {
+            // Deliberately change a bus count while preserving the layout prefix:
+            // bus_count_changes_during_negotiation_are_rejected, audit #11 TD-07.
+            self.arrangements_set.store(true, Ordering::Relaxed);
             kResultOk
         } else {
             kResultFalse

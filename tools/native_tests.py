@@ -38,6 +38,8 @@ run("cargo", "test", "--locked", "-p", "vst-audio", "--test", "stress", "--", "-
 run("cargo", "test", "--locked", "-p", "vst-audio", "--test", "embedding",
     "--", "--ignored", "--nocapture", "--test-threads=1", env=env)
 
+run("cargo", "test", "--locked", "-p", "vst-audio", "--test", "vst3_hardening",
+    "--", "--ignored", "--nocapture", "--test-threads=1", env=env)
 run("cargo", "test", "--locked", "-p", "vst-audio", "--test", "vst2_hardening",
     "--", "--ignored", "--nocapture", "--test-threads=1", env=env)
 for variable, test in [("VST_AUDIO_TEST_CONFIGURE_LATENCY", "callbacks_time_latency_and_opaque_state"),

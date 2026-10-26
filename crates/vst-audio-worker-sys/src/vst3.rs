@@ -689,6 +689,16 @@ impl Vst3Plugin {
             )
         };
         self.refresh_buses()?;
+        // A plugin may change bus counts in setBusArrangements while retaining an equal
+        // layout prefix; zip alone would accept it. The advanced VST3 violating fixture
+        // reproduces this in bus_count_changes_during_negotiation_are_rejected (audit #11 TD-07).
+        if configuration.inputs.len() != self.info.input_buses.len()
+            || configuration.outputs.len() != self.info.output_buses.len()
+        {
+            return Err(PluginError(
+                "plugin changed bus count during arrangement negotiation".into(),
+            ));
+        }
         for (requested, actual) in configuration
             .inputs
             .iter()
