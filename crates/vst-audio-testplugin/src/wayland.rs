@@ -53,6 +53,19 @@ impl IEventHandlerTrait for Handler {
         let _ = self.connection.flush();
     }
 }
+// One successful host open has one owner, including partial Canvas construction
+// failures (audit #11 TD-89). Move the guard into the completed canvas.
+struct HostConnection {
+    host: ComPtr<IWaylandHost>,
+    display: *mut vst3::wl_display,
+}
+impl Drop for HostConnection {
+    fn drop(&mut self) {
+        // SAFETY: this UI-thread guard owns one successful open on the retained
+        // host, and guest objects are dropped before the guard closes it.
+        unsafe { self.host.closeWaylandConnection(self.display) };
+    }
+}
 pub(crate) struct Canvas {
     guest: Rc<RefCell<Guest>>,
     connection: Connection,
@@ -60,7 +73,7 @@ pub(crate) struct Canvas {
     sub: wl_subsurface::WlSubsurface,
     handler: ComPtr<IEventHandler>,
     run_loop: ComPtr<IRunLoop>,
-    host: ComPtr<IWaylandHost>,
+    _host_connection: HostConnection,
 }
 impl Canvas {
     pub unsafe fn attach(
@@ -88,20 +101,16 @@ impl Canvas {
         if display.is_null() {
             return Err(error("null display"));
         }
+        let host_connection = HostConnection { host, display };
         // SAFETY: host retains its connection until after removed and close; this guest never disconnects it.
         let backend =
             unsafe { wayland_backend::client::Backend::from_foreign_display(display.cast()) };
         let connection = Connection::from_backend(backend);
-        let result = Self::create(connection, host.clone(), context, parent);
-        if result.is_err() {
-            // SAFETY: matches the successful open above; failed guest objects have already dropped.
-            unsafe { host.closeWaylandConnection(display) };
-        }
-        result
+        Self::create(connection, host_connection, context, parent)
     }
     fn create(
         connection: Connection,
-        host: ComPtr<IWaylandHost>,
+        host_connection: HostConnection,
         context: &ComPtr<IHostApplication>,
         parent: *mut c_void,
     ) -> io::Result<Self> {
@@ -155,7 +164,7 @@ impl Canvas {
             sub,
             handler,
             run_loop,
-            host,
+            _host_connection: host_connection,
         };
         canvas.resize(320, 200)?;
         canvas.connection.flush().map_err(error)?;
@@ -214,11 +223,6 @@ impl Drop for Canvas {
             buffer.destroy();
         }
         let _ = self.connection.flush();
-        // SAFETY: balances open, all fixture protocol objects are destroyed; host owns the connection.
-        unsafe {
-            self.host
-                .closeWaylandConnection(self.connection.backend().display_ptr().cast())
-        };
     }
 }
 impl Dispatch<wl_registry::WlRegistry, ()> for State {
