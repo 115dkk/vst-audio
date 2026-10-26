@@ -1120,23 +1120,15 @@ impl Vst3Plugin {
         }
         result
     }
-    fn attach_editor(
-        &mut self,
-        parent: Option<vst_audio_protocol::ParentWindow>,
-        scaling: EditorScaling,
+    fn select_editor_backend(
+        &self,
+        view: &ComPtr<IPlugView>,
+        _parent: Option<vst_audio_protocol::ParentWindow>,
+        _scaling: EditorScaling,
         _force_x11: bool,
         _attempted_wayland: &mut bool,
         _restore: Option<&vst_audio_protocol::EditorStatus>,
-    ) -> Result<(), PluginError> {
-        let controller = self
-            .controller
-            .as_ref()
-            .ok_or_else(|| PluginError("no VST 3 controller".into()))?;
-        // SAFETY: controller queried on main thread with SDK editor view name.
-        let pointer = unsafe { controller.createView(ViewType::kEditor) };
-        // SAFETY: createView transfers an owned interface reference, nullable for no editor.
-        let view = unsafe { ComPtr::from_raw(pointer) }
-            .ok_or_else(|| PluginError("no VST 3 editor".into()))?;
+    ) -> Result<&'static std::ffi::CStr, PluginError> {
         let platform = crate::editor_platform();
         #[cfg(target_os = "linux")]
         let platform = {
@@ -1144,9 +1136,9 @@ impl Vst3Plugin {
             // A stretched editor goes to the desktop's XWayland, which the
             // compositor scales; a native Wayland view is never stretched.
             let native = !_force_x11
-                && parent.is_none()
+                && _parent.is_none()
                 && wayland_allowed()
-                && scaling != EditorScaling::Stretch;
+                && _scaling != EditorScaling::Stretch;
             // SAFETY: retained main-thread view, static SDK platform identifier.
             let supported = native
                 && unsafe { view.isPlatformTypeSupported(kPlatformTypeWaylandSurfaceID) }
@@ -1175,6 +1167,12 @@ impl Vst3Plugin {
             unsafe { view.isPlatformTypeSupported(platform.as_ptr()) },
             "native editor support",
         )?;
+        Ok(platform)
+    }
+    fn initial_editor_size(
+        view: &ComPtr<IPlugView>,
+        restore: Option<&vst_audio_protocol::EditorStatus>,
+    ) -> Result<(ViewRect, i32, i32), PluginError> {
         let mut size = ViewRect {
             left: 0,
             top: 0,
@@ -1183,7 +1181,7 @@ impl Vst3Plugin {
         };
         // SAFETY: writable view rectangle, queried before attachment.
         check(unsafe { view.getSize(&mut size) }, "getSize")?;
-        if let Some(status) = _restore {
+        if let Some(status) = restore {
             size = ViewRect {
                 left: 0,
                 top: 0,
@@ -1208,6 +1206,77 @@ impl Vst3Plugin {
             .checked_sub(size.top)
             .filter(|v| (1..=8192).contains(v))
             .ok_or_else(|| PluginError("invalid editor height".into()))?;
+        Ok((size, width, height))
+    }
+    fn negotiate_editor_scale(
+        view: &ComPtr<IPlugView>,
+        window: &EditorWindow,
+        scaling: EditorScaling,
+        restore: Option<&vst_audio_protocol::EditorStatus>,
+        size: &mut ViewRect,
+    ) -> Result<Option<f32>, PluginError> {
+        if !cfg!(target_os = "macos")
+            && editor_scaling::requests_scale(scaling)
+            && let Some(interface) = view.cast::<IPlugViewContentScaleSupport>()
+        {
+            let requested =
+                restore.map_or_else(|| editor_scaling::platform_scale(window), |s| s.scale);
+            let _dpi = editor_scaling::scope(window);
+            // SAFETY: live pre-attachment interface and finite platform/previously accepted scale.
+            if unsafe { interface.setContentScaleFactor(requested) } == kResultOk {
+                // Plugins may change their preferred dimensions when accepting scale.
+                // SAFETY: retained view and writable rectangle, before attached().
+                check(unsafe { view.getSize(size) }, "scaled getSize")?;
+                if let Some(saved) = restore {
+                    *size = ViewRect {
+                        left: 0,
+                        top: 0,
+                        right: saved.width as i32,
+                        bottom: saved.height as i32,
+                    };
+                    if saved.resize_supported {
+                        check(
+                            // SAFETY: live fresh view, writable restored rectangle.
+                            unsafe { view.checkSizeConstraint(size) },
+                            "checkSizeConstraint",
+                        )?;
+                    }
+                }
+                let (width, height) = view_dimensions(size)?;
+                window
+                    .resize(width, height)
+                    .map_err(|e| PluginError(e.to_string()))?;
+                return Ok(Some(requested));
+            }
+        }
+        Ok(None)
+    }
+    fn attach_editor(
+        &mut self,
+        parent: Option<vst_audio_protocol::ParentWindow>,
+        scaling: EditorScaling,
+        _force_x11: bool,
+        _attempted_wayland: &mut bool,
+        _restore: Option<&vst_audio_protocol::EditorStatus>,
+    ) -> Result<(), PluginError> {
+        let controller = self
+            .controller
+            .as_ref()
+            .ok_or_else(|| PluginError("no VST 3 controller".into()))?;
+        // SAFETY: controller queried on main thread with SDK editor view name.
+        let pointer = unsafe { controller.createView(ViewType::kEditor) };
+        // SAFETY: createView transfers an owned interface reference, nullable for no editor.
+        let view = unsafe { ComPtr::from_raw(pointer) }
+            .ok_or_else(|| PluginError("no VST 3 editor".into()))?;
+        let platform = self.select_editor_backend(
+            &view,
+            parent,
+            scaling,
+            _force_x11,
+            _attempted_wayland,
+            _restore,
+        )?;
+        let (mut size, width, height) = Self::initial_editor_size(&view, _restore)?;
         #[allow(unused_mut)]
         let mut window = Rc::new(match parent {
             Some(parent) => EditorWindow::open_embedded(parent, width, height)
@@ -1260,47 +1329,15 @@ impl Vst3Plugin {
         };
         // SAFETY: frame is retained locally and owns the native window; guard clears on failure.
         check(unsafe { view.setFrame(frame.as_ptr()) }, "setFrame")?;
-        let mut applied_scale = 1.0;
-        let mut accepted = false;
-        let mut effective = EditorScaling::Off;
-        if !cfg!(target_os = "macos")
-            && editor_scaling::requests_scale(scaling)
-            && let Some(interface) = view.cast::<IPlugViewContentScaleSupport>()
-        {
-            let requested =
-                _restore.map_or_else(|| editor_scaling::platform_scale(&window), |s| s.scale);
-            let _dpi = editor_scaling::scope(&window);
-            // SAFETY: live pre-attachment interface and finite platform/previously accepted scale.
-            if unsafe { interface.setContentScaleFactor(requested) } == kResultOk {
-                applied_scale = requested;
-                accepted = true;
-                effective = EditorScaling::Plugin;
-                // Plugins may change their preferred dimensions when accepting scale.
-                // SAFETY: retained view and writable rectangle, before attached().
-                check(unsafe { view.getSize(&mut size) }, "scaled getSize")?;
-                if let Some(saved) = _restore {
-                    size = ViewRect {
-                        left: 0,
-                        top: 0,
-                        right: saved.width as i32,
-                        bottom: saved.height as i32,
-                    };
-                    if saved.resize_supported {
-                        check(
-                            // SAFETY: live fresh view, writable restored rectangle.
-                            unsafe { view.checkSizeConstraint(&mut size) },
-                            "checkSizeConstraint",
-                        )?;
-                    }
-                }
-                let (width, height) = view_dimensions(&size)?;
-                window
-                    .resize(width, height)
-                    .map_err(|e| PluginError(e.to_string()))?;
-            }
-        }
+        let applied_scale =
+            Self::negotiate_editor_scale(&view, &window, scaling, _restore, &mut size)?;
+        let accepted = applied_scale.is_some();
+        let effective = if accepted {
+            EditorScaling::Plugin
+        } else {
+            editor_scaling::fallback(scaling, parent)
+        };
         if !accepted {
-            effective = editor_scaling::fallback(scaling, parent);
             #[cfg(windows)]
             if effective == EditorScaling::Stretch && scaling != EditorScaling::Stretch {
                 // View has not been attached. Release its old frame/window and
@@ -1349,7 +1386,7 @@ impl Vst3Plugin {
             mode: scaling,
             scaling: effective,
             scale_supported,
-            scale: applied_scale,
+            scale: applied_scale.unwrap_or(1.0),
             #[cfg(target_os = "linux")]
             output_scale: window.wayland().map_or(1.0, |w| w.scale()),
             view,
