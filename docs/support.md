@@ -378,8 +378,7 @@ these new behaviors still require their native CI runs. Incompatible-count tests
 prove fault/rejected DSP; automatic replacement is provided by existing supervision,
 not a newly verified layout-recovery scenario in these tests.
 
-VST2 edit gestures on the application protocol, plugin-formatted display strings,
-program listing/selection, tail length and native bypass remain outside this
-scope. Non-chunk state contains only the current program's values, not a complete
+Plugin-formatted display strings, program listing/selection, tail length and
+native bypass remain outside this scope. Non-chunk state contains only the current program's values, not a complete
 bank; chunks are bounded to slightly under 64 MiB. OPEN gets the host default
 48 kHz because configuration arrives later; resume gets the configured rate.
