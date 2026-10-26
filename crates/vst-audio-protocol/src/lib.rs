@@ -364,10 +364,13 @@ pub fn decode_frame(bytes: &[u8]) -> Result<DecodedFrame, CodecError> {
     if length < FRAME_META_BYTES {
         return Err(CodecError::InvalidLength);
     }
-    if bytes.len() < 4 + length {
+    let frame_length = 4_usize
+        .checked_add(length)
+        .ok_or(CodecError::InvalidLength)?;
+    if bytes.len() < frame_length {
         return Err(CodecError::Truncated);
     }
-    if bytes.len() != 4 + length {
+    if bytes.len() != frame_length {
         return Err(CodecError::TrailingBytes);
     }
     decode_parts(&bytes[4..12], &bytes[12..])

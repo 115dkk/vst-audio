@@ -411,6 +411,22 @@ fn embedding_rejects_unknown_platform_tags() {
 }
 
 #[test]
+fn decode_frame_rejects_lengths_that_overflow_the_frame_size() {
+    for length in 0xffff_fffc_u32..=u32::MAX {
+        let mut bytes = [0_u8; 12];
+        bytes[..4].copy_from_slice(&length.to_le_bytes());
+        if usize::BITS == 32 {
+            assert!(matches!(
+                decode_frame(&bytes),
+                Err(CodecError::InvalidLength)
+            ));
+        } else {
+            assert!(matches!(decode_frame(&bytes), Err(CodecError::Truncated)));
+        }
+    }
+}
+
+#[test]
 fn malicious_frames_are_rejected_and_unknown_kinds_skip() {
     let mut huge = Vec::new();
     huge.extend_from_slice(&(65_537_u32).to_le_bytes());
