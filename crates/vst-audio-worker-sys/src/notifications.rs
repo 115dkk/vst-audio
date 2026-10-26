@@ -66,7 +66,10 @@ impl Notifications {
 
     pub fn drain(&self) -> Vec<ParameterEdit> {
         let mut edits = Vec::new();
-        while let Some(edit) = self.pop() {
+        for _ in 0..NOTIFICATION_CAPACITY {
+            let Some(edit) = self.pop() else {
+                break;
+            };
             edits.push(edit);
         }
         edits
