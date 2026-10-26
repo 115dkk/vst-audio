@@ -38,6 +38,16 @@ MESA = ("https://github.com/pal1000/mesa-dist-win/releases/download/26.2.4/mesa3
         "351fc8c8b695878ffb3eaa044b3ead08672a48b1a045e3c3e3975811df0f6695")
 
 
+def log_text(log):
+    """A whole run log; the printed tail can drop the early METRIC records."""
+    return Path(log).read_text(encoding="utf-8", errors="replace")
+
+
+def metric_records(text):
+    return [json.loads(line.partition("METRIC ")[2]) for line in text.splitlines()
+            if "METRIC " in line]
+
+
 def diagnostic_outcome(platform, returncode, timed_out, metric_count, mutation_passed=None):
     """Combine ordinary and platform-applicable mutation diagnostics."""
     ordinary_failures = []
@@ -338,8 +348,7 @@ def main():
             "third_party", "--", "--ignored", "--nocapture", "--test-threads=1"],
             report_dir / "checks.log", cwd=ROOT, env=env, timeout=1500, tail_bytes=131072)
         print(result.tail, flush=True)
-        report["metrics"] = [json.loads(line.partition("METRIC ")[2]) for line in result.tail.splitlines()
-                             if "METRIC " in line]
+        report["metrics"] = metric_records(log_text(report_dir / "checks.log"))
         report["returncode"] = result.returncode
         report["timed_out"] = result.timed_out
         report["known_upstream_limitations"]=[m["case"] for m in report["metrics"] if m["case"].startswith("known limitation:")]
@@ -357,12 +366,12 @@ def main():
                 "--test-threads=1"], report_dir / "mutation.log", cwd=ROOT, env=mutation_env,
                 timeout=120, tail_bytes=131072)
             print(result.tail, flush=True)
+            mutation_log = log_text(report_dir / "mutation.log")
             marker = "editor-to-processor sound assertion failed"
-            mutation_passed = not result.timed_out and result.returncode != 0 and marker in result.tail
+            mutation_passed = not result.timed_out and result.returncode != 0 and marker in mutation_log
             report["mutation"] = {"returncode": result.returncode, "timed_out": result.timed_out,
-                "sound_failure": marker in result.tail, "passed": mutation_passed,
-                "metrics": [json.loads(line.partition("METRIC ")[2]) for line in result.tail.splitlines()
-                            if "METRIC " in line]}
+                "sound_failure": marker in mutation_log, "passed": mutation_passed,
+                "metrics": metric_records(mutation_log)}
             outcome = diagnostic_outcome(sys.platform, report["returncode"], report["timed_out"],
                                          len(report["metrics"]), mutation_passed)
         else:

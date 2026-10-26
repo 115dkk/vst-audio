@@ -1,6 +1,10 @@
+import sys
+import tempfile
 import unittest
+from pathlib import Path
 
-from third_party import diagnostic_outcome
+from run import to_log
+from third_party import diagnostic_outcome, log_text, metric_records
 
 
 class DiagnosticOutcomeTests(unittest.TestCase):
@@ -27,6 +31,23 @@ class DiagnosticOutcomeTests(unittest.TestCase):
         self.assertFalse(outcome["mutation_scheduled"])
         self.assertIsNone(outcome["mutation_passed"])
         self.assertTrue(outcome["passed"])
+
+
+class LogParsingTests(unittest.TestCase):
+    def test_metrics_and_marker_survive_output_past_the_tail(self):
+        # Ten cases report early; a later panic backtrace pushes them out of the tail.
+        script = ("import json\n"
+                  "for case in range(10): print('METRIC ' + json.dumps({'case': str(case)}))\n"
+                  "print('editor-to-processor sound assertion failed')\n"
+                  "print('x' * 200000)\n")
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "checks.log"
+            result = to_log([sys.executable, "-c", script], log, cwd=directory,
+                            timeout=60, tail_bytes=131072)
+            self.assertNotIn("METRIC ", result.tail)
+            text = log_text(log)
+            self.assertEqual(len(metric_records(text)), 10)
+            self.assertIn("editor-to-processor sound assertion failed", text)
 
 
 if __name__ == "__main__":
