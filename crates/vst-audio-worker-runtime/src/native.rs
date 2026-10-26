@@ -32,6 +32,7 @@ fn error(error: impl std::fmt::Display) -> StartError {
 fn plugin_error(error: impl std::fmt::Display) -> PluginError {
     PluginError(error.to_string())
 }
+
 fn loaded<'a>(
     plugin: &'a mut Option<Box<dyn Plugin>>,
 ) -> Result<&'a mut (dyn Plugin + 'static), StartError> {
@@ -123,6 +124,36 @@ impl Processor for Vst2ProcessorAdapter {
 }
 #[derive(Debug)]
 struct Vst2ProcessorAdapter(Vst2Processor);
+fn legacy_setup(
+    rate: u32,
+    max_frames: u32,
+    in_channels: u16,
+    out_channels: u16,
+    info: &PluginInfo,
+) -> Result<vst_audio_protocol::ProcessingSetup, StartError> {
+    let buses = |declared: &[vst_audio_protocol::BusInfo], channels, direction| {
+        let configured = declared
+            .iter()
+            .map(|bus| bus.layout.clone().into())
+            .collect::<Vec<_>>();
+        if vst_audio_protocol::ProcessingSetup::channels(&configured) == channels {
+            Ok(configured)
+        } else {
+            Err(StartError(format!(
+                "legacy Configure {direction} channels do not match the plugin declaration"
+            )))
+        }
+    };
+    Ok(vst_audio_protocol::ProcessingSetup {
+        sample_rate: rate,
+        quantum: max_frames,
+        sample_format: vst_audio_ring::SampleFormat::F32,
+        offline: false,
+        inputs: buses(&info.inputs, in_channels, "input")?,
+        outputs: buses(&info.outputs, out_channels, "output")?,
+    })
+}
+
 impl Plugin for Vst2 {
     fn info(&self) -> PluginInfo {
         let mut info = self.info.clone();
@@ -390,35 +421,26 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
                             | Message::OpenEditorIn { .. }
                             | Message::CloseEditor
                     );
-                    let message = match frame.message {
-                        Message::Configure {
-                            rate,
-                            max_frames,
-                            in_channels,
-                            out_channels,
-                        } => Message::Prepare(vst_audio_protocol::ProcessingSetup {
-                            sample_rate: rate,
-                            quantum: max_frames,
-                            sample_format: vst_audio_ring::SampleFormat::F32,
-                            offline: false,
-                            inputs: vec![
-                                Bus {
-                                    channels: in_channels,
-                                    arrangement: 0,
-                                }
-                                .into(),
-                            ],
-                            outputs: vec![
-                                Bus {
-                                    channels: out_channels,
-                                    arrangement: 0,
-                                }
-                                .into(),
-                            ],
-                        }),
-                        other => other,
-                    };
+                    let message = frame.message;
                     let reply: Result<Message, StartError> = (|| {
+                        let message = match message {
+                            Message::Configure {
+                                rate,
+                                max_frames,
+                                in_channels,
+                                out_channels,
+                            } => {
+                                let info = loaded(&mut plugin)?.info();
+                                Message::Prepare(legacy_setup(
+                                    rate,
+                                    max_frames,
+                                    in_channels,
+                                    out_channels,
+                                    &info,
+                                )?)
+                            }
+                            other => other,
+                        };
                         let next_phase = phase
                             .map(|current| current.accept(&message))
                             .transpose()
@@ -765,4 +787,39 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
         plugin.deactivate();
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vst_audio_protocol::{BusInfo, BusKind};
+
+    #[test]
+    fn legacy_configure_preserves_declared_instrument_buses() {
+        let info = PluginInfo {
+            name: "Instrument".into(),
+            vendor: "Tests".into(),
+            latency_frames: 0,
+            inputs: vec![],
+            outputs: vec![BusInfo {
+                layout: Bus {
+                    channels: 2,
+                    arrangement: 3,
+                },
+                kind: BusKind::Main,
+                name: "Main".into(),
+                default_active: true,
+            }],
+        };
+
+        let setup = legacy_setup(48000, 128, 0, 2, &info).unwrap();
+
+        assert!(setup.inputs.is_empty());
+        assert_eq!(setup.outputs.len(), 1);
+        assert_eq!(setup.outputs[0].layout.arrangement, 3);
+        assert_eq!(
+            vst_audio_protocol::ProcessingSetup::channels(&setup.outputs),
+            2
+        );
+    }
 }
