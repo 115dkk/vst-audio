@@ -1,1 +1,3 @@
 /target/
+# tauri-build writes the permission schemas here on every build.
+/tauri-host/gen/

@@ -93,7 +93,9 @@ jobs:
       matrix:
         os: [windows-2025, ubuntu-24.04, macos-15, macos-15-intel]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    # Four GUI toolkits (Tauri and Slint the largest) build from scratch when
+    # the cache misses.
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -108,9 +110,11 @@ jobs:
           shared-key: gui
       - name: Linux graphics dependencies
         if: runner.os == 'Linux'
+        # WebKitGTK and GTK for Tauri, fontconfig for Slint's text, and
+        # dbus-run-session for the GUI step's private session bus.
         run: |
           sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update -qq
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y xvfb xauth libxkbcommon-dev libxkbcommon-x11-0 libwayland-dev libegl1-mesa-dev libgl1-mesa-dev mesa-vulkan-drivers
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y xvfb xauth libxkbcommon-dev libxkbcommon-x11-0 libwayland-dev libegl1-mesa-dev libgl1-mesa-dev mesa-vulkan-drivers libwebkit2gtk-4.1-dev libgtk-3-dev libfontconfig1-dev dbus-daemon
       - run: cargo fmt --manifest-path examples/gui/Cargo.toml --all -- --check
       - run: cargo clippy --locked --manifest-path examples/gui/Cargo.toml --workspace --all-targets -- -D warnings
       - name: GUI and editor lifecycle (Windows, macOS)
@@ -120,7 +124,10 @@ jobs:
         if: runner.os == 'Linux'
         env:
           LIBGL_ALWAYS_SOFTWARE: "1"
-        run: xvfb-run -a -s "-screen 0 1280x800x24" python3 tools/gui_tests.py
+        # A private session bus without services: the runner's portal never
+        # answers, and Tauri's GTK main thread would wait 25 s for it (see
+        # tools/gui-session-bus.conf).
+        run: xvfb-run -a -s "-screen 0 1280x800x24" dbus-run-session --config-file=tools/gui-session-bus.conf -- python3 tools/gui_tests.py
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:

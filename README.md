@@ -4,8 +4,8 @@ A GUI-independent Rust library for hosting VST2 and VST3 plugins
 in separate processes on Windows, macOS and Linux.
 
 Required CI executes native Windows x64, Linux x64, macOS ARM64 and macOS Intel
-tests, two unrelated Rust GUI consumers, and independently built open-source
-plugins.
+tests, four unrelated Rust GUI consumers (egui, iced, Slint and Tauri), and
+independently built open-source plugins.
 
 The contract is one worker per plugin instance, safe application-side
 Rust APIs, bounded audio IPC and worker-owned native editor windows. Any Rust GUI
@@ -74,7 +74,7 @@ checksums, license notices and the separate macOS signing/notarization steps.
 The CLI `cargo run -p vst-audio --example editor -- <worker> <plugin>` opens an
 editor without a GUI framework.
 
-The independent [egui and iced consumers](https://github.com/115dkk/vst-audio/tree/main/examples/gui) demonstrate the same
+The independent [egui, iced, Slint and Tauri consumers](https://github.com/115dkk/vst-audio/tree/main/examples/gui) demonstrate the same
 editor IPC contract. They are built and exercised separately in CI.
 
 VST is a registered trademark of Steinberg Media Technologies GmbH.

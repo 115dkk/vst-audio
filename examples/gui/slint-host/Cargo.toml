@@ -1,0 +1,14 @@
+[package]
+name = "vst-audio-slint-example"
+version = "0.1.0"
+edition = "2024"
+publish = false
+[dependencies]
+vst-audio-gui-example.workspace = true
+# Windows runners have no OpenGL 3 driver, so Windows renders in software.
+# Elsewhere femtovg renders through OpenGL (Mesa llvmpipe under Xvfb), and
+# Slint falls back to the software renderer when no context can be created.
+[target.'cfg(windows)'.dependencies]
+slint = { version = "=1.18.1", default-features = false, features = ["std", "compat-1-2", "backend-winit", "renderer-software"] }
+[target.'cfg(not(windows))'.dependencies]
+slint = { version = "=1.18.1", default-features = false, features = ["std", "compat-1-2", "backend-winit", "renderer-femtovg", "renderer-software"] }
