@@ -598,18 +598,17 @@ unsafe extern "C" fn process(
         unsafe { callback(effect, MASTER_AUTOMATE, 1, 0, std::ptr::null_mut(), 0.75) };
     }
     if mode == mode::SHORT_MIDI_HEADER {
-        // Audit #11 TD-06: a violating VST2 plugin sends only the common header,
-        // not a full MidiEvent, but advertises 24 bytes (the old host minimum).
-        // Box<[i32; 4]> requests exactly 16 heap bytes; there is no MIDI payload.
-        let header = Box::new([1i32, 24, 0, 0]);
+        // Audit #11 TD-06: a short MIDI record, the common header and offset/flags
+        // only. Its byteSize (8, which excludes type and byteSize) truthfully
+        // covers the 16 heap bytes of Box<[i32; 4]>; there is no MIDI payload.
+        let header = Box::new([1i32, 8, 0, 0]);
         let mut events = Events {
             count: 1,
             reserved: 0,
             events: [header.as_ptr().cast()],
         };
-        // SAFETY: the aligned list and its common 16-byte header remain live for
-        // this synchronous callback. The deliberately false short size is the
-        // fixture's contract violation; no payload is read by the fixture.
+        // SAFETY: the aligned list and its 16-byte record remain live for this
+        // synchronous callback; no payload is read by the fixture.
         unsafe { host(effect, 8, 0, 0, (&mut events as *mut Events<1>).cast()) };
     }
     if mode == mode::STATE_RESTORE_OUTPUT_COUNT_CHANGE

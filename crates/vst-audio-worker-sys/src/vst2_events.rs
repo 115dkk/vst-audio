@@ -195,15 +195,18 @@ impl CallbackEvents {
             let kind = unsafe { *pointer.cast::<i32>() };
             // SAFETY: the declared byte size sits second in that common header.
             let size = unsafe { pointer.cast::<i32>().wrapping_add(1).read() };
-            let declared = usize::try_from(size).unwrap_or(0);
+            // byteSize excludes the type and byteSize fields (aeffectx.h VstEvent),
+            // and hosts often store sizeof instead: either way the plugin vouches
+            // for 8 + byteSize readable bytes, which must cover every field read.
+            let readable = usize::try_from(size).unwrap_or(0).saturating_add(8);
             let event = match kind {
                 1 => {
-                    // A violating VST2 short-header plugin must not cause a full
-                    // MidiEvent reference or payload read before size validation.
-                    // Regression: short_midi_header_is_dropped_and_worker_keeps_processing
-                    // (audit #11 TD-06).
+                    // A short record must not cause a full MidiEvent reference or
+                    // payload read before size validation (audit #11 TD-06;
+                    // short_midi_header_is_dropped_and_worker_keeps_processing,
+                    // midi_byte_size_excludes_the_common_header).
                     let raw = pointer.cast::<MidiEvent>();
-                    if !raw.is_aligned() || declared < size_of::<MidiEvent>() {
+                    if !raw.is_aligned() || readable < size_of::<MidiEvent>() {
                         self.dropped.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
@@ -237,7 +240,7 @@ impl CallbackEvents {
                     // whole record is formed.
                     let raw = pointer.cast::<SysExEvent>();
                     let needed = std::mem::offset_of!(SysExEvent, data) + size_of::<*mut u8>();
-                    if !raw.is_aligned() || declared < needed {
+                    if !raw.is_aligned() || readable < needed {
                         self.dropped.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
@@ -346,5 +349,57 @@ impl Sample for f64 {
         let process = unsafe { (*effect).process_double }.expect("configured f64 entry");
         // SAFETY: processor supplies bounded live buffers with the configured channel counts.
         unsafe { process(effect, inputs, outputs, frames) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Delivers one event record through processEvents and reports (received, dropped).
+    fn deliver(record: *const c_void) -> (usize, u32) {
+        let events = CallbackEvents::default();
+        let mut list = Events::<1> {
+            count: 1,
+            reserved: 0,
+            events: [record],
+        };
+        // SAFETY: the aligned list and its record stay live for this synchronous call.
+        unsafe { events.receive((&mut list as *mut Events<1>).cast()) };
+        (events.output.len(), events.dropped.load(Ordering::Relaxed))
+    }
+
+    #[test]
+    fn midi_byte_size_excludes_the_common_header() {
+        // aeffectx.h: byteSize excludes type and byteSize, so a full record says 24;
+        // hosts that store sizeof(VstMidiEvent) say 32 (audit #11 TD-06).
+        for size in [24, 32] {
+            let event = MidiEvent {
+                kind: 1,
+                size,
+                data: [0x90, 60, 100, 0],
+                ..Default::default()
+            };
+            assert_eq!(
+                deliver((&raw const event).cast()),
+                (1, 0),
+                "byteSize {size}"
+            );
+        }
+        // Only the common header is readable: dropped without reading past it.
+        let header = [1i32, 8, 0, 0];
+        assert_eq!(deliver(header.as_ptr().cast()), (0, 1));
+    }
+
+    #[test]
+    fn sysex_byte_size_excludes_the_common_header() {
+        let dump = [0xf0u8, 0x7e, 0xf7];
+        let event = SysExEvent {
+            size: (size_of::<SysExEvent>() - 8) as i32,
+            dump_bytes: dump.len() as i32,
+            data: dump.as_ptr().cast_mut(),
+            ..Default::default()
+        };
+        assert_eq!(deliver((&raw const event).cast()), (1, 0));
     }
 }
