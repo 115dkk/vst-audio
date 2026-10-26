@@ -475,6 +475,13 @@ unsafe extern "C" fn set_parameter(effect: *mut AEffect, index: u32, value: f32)
     }
     // SAFETY: field is atomic; no reference to the foreign header or DSP state is formed.
     unsafe { &(*effect.cast::<Instance>()).width }.store(value.to_bits(), Ordering::Relaxed);
+    // SAFETY: the live instance retains its immutable child ID through CLOSE.
+    let child = unsafe { (*effect.cast::<Instance>()).child };
+    if child == 23 && value == 0.75 {
+        // Audit #11 TD-36: switch to a violating getter only after a valid save.
+        // SAFETY: mode is an independent atomic retained until CLOSE.
+        unsafe { &(*effect.cast::<Instance>()).mode }.store(23, Ordering::Relaxed);
+    }
     // SAFETY: the live instance retains its immutable callback through CLOSE.
     let callback = unsafe { (*effect.cast::<Instance>()).host };
     // SAFETY: automate addresses parameter zero and carries no borrowed payload.
@@ -483,6 +490,11 @@ unsafe extern "C" fn set_parameter(effect: *mut AEffect, index: u32, value: f32)
 unsafe extern "C" fn get_parameter(effect: *mut AEffect, index: u32) -> f32 {
     if effect.is_null() || index != 0 {
         return 0.0;
+    }
+    // SAFETY: mode is an independent atomic retained until CLOSE.
+    if unsafe { &(*effect.cast::<Instance>()).mode }.load(Ordering::Relaxed) == 23 {
+        // Audit #11 TD-36: a VST2 getter violates the normalized-value contract.
+        return f32::NAN;
     }
     // SAFETY: atomic parameter is live throughout the call.
     f32::from_bits(unsafe { &(*effect.cast::<Instance>()).width }.load(Ordering::Relaxed))

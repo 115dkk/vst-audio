@@ -525,8 +525,14 @@ impl Vst2Plugin {
             // SAFETY: GET_CHUNK guarantees size readable bytes until the next dispatcher call.
             return Ok(unsafe { std::slice::from_raw_parts(data, size as usize) }.to_vec());
         }
+        // Violating VST2 getters must not poison recovery checkpoints (audit #11 TD-36;
+        // bad_parameter_getter_does_not_replace_recovery_checkpoint).
         let program = if control.effect().num_programs > 0 {
-            control.call(GET_PROGRAM, 0, 0, std::ptr::null_mut(), 0.0) as i32
+            let program = control.call(GET_PROGRAM, 0, 0, std::ptr::null_mut(), 0.0);
+            if program < 0 || program >= control.effect().num_programs as isize {
+                return Err(PluginError("invalid program".into()));
+            }
+            program as i32
         } else {
             0
         };
@@ -539,6 +545,9 @@ impl Vst2Plugin {
         for index in 0..count {
             // SAFETY: validated parameter index; concurrent parameter reads are a VST2 plugin obligation.
             let value = unsafe { get(self.shared.effect(), index as u32) };
+            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                return Err(PluginError("invalid parameter state value".into()));
+            }
             state.extend(value.to_le_bytes());
         }
         Ok(state)

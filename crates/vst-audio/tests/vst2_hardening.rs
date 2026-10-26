@@ -425,6 +425,163 @@ fn zero_program_parameter_state() {
 
 #[test]
 #[ignore = "native fixtures required"]
+fn bad_parameter_getter_does_not_replace_recovery_checkpoint() {
+    if std::env::var_os("VST_AUDIO_TEST_NO_CHUNKS").is_none() {
+        // Keep the non-chunk environment local to this test and its worker.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "bad_parameter_getter_does_not_replace_recovery_checkpoint",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("VST_AUDIO_TEST_NO_CHUNKS", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "non-chunk regression failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        print!("{}", String::from_utf8_lossy(&output.stdout));
+        return;
+    }
+    let (worker, plugin) = paths();
+    let mut descriptor = PluginDescriptor::new(plugin, PluginFormat::Vst2);
+    descriptor.class_id = Some([b'V', b'S', b'T', b'2', 0, 0, 0, 23, 0, 0, 0, 0, 0, 0, 0, 0]);
+    let mut instance = Host::new(worker)
+        .spawn(&descriptor, &Configuration::default(), None)
+        .unwrap();
+    let mut audio = instance.take_audio().unwrap();
+    let generation = audio.generation();
+    let next_event = |instance: &vst_audio::Instance| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(event) = instance.try_next_event() {
+                return event;
+            }
+            assert!(Instant::now() < deadline, "public state event timeout");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    };
+    let set = instance
+        .controller()
+        .request(Command::SetParameter { id: 0, value: 0.25 })
+        .unwrap();
+    loop {
+        match next_event(&instance) {
+            HostEvent::Completed { request } if request == set => break,
+            HostEvent::Failed { reason } | HostEvent::RequestFailed { reason, .. } => {
+                panic!("valid parameter edit failed: {reason}")
+            }
+            _ => {}
+        }
+    }
+    let save = instance.controller().request(Command::SaveState).unwrap();
+    let saved = loop {
+        match next_event(&instance) {
+            HostEvent::State { request, bytes } if request == Some(save) => break bytes,
+            HostEvent::Failed { reason } | HostEvent::RequestFailed { reason, .. } => {
+                panic!("valid state save failed: {reason}")
+            }
+            _ => {}
+        }
+    };
+    assert_eq!(saved, [0, 0, 0, 0, 0, 0, 128, 62]); // program 0, width 0.25
+
+    // Class 23 starts valid; this edit switches its getter to mode 23 (NaN).
+    let set = instance
+        .controller()
+        .request(Command::SetParameter { id: 0, value: 0.75 })
+        .unwrap();
+    loop {
+        match next_event(&instance) {
+            HostEvent::Completed { request } if request == set => break,
+            HostEvent::Failed { reason } | HostEvent::RequestFailed { reason, .. } => {
+                panic!("fixture mode switch failed: {reason}")
+            }
+            _ => {}
+        }
+    }
+    let bad_save = instance.controller().request(Command::SaveState).unwrap();
+    loop {
+        match next_event(&instance) {
+            HostEvent::State { request, bytes } if request == Some(bad_save) => {
+                panic!("bad getter became a successful checkpoint: {bytes:?}")
+            }
+            HostEvent::Completed { request } if request == bad_save => {
+                panic!("bad getter SaveState completed successfully")
+            }
+            // Native GetState errors are Faults, exposed as instance failure,
+            // not per-request errors. Recover must retain the last valid save.
+            HostEvent::Failed { reason } => {
+                assert!(reason.contains("invalid parameter state value"), "{reason}");
+                break;
+            }
+            HostEvent::RequestFailed { reason, .. } => panic!("unexpected request error: {reason}"),
+            _ => {}
+        }
+    }
+    assert_eq!(instance.status(), vst_audio::Status::Failed);
+    instance
+        .controller()
+        .request(Command::Recover {
+            use_previous: false,
+        })
+        .unwrap();
+    let input = [1.0f32; 128];
+    let mut samples = [[0.0f32; 128]; 6];
+    let mut outputs: Vec<_> = samples.iter_mut().map(|plane| &mut plane[..]).collect();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut recovered = false;
+    let mut processed = 0;
+    while !recovered || processed < 3 {
+        if audio.process(&[&input, &input], &mut outputs) == AudioStatus::Processed {
+            assert!(audio.generation() > generation);
+            assert_eq!(outputs[0][100], 0.25);
+            assert_eq!(outputs[4][100], 0.03125); // 1 * 0.5 * saved width 0.25 * child gain 0.25
+            processed += 1;
+        }
+        while let Some(event) = instance.try_next_event() {
+            match event {
+                HostEvent::Recovered {
+                    generation: current,
+                } => {
+                    assert!(current > generation);
+                    recovered = true;
+                }
+                HostEvent::Failed { reason } | HostEvent::RequestFailed { reason, .. } => {
+                    panic!("last valid checkpoint recovery failed: {reason}")
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "checkpoint recovery audio timeout"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let save = instance.controller().request(Command::SaveState).unwrap();
+    loop {
+        match next_event(&instance) {
+            HostEvent::State { request, bytes } if request == Some(save) => {
+                assert_eq!(bytes, saved);
+                break;
+            }
+            HostEvent::Failed { reason } | HostEvent::RequestFailed { reason, .. } => {
+                panic!("recovered state save failed: {reason}")
+            }
+            _ => {}
+        }
+    }
+    println!("bad getter failed; latest checkpoint recovered: program=0, width=0.25, side=0.03125");
+}
+
+#[test]
+#[ignore = "native fixtures required"]
 fn resize_reaches_application_floating_and_embedded() {
     use vst_audio::{Command, Configuration, Host, HostEvent, PluginDescriptor};
     for format in [PluginFormat::Vst2, PluginFormat::Vst3] {
