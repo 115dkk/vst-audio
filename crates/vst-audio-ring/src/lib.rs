@@ -4,7 +4,8 @@
 //!
 //! This is a Rust port of EqualizerAPO-XT `runtime/ipc/StreamRing.{h,cpp}` at
 //! commit `1432f61cc437c99fde8e8e84e10e648fe516d4ce`. Copyright 2026 115dkk.
-//! It is ported to MIT with the copyright holder's permission (ADR 0021).
+//! It is distributed under MIT with the copyright holder's permission; `NOTICE`
+//! records the source revision and license provenance.
 //!
 //! The wire image is little-endian. Every value is accessed atomically. The
 //! mapping is split into a prefix of [`AtomicU32`] words and a 128-byte suffix
@@ -42,7 +43,7 @@
 use std::array;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
 mod block;
@@ -286,13 +287,14 @@ pub enum Waited {
 struct EventInner {
     generation: AtomicU64,
     gone: AtomicBool,
+    contended: AtomicBool,
     observed: Mutex<u64>,
     changed: Condvar,
 }
 
-/// Same-process event for tests and adapters. `signal` only performs an atomic
-/// increment and a condition-variable notification; it neither locks nor
-/// allocates.
+/// Same-process event for tests and adapters. `signal` never blocks or allocates;
+/// it attempts the condition-variable mutex and uses the waiter's bounded atomic
+/// recheck when the waiter owns it.
 #[derive(Clone, Debug)]
 pub struct InProcessEvent(Arc<EventInner>);
 
@@ -301,6 +303,7 @@ impl InProcessEvent {
         Self(Arc::new(EventInner {
             generation: AtomicU64::new(0),
             gone: AtomicBool::new(false),
+            contended: AtomicBool::new(false),
             observed: Mutex::new(0),
             changed: Condvar::new(),
         }))
@@ -308,7 +311,38 @@ impl InProcessEvent {
 
     pub fn peer_gone(&self) {
         self.0.gone.store(true, Ordering::Release);
-        self.0.changed.notify_all();
+        self.notify(false);
+    }
+
+    fn notify(&self, one: bool) {
+        // A notifier that acquires `observed` cannot race between the waiter's
+        // predicate check and parking. `signal` must remain non-blocking, so a
+        // contended mutex sets a handoff flag that makes the waiter skip parking.
+        match self.0.observed.try_lock() {
+            Ok(_guard) => {
+                if one {
+                    self.0.changed.notify_one();
+                } else {
+                    self.0.changed.notify_all();
+                }
+            }
+            Err(TryLockError::Poisoned(error)) => {
+                let _guard = error.into_inner();
+                if one {
+                    self.0.changed.notify_one();
+                } else {
+                    self.0.changed.notify_all();
+                }
+            }
+            Err(TryLockError::WouldBlock) => {
+                self.0.contended.store(true, Ordering::Release);
+                if one {
+                    self.0.changed.notify_one();
+                } else {
+                    self.0.changed.notify_all();
+                }
+            }
+        }
     }
 }
 
@@ -321,7 +355,7 @@ impl Default for InProcessEvent {
 impl Signal for InProcessEvent {
     fn signal(&self) {
         self.0.generation.fetch_add(1, Ordering::Release);
-        self.0.changed.notify_one();
+        self.notify(true);
     }
 }
 
@@ -336,25 +370,42 @@ impl Wait for InProcessEvent {
             *observed = current;
             return Waited::Signalled;
         }
-        let (mut observed, result) = self
-            .0
-            .changed
-            .wait_timeout_while(observed, timeout, |seen| {
-                !self.0.gone.load(Ordering::Acquire)
-                    && self.0.generation.load(Ordering::Acquire) == *seen
-            })
-            .unwrap_or_else(|e| e.into_inner());
-        if self.0.gone.load(Ordering::Acquire) {
-            Waited::PeerGone
-        } else {
+        if self.0.contended.swap(false, Ordering::AcqRel) {
             let current = self.0.generation.load(Ordering::Acquire);
             if current != *observed {
                 *observed = current;
-                Waited::Signalled
-            } else if result.timed_out() {
-                Waited::TimedOut
-            } else {
-                Waited::Signalled
+                return Waited::Signalled;
+            }
+            if self.0.gone.load(Ordering::Acquire) {
+                return Waited::PeerGone;
+            }
+        }
+        let deadline = Instant::now() + timeout;
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return Waited::TimedOut;
+            }
+            let slice = deadline
+                .saturating_duration_since(now)
+                .min(Duration::from_millis(1));
+            let (next_observed, _) = self
+                .0
+                .changed
+                .wait_timeout_while(observed, slice, |seen| {
+                    !self.0.gone.load(Ordering::Acquire)
+                        && !self.0.contended.swap(false, Ordering::AcqRel)
+                        && self.0.generation.load(Ordering::Acquire) == *seen
+                })
+                .unwrap_or_else(|e| e.into_inner());
+            observed = next_observed;
+            if self.0.gone.load(Ordering::Acquire) {
+                return Waited::PeerGone;
+            }
+            let current = self.0.generation.load(Ordering::Acquire);
+            if current != *observed {
+                *observed = current;
+                return Waited::Signalled;
             }
         }
     }
@@ -474,6 +525,12 @@ pub enum Publish {
 /// cached so the per-block path needs no [`Producer`] and no borrow of the
 /// mapping beyond each call. Every method takes the [`Region`] it works on and
 /// neither blocks, locks nor allocates; `work` is only signalled.
+///
+/// Each lane has exactly one producer and one consumer. The producer publishes
+/// only the next wrapping sequence and accesses a completed slot only after the
+/// completion counter's Acquire load. The consumer likewise accesses a slot
+/// only after observing its publication with Acquire, then calls
+/// [`Consumer::complete`] after processing it.
 #[derive(Clone, Copy, Debug)]
 pub struct Publisher {
     geometry: Geometry,
@@ -537,7 +594,12 @@ impl Publisher {
         };
         let meta_offset =
             offset + self.geometry.samples_per_slot() * self.geometry.sample_format.words();
-        let metadata = &region.words32[meta_offset..meta_offset + METADATA_WORDS];
+        let Some(metadata) = region
+            .words32
+            .get(meta_offset..meta_offset + METADATA_WORDS)
+        else {
+            return Publish::Dropped;
+        };
         let mut writer = SlotWriter {
             samples,
             metadata,
@@ -579,9 +641,15 @@ impl Publisher {
         };
         let meta_offset =
             offset + self.geometry.samples_per_slot() * self.geometry.sample_format.words();
+        let Some(metadata) = region
+            .words32
+            .get(meta_offset..meta_offset + METADATA_WORDS)
+        else {
+            return false;
+        };
         read(SlotReader {
             samples,
-            metadata: &region.words32[meta_offset..meta_offset + METADATA_WORDS],
+            metadata,
             format: self.geometry.sample_format,
             frames: self.geometry.max_frames as usize,
             planes: self.geometry.planes(),
@@ -728,7 +796,10 @@ impl<'a> Producer<'a> {
         let Some(publisher) = self.publisher() else {
             return Publish::Dropped;
         };
-        publisher.try_publish(self.region, lane, sequence, self.work[lane], write)
+        let Some(work) = self.work.get(lane).copied() else {
+            return Publish::Dropped;
+        };
+        publisher.try_publish(self.region, lane, sequence, work, write)
     }
 
     pub fn try_read<F>(&self, lane: usize, sequence: u32, read: F) -> bool
@@ -984,6 +1055,12 @@ fn load_packet(words: &[AtomicU32], frames: u32, events: &mut EventBuffer) -> bo
     true
 }
 
+/// The worker-side half of the ring.
+///
+/// Use one consumer per lane. After [`Consumer::next_published`] observes the
+/// next sequence with Acquire, read and process that slot through the methods
+/// below, then call [`Consumer::complete`] for the same sequence before moving
+/// to the next one. These ordering and ownership rules pair with [`Publisher`].
 pub struct Consumer<'a> {
     region: Region<'a>,
     geometry: Option<Geometry>,
@@ -1043,6 +1120,8 @@ impl<'a> Consumer<'a> {
         }
     }
 
+    /// Acquires publication and returns only the next uncompleted sequence.
+    /// Slot access for that sequence must happen after this call.
     pub fn next_published(&self, lane: usize) -> Option<u32> {
         let geometry = self.geometry?;
         if lane >= geometry.lanes as usize || self.region.state() != Some(State::Ready) {
@@ -1168,7 +1247,15 @@ impl<'a> Consumer<'a> {
         true
     }
 
+    /// Releases `sequence` after all sample and packet processing has finished,
+    /// allowing the producer to read and eventually reuse the slot.
     pub fn complete(&self, lane: usize, sequence: u32) {
+        let Some(geometry) = self.geometry else {
+            return;
+        };
+        if lane >= geometry.lanes as usize {
+            return;
+        }
         self.region
             .store32(COMPLETED_I + lane, sequence.to_le(), Ordering::Release);
         if let Some(signal) = self.done[lane] {

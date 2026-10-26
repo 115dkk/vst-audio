@@ -49,6 +49,30 @@ fn parameter_codec_is_bounded_and_preserves_optional_metadata() {
             message: Message::SetParameter { id: 0, value },
         };
         assert!(encode_frame(&frame).is_err());
+        for (entry_value, default) in [(value, Some(0.5)), (0.5, Some(value))] {
+            let frame = Frame {
+                flags: 0,
+                request: 1,
+                message: Message::Parameters {
+                    total: 1,
+                    entries: vec![Parameter {
+                        automatable: true,
+                        read_only: false,
+                        hidden: false,
+                        id: 0,
+                        name: "Gain".into(),
+                        unit: String::new(),
+                        value: entry_value,
+                        default,
+                        steps: None,
+                    }],
+                },
+            };
+            assert!(matches!(
+                encode_frame(&frame),
+                Err(CodecError::InvalidValue)
+            ));
+        }
     }
     let frame = Frame {
         flags: 0,

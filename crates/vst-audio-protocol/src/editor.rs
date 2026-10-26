@@ -30,8 +30,10 @@ pub enum EditorScaling {
     Auto = 0,
     /// Only the plugin scales; a plugin that cannot stays 1:1.
     Plugin = 1,
-    /// The system stretches a 1:1 drawing (sharpness is lost). Windows
-    /// floating editors only; elsewhere the open fails with a request error.
+    /// The system stretches a 1:1 drawing (sharpness is lost). Supported by
+    /// Windows floating editors and, in a Wayland session with `DISPLAY`, by a
+    /// floating X11 editor that the desktop's XWayland scales. Embedded views,
+    /// plain X11 sessions and Wayland sessions without `DISPLAY` reject it.
     Stretch = 2,
     /// No scaling: the plugin is told nothing and draws 1:1 physical pixels.
     Off = 3,

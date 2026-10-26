@@ -1,13 +1,74 @@
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeSet;
-use std::io::Cursor;
+use std::io::{self, Cursor, Read};
 
 use vst_audio_protocol::{
     Action, Bus, BusInfo, BusKind, ClassInfo, CodecError, DecodedFrame, DisableReason, EditPhase,
     Frame, HostWatch, KillReason, MAX_STRING_BYTES, Message, PluginFormat, Received, RequestKind,
     StateHistory, WatchState, decode_frame, encode_frame, read_frame,
 };
+
+fn editor_status(width: u32, height: u32, scale: f32) -> Message {
+    Message::EditorStatus(vst_audio_protocol::EditorStatus {
+        platform: vst_audio_protocol::EditorPlatform::X11,
+        scaling: vst_audio_protocol::EditorScaling::Plugin,
+        visible: false,
+        embedded: false,
+        width,
+        height,
+        scale,
+        resize_supported: true,
+        scale_supported: true,
+    })
+}
+
+#[test]
+fn editor_status_rejects_invalid_dimensions_and_scale() {
+    for message in [
+        editor_status(0, 200, 1.0),
+        editor_status(8193, 200, 1.0),
+        editor_status(320, 0, 1.0),
+        editor_status(320, 8193, 1.0),
+        editor_status(320, 200, 0.0),
+        editor_status(320, 200, 0.49),
+        editor_status(320, 200, 4.01),
+        editor_status(320, 200, f32::NAN),
+        editor_status(320, 200, f32::INFINITY),
+    ] {
+        assert!(matches!(
+            encode_frame(&Frame {
+                flags: 0,
+                request: 1,
+                message,
+            }),
+            Err(CodecError::InvalidValue)
+        ));
+    }
+
+    for (width, height, scale) in [(1, 1, 0.5), (8192, 8192, 4.0)] {
+        round_trip(editor_status(width, height, scale));
+    }
+
+    let valid = encode_frame(&Frame {
+        flags: 0,
+        request: 1,
+        message: editor_status(320, 200, 1.0),
+    })
+    .unwrap();
+    for (offset, bytes) in [
+        (15, 0_u32.to_le_bytes()),
+        (19, 8193_u32.to_le_bytes()),
+        (23, f32::NAN.to_bits().to_le_bytes()),
+    ] {
+        let mut invalid = valid.clone();
+        invalid[offset..offset + 4].copy_from_slice(&bytes);
+        assert!(matches!(
+            decode_frame(&invalid),
+            Err(CodecError::InvalidValue)
+        ));
+    }
+}
 
 #[test]
 fn editor_platforms_round_trip_and_reject_unknown_tags() {
@@ -44,6 +105,39 @@ fn editor_platforms_round_trip_and_reject_unknown_tags() {
             Err(CodecError::InvalidValue)
         ));
     }
+}
+
+#[test]
+fn read_frame_retries_an_interrupted_first_read() {
+    struct InterruptOnce {
+        bytes: Cursor<Vec<u8>>,
+        interrupted: bool,
+    }
+
+    impl Read for InterruptOnce {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            self.bytes.read(buffer)
+        }
+    }
+
+    let frame = Frame {
+        flags: 7,
+        request: 42,
+        message: Message::hello(),
+    };
+    let mut reader = InterruptOnce {
+        bytes: Cursor::new(encode_frame(&frame).unwrap()),
+        interrupted: false,
+    };
+
+    assert_eq!(
+        read_frame(&mut reader).unwrap(),
+        Some(DecodedFrame::Known(frame))
+    );
 }
 
 fn round_trip(message: Message) {
@@ -313,6 +407,22 @@ fn embedding_rejects_unknown_platform_tags() {
             decode_frame(&bytes),
             Err(CodecError::InvalidValue)
         ));
+    }
+}
+
+#[test]
+fn decode_frame_rejects_lengths_that_overflow_the_frame_size() {
+    for length in 0xffff_fffc_u32..=u32::MAX {
+        let mut bytes = [0_u8; 12];
+        bytes[..4].copy_from_slice(&length.to_le_bytes());
+        if usize::BITS == 32 {
+            assert!(matches!(
+                decode_frame(&bytes),
+                Err(CodecError::InvalidLength)
+            ));
+        } else {
+            assert!(matches!(decode_frame(&bytes), Err(CodecError::Truncated)));
+        }
     }
 }
 

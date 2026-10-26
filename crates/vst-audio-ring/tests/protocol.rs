@@ -5,8 +5,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use vst_audio_ring::{
-    Consumer, Fault, Geometry, HeaderError, InProcessEvent, Pipeline, Producer, Publish, Region,
-    RegionBuf, RegionMemory, State, Waited,
+    Consumer, Event, EventBuffer, Fault, Geometry, HeaderError, InProcessEvent, Pipeline, Producer,
+    Publish, Region, RegionBuf, RegionMemory, State, Waited,
 };
 
 fn geometry(lanes: u32) -> Geometry {
@@ -167,6 +167,7 @@ fn publisher_and_owned_region_cross_threads_after_announcement() {
     };
     let consumer_storage = Arc::clone(&storage);
     let consumer_ready = Arc::clone(&ready);
+    let deadline = Instant::now() + Duration::from_secs(10);
     let consumer = thread::spawn(move || {
         let mut consumer = Consumer::new(
             consumer_storage.region(),
@@ -177,6 +178,10 @@ fn publisher_and_owned_region_cross_threads_after_announcement() {
         let mut buffer = vec![0.0; geometry(1).samples_per_slot()];
         for sequence in 1..=3 {
             while consumer.next_published(0) != Some(sequence) {
+                assert!(
+                    Instant::now() < deadline,
+                    "publisher never announced {sequence}"
+                );
                 thread::yield_now();
             }
             assert!(consumer.slot_mut(0, sequence, &mut buffer, |samples| samples[0] *= 2.0));
@@ -187,6 +192,7 @@ fn publisher_and_owned_region_cross_threads_after_announcement() {
     let memory: Box<dyn RegionMemory> = Box::new(Arc::clone(&storage));
     let publishing = thread::spawn(move || {
         while publisher.state(memory.region()) != Some(State::Ready) {
+            assert!(Instant::now() < deadline, "consumer never became ready");
             thread::yield_now();
         }
         let mut results = Vec::new();
@@ -198,6 +204,10 @@ fn publisher_and_owned_region_cross_threads_after_announcement() {
                 Publish::Published
             );
             while publisher.completed(memory.region(), 0) != sequence {
+                assert!(
+                    Instant::now() < deadline,
+                    "consumer never completed {sequence}"
+                );
                 thread::yield_now();
             }
             assert!(publisher.try_read(memory.region(), 0, sequence, |slot| {
@@ -224,6 +234,34 @@ fn late_blocks_are_processed_without_skipping() {
     consumer.complete(0, 1);
     assert_eq!(consumer.next_published(0), Some(2));
     consumer.complete(0, 2);
+}
+
+#[test]
+fn in_process_event_wakes_for_signal_and_peer_loss_under_race() {
+    for peer_loss in [false, true] {
+        for _ in 0..1_000 {
+            let event = Arc::new(InProcessEvent::new());
+            let waiter = Arc::clone(&event);
+            let waiting = thread::spawn(move || {
+                vst_audio_ring::Wait::wait(waiter.as_ref(), Duration::from_millis(20))
+            });
+            thread::yield_now();
+            if peer_loss {
+                event.peer_gone();
+            } else {
+                vst_audio_ring::Signal::signal(&event);
+            }
+            let result = waiting.join().unwrap();
+            assert_eq!(
+                result,
+                if peer_loss {
+                    Waited::PeerGone
+                } else {
+                    Waited::Signalled
+                }
+            );
+        }
+    }
 }
 
 #[test]
@@ -336,6 +374,68 @@ fn cached_geometry_ignores_later_header_mutation() {
 }
 
 #[test]
+fn corrupt_output_event_packets_are_rejected_and_clear_the_buffer() {
+    const CONTEXT_WORDS: usize = 32;
+    const PACKET_WORDS: usize = 2 + vst_audio_ring::MAX_EVENTS * 72;
+    const EVENT_WORDS: usize = 72;
+
+    let g = geometry(1);
+    for (count, kind, sysex_len) in [(257, 1, 0), (1, 5, 0), (1, 4, 0), (1, 4, 257)] {
+        let total = g.total_bytes().unwrap();
+        let prefix: Vec<_> = (0..g.mapping_split(total).unwrap() / 4)
+            .map(|_| std::sync::atomic::AtomicU32::new(0))
+            .collect();
+        let counters: Vec<_> = (0..vst_audio_ring::COUNTER_WORDS)
+            .map(|_| std::sync::atomic::AtomicU64::new(0))
+            .collect();
+        let event = InProcessEvent::new();
+        let region = Region::new(&prefix, &counters);
+        let mut producer = Producer::new(region, [None, None], &event);
+        producer.announce(g, 1).unwrap();
+        let mut consumer = Consumer::new(region, &event, [None, None]);
+        consumer.validate_and_ready(2).unwrap();
+        assert_eq!(producer.try_publish(0, 1, |_| {}), Publish::Published);
+        let mut valid = EventBuffer::default();
+        valid.push(Event::midi(3, 0, [0x90, 60, 100]));
+        assert!(consumer.output_packet(0, 1, &valid));
+        consumer.complete(0, 1);
+
+        let prefix_bytes = g.total_bytes().unwrap() - vst_audio_ring::COUNTER_BYTES;
+        let slot_words = (prefix_bytes - vst_audio_ring::HEADER_BYTES) / g.slots as usize / 4;
+        let output = vst_audio_ring::HEADER_BYTES / 4
+            + slot_words
+            + g.samples_per_slot()
+            + CONTEXT_WORDS
+            + PACKET_WORDS;
+        prefix[output].store(count, std::sync::atomic::Ordering::Relaxed);
+        prefix[output + 2].store(kind, std::sync::atomic::Ordering::Relaxed);
+        prefix[output + 2 + 3].store(sysex_len, std::sync::atomic::Ordering::Relaxed);
+        debug_assert!(output + 2 + EVENT_WORDS <= prefix.len());
+
+        let mut decoded = valid.clone();
+        assert!(producer.try_read(0, 1, |slot| {
+            assert!(!slot.output_events(&mut decoded));
+        }));
+        assert!(decoded.as_slice().is_empty());
+        assert_eq!(decoded.dropped, 0);
+    }
+}
+
+#[test]
+fn producer_and_consumer_ignore_lanes_outside_the_geometry() {
+    let storage = RegionBuf::new(geometry(1)).unwrap();
+    let event = InProcessEvent::new();
+    let mut producer = Producer::new(storage.region(), [Some(&event), None], &event);
+    producer.announce(geometry(1), 1).unwrap();
+    let mut consumer = Consumer::new(storage.region(), &event, [Some(&event), None]);
+    consumer.validate_and_ready(2).unwrap();
+
+    assert_eq!(producer.try_publish(2, 1, |_| {}), Publish::Dropped);
+    consumer.complete(2, 7);
+    assert_eq!(producer.completed(0), 0);
+}
+
+#[test]
 fn both_lanes_are_independent() {
     let storage = RegionBuf::new(geometry(2)).unwrap();
     let event = InProcessEvent::new();
@@ -350,6 +450,32 @@ fn both_lanes_are_independent() {
     consumer.complete(1, 1);
     assert_eq!(producer.completed(0), 0);
     assert_eq!(producer.completed(1), 1);
+}
+
+#[test]
+fn publisher_drops_a_region_truncated_after_slot_samples() {
+    let g = geometry(1);
+    let total = g.total_bytes().unwrap();
+    let prefix: Vec<_> = (0..g.mapping_split(total).unwrap() / 4)
+        .map(|_| std::sync::atomic::AtomicU32::new(0))
+        .collect();
+    let counters: Vec<_> = (0..vst_audio_ring::COUNTER_WORDS)
+        .map(|_| std::sync::atomic::AtomicU64::new(0))
+        .collect();
+    let event = InProcessEvent::new();
+    let full = Region::new(&prefix, &counters);
+    let mut producer = Producer::new(full, [None, None], &event);
+    producer.announce(g, 1).unwrap();
+    let mut consumer = Consumer::new(full, &event, [None, None]);
+    consumer.validate_and_ready(2).unwrap();
+    let publisher = producer.publisher().unwrap();
+
+    let sample_end = vst_audio_ring::HEADER_BYTES / 4 + g.samples_per_slot();
+    let truncated = Region::new(&prefix[..sample_end], &counters);
+    assert_eq!(
+        publisher.try_publish(truncated, 0, 2, None, |_| {}),
+        Publish::Dropped
+    );
 }
 
 #[test]

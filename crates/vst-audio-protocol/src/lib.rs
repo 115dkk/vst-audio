@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
-//! Control framing and deterministic host supervision from ADR 0021.
+//! Bounded control framing and deterministic host supervision for the isolated-worker
+//! boundary described in `docs/architecture.md`.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -364,10 +365,13 @@ pub fn decode_frame(bytes: &[u8]) -> Result<DecodedFrame, CodecError> {
     if length < FRAME_META_BYTES {
         return Err(CodecError::InvalidLength);
     }
-    if bytes.len() < 4 + length {
+    let frame_length = 4_usize
+        .checked_add(length)
+        .ok_or(CodecError::InvalidLength)?;
+    if bytes.len() < frame_length {
         return Err(CodecError::Truncated);
     }
-    if bytes.len() != 4 + length {
+    if bytes.len() != frame_length {
         return Err(CodecError::TrailingBytes);
     }
     decode_parts(&bytes[4..12], &bytes[12..])
@@ -379,10 +383,16 @@ pub fn decode_frame(bytes: &[u8]) -> Result<DecodedFrame, CodecError> {
 pub fn read_frame(reader: &mut impl Read) -> Result<Option<DecodedFrame>, CodecError> {
     let mut length_bytes = [0_u8; 4];
     let mut first = [0_u8; 1];
-    match reader.read(&mut first) {
-        Ok(0) => return Ok(None),
-        Ok(_) => length_bytes[0] = first[0],
-        Err(error) => return Err(CodecError::Io(error)),
+    loop {
+        match reader.read(&mut first) {
+            Ok(0) => return Ok(None),
+            Ok(_) => {
+                length_bytes[0] = first[0];
+                break;
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(CodecError::Io(error)),
+        }
     }
     reader.read_exact(&mut length_bytes[1..]).map_err(map_eof)?;
     let length = u32::from_le_bytes(length_bytes) as usize;
@@ -549,6 +559,13 @@ fn encode_message(message: &Message, out: &mut Vec<u8>) -> Result<(), CodecError
             out.push(*scaling as u8);
         }
         Message::EditorStatus(status) => {
+            if !(1..=8192).contains(&status.width)
+                || !(1..=8192).contains(&status.height)
+                || !status.scale.is_finite()
+                || !(0.5..=4.0).contains(&status.scale)
+            {
+                return Err(CodecError::InvalidValue);
+            }
             out.push(status.platform as u8);
             out.push(u8::from(status.visible));
             out.push(u8::from(status.embedded));
@@ -625,6 +642,14 @@ fn encode_message(message: &Message, out: &mut Vec<u8>) -> Result<(), CodecError
             put_u32(out, *total);
             put_u16(out, entries.len() as u16);
             for entry in entries {
+                if !entry.value.is_finite()
+                    || !(0.0..=1.0).contains(&entry.value)
+                    || entry
+                        .default
+                        .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+                {
+                    return Err(CodecError::InvalidValue);
+                }
                 put_u32(out, entry.id);
                 out.push(
                     u8::from(entry.automatable)
@@ -740,6 +765,10 @@ fn decode_message(kind: u16, body: &[u8]) -> Result<Option<Message>, CodecError>
         },
         kind::CLASSES => {
             let count = cursor.u16()? as usize;
+            const MIN_CLASS_BYTES: usize = 16 + 2 + 2 + 2;
+            if count > cursor.remaining() / MIN_CLASS_BYTES {
+                return Err(CodecError::Truncated);
+            }
             let mut entries = Vec::with_capacity(count);
             for _ in 0..count {
                 entries.push(ClassInfo {
@@ -814,6 +843,13 @@ fn decode_message(kind: u16, body: &[u8]) -> Result<Option<Message>, CodecError>
             let width = cursor.u32()?;
             let height = cursor.u32()?;
             let scale = f32::from_bits(cursor.u32()?);
+            if !(1..=8192).contains(&width)
+                || !(1..=8192).contains(&height)
+                || !scale.is_finite()
+                || !(0.5..=4.0).contains(&scale)
+            {
+                return Err(CodecError::InvalidValue);
+            }
             let resize_supported = cursor.boolean()?;
             let scale_supported = cursor.boolean()?;
             Message::EditorStatus(EditorStatus {
@@ -1071,6 +1107,10 @@ impl<'a> Cursor<'a> {
     }
     fn bus_infos(&mut self) -> Result<Vec<BusInfo>, CodecError> {
         let count = self.u16()? as usize;
+        const MIN_BUS_BYTES: usize = 2 + 8 + 1 + 1 + 2;
+        if count > self.remaining() / MIN_BUS_BYTES {
+            return Err(CodecError::Truncated);
+        }
         let mut buses = Vec::with_capacity(count);
         for _ in 0..count {
             let layout = Bus {
@@ -1169,6 +1209,13 @@ const PARAM_QUIET_MS: u64 = 2_000;
 const FAILURE_WINDOW_MS: u64 = 10 * 60 * 1_000;
 const BACKOFF_MS: [u64; 3] = [500, 2_000, 8_000];
 
+/// Deterministic worker-health state machine.
+///
+/// Every `now_ms` argument must come from one monotonic clock and share the
+/// epoch passed to [`HostWatch::new`]. While running, observe the current worker
+/// counter with [`HostWatch::heartbeat`] before calling [`HostWatch::tick`] at
+/// that observation time; otherwise `tick` can declare a healthy worker silent
+/// before recording its latest heartbeat (audit #11 TD-94).
 #[derive(Debug)]
 pub struct HostWatch {
     state: WatchState,
@@ -1247,6 +1294,11 @@ impl HostWatch {
         Action::None
     }
 
+    /// Starts the request deadline. State saves and editor operations use the
+    /// same bound because both are control-thread round trips: neither is safe
+    /// to leave pending while worker health is uncertain. `kind` remains in the
+    /// public contract for diagnostics and future policy without changing the
+    /// current deadline (audit #11 TD-92).
     pub fn request_sent(&mut self, now_ms: u64, request: u32, _kind: RequestKind) -> Action {
         self.pending_requests.retain(|(id, _)| *id != request);
         self.pending_requests.push((request, now_ms));
