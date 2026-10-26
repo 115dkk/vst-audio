@@ -475,8 +475,10 @@ unsafe extern "C" fn set_parameter(effect: *mut AEffect, index: u32, value: f32)
     }
     // SAFETY: field is atomic; no reference to the foreign header or DSP state is formed.
     unsafe { &(*effect.cast::<Instance>()).width }.store(value.to_bits(), Ordering::Relaxed);
+    // SAFETY: the live instance retains its immutable callback through CLOSE.
+    let callback = unsafe { (*effect.cast::<Instance>()).host };
     // SAFETY: automate addresses parameter zero and carries no borrowed payload.
-    unsafe { host(effect, MASTER_AUTOMATE, 0, 0, std::ptr::null_mut()) };
+    unsafe { callback(effect, MASTER_AUTOMATE, 0, 0, std::ptr::null_mut(), value) };
 }
 unsafe extern "C" fn get_parameter(effect: *mut AEffect, index: u32) -> f32 {
     if effect.is_null() || index != 0 {
