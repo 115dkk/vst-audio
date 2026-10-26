@@ -616,7 +616,6 @@ version = "0.6.1"
 dependencies = [
  "libc",
  "tempfile",
- "thiserror",
  "vst-audio-ring",
  "windows",
 ]
