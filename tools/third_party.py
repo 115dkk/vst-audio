@@ -37,6 +37,31 @@ EAPO = ("https://github.com/115dkk/equalizerapo-xt/releases/download/v2.60.6/Equ
 MESA = ("https://github.com/pal1000/mesa-dist-win/releases/download/26.2.4/mesa3d-26.2.4-release-msvc.7z",
         "351fc8c8b695878ffb3eaa044b3ead08672a48b1a045e3c3e3975811df0f6695")
 
+
+def diagnostic_outcome(platform, returncode, timed_out, metric_count, mutation_passed=None):
+    """Combine ordinary and platform-applicable mutation diagnostics."""
+    ordinary_failures = []
+    if timed_out:
+        ordinary_failures.append("semantic test timed out")
+    if returncode:
+        ordinary_failures.append(f"semantic test exited with {returncode}")
+    if metric_count < 10:
+        ordinary_failures.append(f"semantic test produced {metric_count} METRIC records; need 10")
+    mutation_scheduled = platform != "darwin"
+    failures = list(ordinary_failures)
+    if mutation_scheduled and mutation_passed is not True:
+        failures.append("mutation diagnostics incomplete" if mutation_passed is None
+                        else "mutation did not fail at the sound assertion")
+    return {
+        "ordinary_passed": not ordinary_failures,
+        "ordinary_failures": ordinary_failures,
+        "mutation_scheduled": mutation_scheduled,
+        "mutation_passed": mutation_passed,
+        "passed": not failures,
+        "failures": failures,
+    }
+
+
 def run(*command, cwd=ROOT):
     subprocess.run(list(map(str, command)), cwd=cwd, check=True)
 
@@ -317,10 +342,11 @@ def main():
                              if "METRIC " in line]
         report["returncode"] = result.returncode
         report["timed_out"] = result.timed_out
-        assert not result.timed_out, "semantic test timed out"
-        assert len(report["metrics"]) >= 10, "semantic test measurements missing"
         report["known_upstream_limitations"]=[m["case"] for m in report["metrics"] if m["case"].startswith("known limitation:")]
-        if sys.platform != "darwin":
+        outcome = diagnostic_outcome(sys.platform, result.returncode, result.timed_out,
+                                     len(report["metrics"]))
+        report["diagnostics"] = outcome
+        if outcome["mutation_scheduled"]:
             mutant_target = root / "mutation-target"
             run("cargo", "build", "--locked", "-p", "vst-audio-worker", "--features",
                 "vst-audio-worker-sys/__test-drop-editor-edits", "--target-dir", mutant_target)
@@ -337,11 +363,15 @@ def main():
                 "sound_failure": marker in result.tail, "passed": mutation_passed,
                 "metrics": [json.loads(line.partition("METRIC ")[2]) for line in result.tail.splitlines()
                             if "METRIC " in line]}
-            assert mutation_passed, "mutation did not fail at the sound assertion"
+            outcome = diagnostic_outcome(sys.platform, report["returncode"], report["timed_out"],
+                                         len(report["metrics"]), mutation_passed)
         else:
             report["mutation"] = {"not_run": "macOS synthetic editor input is unsupported"}
-        if report["returncode"]:
-            raise SystemExit(report["returncode"])
+            outcome = diagnostic_outcome(sys.platform, report["returncode"], report["timed_out"],
+                                         len(report["metrics"]))
+        report["diagnostics"] = outcome
+        if not outcome["passed"]:
+            raise RuntimeError("; ".join(outcome["failures"]))
         report["passed"] = True
     finally:
         (report_dir / "summary.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
