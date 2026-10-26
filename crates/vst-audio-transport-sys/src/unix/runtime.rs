@@ -10,7 +10,7 @@ use std::{
     io,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
     path::Path,
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -344,80 +344,159 @@ fn spawn_handles_macos(
     };
     spawn_result(result)?;
     Ok(ChildProcess {
-        child: Mutex::new(MacChild {
+        child: Mutex::new(Some(UnixChild {
             pid,
             exit_code: None,
-        }),
+            ownership_lost: false,
+        })),
         _parent: parent,
-        _sandbox: sandbox,
+        sandbox: Some(sandbox),
+        #[cfg(test)]
+        suppress_termination: false,
     })
 }
 
-#[cfg(target_os = "macos")]
 #[derive(Debug)]
-struct MacChild {
+struct UnixChild {
+    #[cfg(not(target_os = "macos"))]
+    child: Child,
+    #[cfg(target_os = "macos")]
     pid: libc::pid_t,
     exit_code: Option<u32>,
+    ownership_lost: bool,
 }
 
-#[cfg(target_os = "macos")]
-impl MacChild {
-    fn cache_status(&mut self, status: libc::c_int) -> u32 {
-        let code = if libc::WIFEXITED(status) {
-            libc::WEXITSTATUS(status) as u32
-        } else {
-            (128 + libc::WTERMSIG(status)) as u32
+impl UnixChild {
+    fn pid(&self) -> libc::pid_t {
+        #[cfg(target_os = "macos")]
+        {
+            self.pid
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.child.id() as libc::pid_t
+        }
+    }
+
+    // Called under ChildProcess's mutex, or by the sole owner in the reaper.
+    // WNOWAIT keeps even an exited leader's PID reserved until group cleanup.
+    fn exit_pending(&mut self) -> io::Result<bool> {
+        if self.ownership_lost {
+            return Err(io::Error::from_raw_os_error(libc::ECHILD));
+        }
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        // SAFETY: info is writable siginfo_t storage, and P_PID selects only this
+        // child's positive PID. WNOWAIT never consumes its wait status.
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                self.pid() as libc::id_t,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
         };
-        self.exit_code = Some(code);
-        code
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            self.ownership_lost = error.raw_os_error() == Some(libc::ECHILD);
+            return Err(error);
+        }
+        // SAFETY: the storage was zeroed and waitid succeeded; the zero PID also
+        // covers systems that leave the structure unchanged when no exit is pending.
+        let info = unsafe { info.assume_init() };
+        // SAFETY: successful waitid with WEXITED supplies the SIGCHLD layout.
+        Ok(unsafe { info.si_pid() } != 0)
+    }
+
+    fn kill_group(&self) -> io::Result<()> {
+        // SAFETY: spawn created a group led by this child, and the caller just
+        // validated outstanding wait ownership without reaping. Exclusive access
+        // prevents our other wait paths from releasing the PID before this signal.
+        let result = unsafe { libc::kill(-self.pid(), libc::SIGKILL) };
+        if result != 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(error);
+            }
+        }
+        Ok(())
     }
 
     fn try_wait(&mut self) -> io::Result<Option<u32>> {
         if self.exit_code.is_some() {
             return Ok(self.exit_code);
         }
-        let mut status = 0;
-        // SAFETY: self owns this unreaped PID and status points to writable storage.
-        let result = unsafe { libc::waitpid(self.pid, &mut status, libc::WNOHANG) };
-        if result < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if result == 0 {
+        if !self.exit_pending()? {
             return Ok(None);
         }
-        debug_assert_eq!(result, self.pid);
-        Ok(Some(self.cache_status(status)))
+        // Audit #11 TD-45: a plugin helper can outlive its leader. Kill the group before
+        // every reap, including supervision and the reaper; see
+        // drop_removes_helper_after_worker_leader_exits at the Instance seam.
+        self.kill_group()?;
+        #[cfg(target_os = "macos")]
+        let code = {
+            let mut status = 0;
+            // SAFETY: status is writable and the non-reaping probe confirmed this
+            // child exited. Exclusive ownership is held through group kill and reap.
+            let result = unsafe { libc::waitpid(self.pid, &mut status, libc::WNOHANG) };
+            if result < 0 {
+                let error = io::Error::last_os_error();
+                self.ownership_lost = error.raw_os_error() == Some(libc::ECHILD);
+                return Err(error);
+            }
+            if result == 0 {
+                return Ok(None);
+            }
+            if libc::WIFEXITED(status) {
+                libc::WEXITSTATUS(status) as u32
+            } else {
+                (128 + libc::WTERMSIG(status)) as u32
+            }
+        };
+        #[cfg(not(target_os = "macos"))]
+        let code = match self.child.try_wait() {
+            Ok(Some(status)) => status
+                .code()
+                .unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
+                as u32,
+            Ok(None) => return Ok(None),
+            Err(error) => {
+                self.ownership_lost = error.raw_os_error() == Some(libc::ECHILD);
+                return Err(error);
+            }
+        };
+        self.exit_code = Some(code);
+        Ok(Some(code))
     }
 
-    fn wait(&mut self) -> io::Result<u32> {
-        if let Some(code) = self.exit_code {
-            return Ok(code);
+    fn terminate(&mut self) -> io::Result<()> {
+        if self.exit_code.is_some() {
+            return Ok(());
         }
-        loop {
-            let mut status = 0;
-            // SAFETY: self owns this unreaped PID and status points to writable storage.
-            let result = unsafe { libc::waitpid(self.pid, &mut status, 0) };
-            if result == self.pid {
-                return Ok(self.cache_status(status));
-            }
+        self.exit_pending()?;
+        let group_result = self.kill_group();
+        // SAFETY: waitid confirmed outstanding child ownership without reaping;
+        // exclusive access keeps its PID reserved even if it exits during the call.
+        // Address the leader too in case it has moved out of its original group.
+        let result = unsafe { libc::kill(self.pid(), libc::SIGKILL) };
+        if result != 0 {
             let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted {
+            if error.raw_os_error() != Some(libc::ESRCH) {
                 return Err(error);
             }
         }
+        group_result
     }
 }
 
 #[derive(Debug)]
 pub struct ChildProcess {
-    #[cfg(not(target_os = "macos"))]
-    child: Mutex<Child>,
-    #[cfg(target_os = "macos")]
-    child: Mutex<MacChild>,
+    child: Mutex<Option<UnixChild>>,
     // Only the parent retains the write end: death closes it even while a
     // plugin's main thread is blocked inside foreign code.
     _parent: ParentHandle,
-    _sandbox: crate::sandbox::SandboxLaunch,
+    sandbox: Option<crate::sandbox::SandboxLaunch>,
+    #[cfg(test)]
+    suppress_termination: bool,
 }
 
 pub fn spawn_handles(
@@ -433,74 +512,179 @@ pub fn spawn_handles(
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let mut descriptors = Vec::new();
-        for value in values {
-            // Event tokens carry their read/write descriptors in two 32-bit halves.
-            descriptors.push((value & 0xffff_ffff) as i32);
-            if value >> 32 != 0 {
-                descriptors.push((value >> 32) as i32);
-            }
-        }
-        let mut command = Command::new(exe);
-        // A compositor-provided socket descriptor is not among the selected
-        // descriptors, so its number must not reach the worker as WAYLAND_SOCKET:
-        // libwayland would otherwise claim whichever descriptor has that number.
-        command.env_remove("WAYLAND_SOCKET");
-        if let Some(temporary) = sandbox.temporary() {
-            for key in ["TMPDIR", "TMP", "TEMP"] {
-                command.env(key, temporary);
-            }
-        }
-        command
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit());
-        let prepare = move || {
-            // SAFETY: async-signal-safe syscall in the fork child, before exec.
-            if unsafe { libc::setpgid(0, 0) } != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            inherit_only(&descriptors)
-        };
-        // SAFETY: prepare uses only async-signal-safe syscalls and preallocated data.
-        unsafe { command.pre_exec(prepare) };
-        let child = command.spawn()?;
-        Ok(ChildProcess {
-            child: Mutex::new(child),
-            _parent: parent,
-            _sandbox: sandbox,
-        })
+        spawn_handles_unix(
+            exe,
+            args,
+            values,
+            parent,
+            sandbox,
+            #[cfg(test)]
+            false,
+        )
     }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn spawn_handles_unix(
+    exe: &Path,
+    args: &[OsString],
+    values: &[u64],
+    parent: ParentHandle,
+    sandbox: crate::sandbox::SandboxLaunch,
+    #[cfg(test)] force_fallback: bool,
+) -> io::Result<ChildProcess> {
+    let mut descriptors = Vec::new();
+    for value in values {
+        // Event tokens carry their read/write descriptors in two 32-bit halves.
+        descriptors.push((value & 0xffff_ffff) as i32);
+        if value >> 32 != 0 {
+            descriptors.push((value >> 32) as i32);
+        }
+    }
+    let mut command = Command::new(exe);
+    // A compositor-provided socket descriptor is not among the selected
+    // descriptors, so its number must not reach the worker as WAYLAND_SOCKET:
+    // libwayland would otherwise claim whichever descriptor has that number.
+    command.env_remove("WAYLAND_SOCKET");
+    if let Some(temporary) = sandbox.temporary() {
+        for key in ["TMPDIR", "TMP", "TEMP"] {
+            command.env(key, temporary);
+        }
+    }
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
+    // Preparation errors matter only if close_range is unavailable in the child.
+    let fallback =
+        prepare_cloexec_fallback().map_err(|error| error.raw_os_error().unwrap_or(libc::EIO));
+    let prepare = move || {
+        // SAFETY: async-signal-safe syscall in the fork child, before exec.
+        if unsafe { libc::setpgid(0, 0) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        inherit_only(
+            &descriptors,
+            &fallback,
+            #[cfg(test)]
+            force_fallback,
+        )
+    };
+    // SAFETY: prepare uses only async-signal-safe syscalls and preallocated data.
+    unsafe { command.pre_exec(prepare) };
+    let child = command.spawn()?;
+    Ok(ChildProcess {
+        child: Mutex::new(Some(UnixChild {
+            child,
+            exit_code: None,
+            ownership_lost: false,
+        })),
+        _parent: parent,
+        sandbox: Some(sandbox),
+        #[cfg(test)]
+        suppress_termination: false,
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+struct CloexecFallback {
+    end: i32,
+    high: Vec<i32>,
+}
+
+#[cfg(not(target_os = "macos"))]
+fn descriptor_limit() -> io::Result<libc::rlimit> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: limit points to writable initialized storage for one rlimit.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(limit)
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_cloexec_fallback() -> io::Result<CloexecFallback> {
+    // A soft limit can be raised by another thread. The hard limit covers new
+    // descriptors, including std's error pipe created after this snapshot.
+    let end = i32::try_from(descriptor_limit()?.rlim_max)
+        .map_err(|_| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
+    let mut high = Vec::new();
+    for entry in std::fs::read_dir("/proc/self/fd")? {
+        let name = entry?.file_name();
+        let fd = name
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+            .filter(|fd| *fd >= 0)
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EIO))?;
+        if fd >= end && fd >= 3 {
+            high.push(fd);
+        }
+    }
+    // Audit #11 TD-44: preexisting fds survive even lowering the hard limit. Keep them
+    // separately; see fallback_excludes_descriptor_opened_before_limit_was_lowered.
+    Ok(CloexecFallback { end, high })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn prepare_cloexec_fallback() -> io::Result<CloexecFallback> {
+    Err(io::Error::from_raw_os_error(libc::ENOTSUP))
 }
 
 /// Marks every descriptor from 3 upwards close-on-exec, then clears the flag on
 /// the selection. Nothing is closed before exec, so std's own error pipe and the
 /// selected descriptors stay valid. Runs in the fork child: raw syscalls only.
 #[cfg(not(target_os = "macos"))]
-fn inherit_only(descriptors: &[i32]) -> io::Result<()> {
-    if !mark_all_cloexec() {
-        let mut limit = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        // SAFETY: writable initialized rlimit record; no allocation.
-        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
-            return Err(io::Error::last_os_error());
+fn inherit_only(
+    descriptors: &[i32],
+    fallback: &Result<CloexecFallback, i32>,
+    #[cfg(test)] force_fallback: bool,
+) -> io::Result<()> {
+    #[cfg(not(test))]
+    let force_fallback = false;
+    if force_fallback || !mark_all_cloexec() {
+        let fallback = fallback
+            .as_ref()
+            .map_err(|error| io::Error::from_raw_os_error(*error))?;
+        // No parent threads remain in this fork child's descriptor table. Refuse
+        // a raised hard limit: the prepared coverage no longer proves completeness.
+        // This covers ordinary concurrent opens/dups and soft-limit changes, not
+        // privileged peers raising then restoring the hard limit during preparation.
+        if descriptor_limit()?.rlim_max > fallback.end as libc::rlim_t {
+            return Err(io::Error::from_raw_os_error(libc::EAGAIN));
         }
-        // Kernels without close_range (before 5.11) walk the table instead. The
-        // cap keeps an unlimited soft limit from turning this into a long loop.
-        let end = limit.rlim_cur.min(1 << 20) as i32;
-        for fd in 3..end {
-            // SAFETY: flag-only operation; a closed descriptor merely yields EBADF.
-            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+        for fd in (3..fallback.end).chain(fallback.high.iter().copied()) {
+            if let Err(error) = set_cloexec(fd, true)
+                && error.raw_os_error() != Some(libc::EBADF)
+            {
+                return Err(error);
+            }
         }
     }
     for fd in descriptors {
-        // SAFETY: selected inherited descriptor, no allocation or pointer access.
-        if unsafe { libc::fcntl(*fd, libc::F_SETFD, 0) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        set_cloexec(*fd, false)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_cloexec(fd: i32, cloexec: bool) -> io::Result<()> {
+    // SAFETY: scalar-only query; fcntl validates fd, including unselected holes.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let flags = if cloexec {
+        flags | libc::FD_CLOEXEC
+    } else {
+        flags & !libc::FD_CLOEXEC
+    };
+    // SAFETY: flag-only operation on a queried fd, with every other flag preserved.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags) } < 0 {
+        return Err(io::Error::last_os_error());
     }
     Ok(())
 }
@@ -526,99 +710,115 @@ fn mark_all_cloexec() -> bool {
 
 impl ChildProcess {
     pub fn pid(&self) -> u32 {
-        #[cfg(target_os = "macos")]
-        {
-            self.child.lock().unwrap_or_else(|e| e.into_inner()).pid as u32
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            self.child.lock().unwrap_or_else(|e| e.into_inner()).id()
-        }
+        self.child
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .unwrap()
+            .pid() as u32
     }
     pub fn exit_code(&self) -> io::Result<Option<u32>> {
-        #[cfg(target_os = "macos")]
-        {
-            self.child
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .try_wait()
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            Ok(self
-                .child
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .try_wait()?
-                .map(|s| s.code().unwrap_or_else(|| 128 + s.signal().unwrap_or(0)) as u32))
+        self.child
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+            .unwrap()
+            .try_wait()
+    }
+    /// Waits for confirmed exit, returning `false` only when the timeout expires.
+    /// OS errors are returned immediately rather than treated as timeouts.
+    pub fn wait_for(&self, timeout: Duration) -> io::Result<bool> {
+        let start = Instant::now();
+        loop {
+            if self.exit_code()?.is_some() {
+                return Ok(true);
+            }
+            let remaining = timeout.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                return Ok(false);
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(2)));
         }
     }
+    /// Legacy boolean wait; use [`Self::wait_for`] to handle OS errors.
+    ///
+    /// # Panics
+    ///
+    /// Panics if waiting fails. This fail-loud policy no longer disguises an OS
+    /// error as a timeout.
     pub fn wait(&self, timeout: Duration) -> bool {
-        let end = Instant::now() + timeout;
-        loop {
-            if self.exit_code().ok().flatten().is_some() {
-                return true;
-            }
-            if Instant::now() >= end {
-                return false;
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        }
+        self.wait_for(timeout)
+            .unwrap_or_else(|error| panic!("failed to wait for child process exit: {error}"))
     }
     pub fn terminate(&self, _: u32) -> io::Result<()> {
-        #[cfg(target_os = "macos")]
-        {
-            let mut child = self.child.lock().unwrap_or_else(|e| e.into_inner());
-            if child.try_wait()?.is_some() {
-                return Ok(());
-            }
-            // SAFETY: spawn put this owned, unreaped child in its own process group.
-            // Holding the lock prevents another thread reaping/reusing its PID.
-            let _ = unsafe { libc::kill(-child.pid, libc::SIGKILL) };
-            // SAFETY: the same owned, unreaped child, whatever process group it has
-            // joined since; a worker cannot escape a signal addressed to its PID.
-            let result = unsafe { libc::kill(child.pid, libc::SIGKILL) };
-            if result != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
+        #[cfg(test)]
+        if self.suppress_termination {
+            return Ok(());
         }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let mut child = self.child.lock().unwrap_or_else(|e| e.into_inner());
-            if child.try_wait()?.is_some() {
-                return Ok(());
-            }
-            let pid = child.id() as i32;
-            // SAFETY: spawn put this owned, unreaped child in its own process group.
-            // Holding the lock prevents another thread reaping/reusing its PID.
-            let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
-            // SAFETY: the same owned, unreaped child, whatever process group it has
-            // joined since; a worker cannot escape a signal addressed to its PID.
-            let result = unsafe { libc::kill(pid, libc::SIGKILL) };
-            if result != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        }
+        self.child
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+            .unwrap()
+            .terminate()
     }
 }
+
+// Debugger-visible diagnostic for the last-resort leak below. Logging to stderr
+// in Drop could itself block indefinitely; this counter performs no I/O.
+static REAPER_SPAWN_FAILURES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 impl Drop for ChildProcess {
     fn drop(&mut self) {
         let _ = self.terminate(0);
-        #[cfg(target_os = "macos")]
-        let _ = self
+        match self.wait_for(Duration::from_millis(100)) {
+            Ok(true) => return,
+            // An external waiter has already reaped the child. Never signal that
+            // PID again; it may now belong to an unrelated process.
+            Err(error) if error.raw_os_error() == Some(libc::ECHILD) => return,
+            Ok(false) | Err(_) => {}
+        }
+        // Only Drop takes these options, after the last public method call.
+        let child = self
             .child
             .get_mut()
             .unwrap_or_else(|e| e.into_inner())
-            .wait();
-        #[cfg(not(target_os = "macos"))]
-        let _ = self
-            .child
-            .get_mut()
-            .unwrap_or_else(|e| e.into_inner())
-            .wait();
+            .take()
+            .unwrap();
+        let sandbox = self.sandbox.take().unwrap();
+        // Keep a second owner until spawn succeeds: Builder::spawn drops its
+        // closure on failure, which must not delete a live child's TempDir.
+        let retained = Arc::new(Mutex::new(Some((child, sandbox))));
+        let task = Arc::clone(&retained);
+        let spawned = std::thread::Builder::new()
+            .name("vst-audio-child-reaper".into())
+            .spawn(move || {
+                let (mut child, _sandbox) = task
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take()
+                    .unwrap();
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(_)) => break,
+                        Err(error) if error.raw_os_error() == Some(libc::ECHILD) => break,
+                        Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                        Err(_) => {
+                            // An error is not proof of exit. Retain ownership and
+                            // retry the non-reaping ownership check off the drop thread.
+                            std::thread::sleep(Duration::from_secs(1));
+                        }
+                    }
+                }
+                // The sandbox is released only after wait confirms exit/reaping.
+            });
+        if spawned.is_err() {
+            // Last-resort resource leak only on thread-spawn failure: preserving
+            // the owned child and its directory is safer than premature cleanup.
+            std::mem::forget(retained);
+            REAPER_SPAWN_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 
@@ -649,6 +849,188 @@ mod tests {
         .unwrap();
         assert!(child.wait(Duration::from_secs(10)), "shell did not exit");
         child.exit_code().unwrap().unwrap()
+    }
+
+    #[test]
+    fn drop_bounds_wait_and_reaps_before_removing_sandbox() {
+        let sandbox = crate::sandbox::SandboxLaunch::new(
+            Some(&crate::sandbox::SandboxPolicy::default()),
+            Path::new("/bin/sleep"),
+        )
+        .unwrap();
+        let temporary = sandbox.temporary().unwrap().to_owned();
+        let mut child = spawn_handles(
+            Path::new("/bin/sleep"),
+            &[OsString::from("1")],
+            &[],
+            parent_handle().unwrap(),
+            sandbox,
+        )
+        .unwrap();
+        // TD-43: model a worker that remains alive after termination is requested.
+        // The hook belongs to this child only; parallel tests still terminate normally.
+        child.suppress_termination = true;
+        let pid = child.pid() as libc::pid_t;
+        let start = Instant::now();
+        drop(child);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "Drop blocked for {elapsed:?}"
+        );
+        assert!(temporary.is_dir(), "sandbox removed before child exit");
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        // SAFETY: pid identifies this test's child and info is writable siginfo_t
+        // storage. WNOWAIT observes exit without stealing the reaper's ownership.
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        assert_eq!(result, 0, "child was already reaped");
+        // SAFETY: waitid succeeded and initialized the zeroed siginfo_t storage.
+        let info = unsafe { info.assume_init() };
+        // SAFETY: successful waitid supplies the SIGCHLD layout accessed by si_pid.
+        assert_eq!(unsafe { info.si_pid() }, 0, "child already exited");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while temporary.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !temporary.exists(),
+            "reaper did not remove sandbox after exit"
+        );
+        let mut status = 0;
+        // SAFETY: status is writable and waitpid validates this test's child PID.
+        // Only check after cleanup, so this probe cannot reap instead of the reaper.
+        let result = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        assert_eq!(result, -1, "child was not reaped before sandbox cleanup");
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+        eprintln!("Drop returned in {elapsed:?}; child reaped and sandbox removed");
+    }
+
+    #[test]
+    fn wait_for_preserves_echild_after_external_reap() {
+        let sandbox = crate::sandbox::SandboxLaunch::new(None, Path::new("/bin/sh")).unwrap();
+        let args = [OsString::from("-c"), OsString::from("exit 0")];
+        let child = spawn_handles(
+            Path::new("/bin/sh"),
+            &args,
+            &[],
+            parent_handle().unwrap(),
+            sandbox,
+        )
+        .unwrap();
+        let pid = child.pid() as libc::pid_t;
+        let mut status = 0;
+        loop {
+            // SAFETY: pid is this test's actual child and status is writable. No
+            // other thread uses this ChildProcess; this deliberately reaps it externally.
+            let result = unsafe { libc::waitpid(pid, &mut status, 0) };
+            if result == pid {
+                break;
+            }
+            let error = io::Error::last_os_error();
+            assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        }
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+
+        let start = Instant::now();
+        let result = child.wait_for(Duration::from_secs(2));
+        let elapsed = start.elapsed();
+        let legacy = std::panic::catch_unwind(|| child.wait(Duration::ZERO));
+        // Drop's non-reaping probe returns ECHILD before signalling, and its
+        // bounded wait also returns ECHILD. Never signal an already-reaped PID.
+        drop(child);
+        let error = result.expect_err("external reap must report ECHILD, not a timeout");
+        assert_eq!(error.raw_os_error(), Some(libc::ECHILD));
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "error was delayed: {elapsed:?}"
+        );
+        let panic = legacy.expect_err("legacy wait must panic on ECHILD");
+        let message = panic.downcast_ref::<String>().unwrap();
+        assert!(message.contains("failed to wait for child process exit"));
+    }
+
+    #[test]
+    fn fallback_excludes_descriptor_opened_before_limit_was_lowered() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "runtime::tests::lowered_limit_spawn_subprocess",
+                "--ignored",
+                "--nocapture",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "isolated descriptor regression failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+    }
+
+    #[test]
+    #[ignore = "rlimit mutation runs only in an isolated subprocess"]
+    fn lowered_limit_spawn_subprocess() {
+        use std::io::Read;
+
+        let file = File::open("/dev/null").unwrap();
+        // SAFETY: file is an owned open fd; F_DUPFD returns a new inheritable fd.
+        let high = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, 256) };
+        assert!(
+            high >= 256,
+            "could not create high fd: {}",
+            io::Error::last_os_error()
+        );
+        // SAFETY: successful F_DUPFD returned unique ownership of high.
+        let high = unsafe { OwnedFd::from_raw_fd(high) };
+        let limit = libc::rlimit {
+            rlim_cur: 64,
+            rlim_max: 128,
+        };
+        // SAFETY: initialized readable rlimit; only this isolated test process is affected.
+        let result = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) };
+        assert_eq!(result, 0, "could not lower descriptor limit");
+        for force_fallback in [true, false] {
+            let mut selected = Pipe::create(true).unwrap();
+            let script = format!(
+                "if test -e /proc/self/fd/{}; then exit 73; fi; printf selected-ok > /proc/self/fd/{}",
+                high.as_raw_fd(),
+                selected.child_value()
+            );
+            let sandbox = crate::sandbox::SandboxLaunch::new(None, Path::new("/bin/sh")).unwrap();
+            let child = spawn_handles_unix(
+                Path::new("/bin/sh"),
+                &[OsString::from("-c"), OsString::from(script)],
+                &[selected.child_value() as u64],
+                parent_handle().unwrap(),
+                sandbox,
+                force_fallback,
+            )
+            .expect("descriptor filtering must spawn successfully");
+            assert!(child.wait(Duration::from_secs(10)), "probe did not exit");
+            assert_eq!(
+                child.exit_code().unwrap(),
+                Some(0),
+                "high unselected descriptor leaked (force_fallback={force_fallback})"
+            );
+            drop(selected.child);
+            let mut received = [0; 11];
+            selected.parent.read_exact(&mut received).unwrap();
+            assert_eq!(&received, b"selected-ok", "selected fd was not usable");
+        }
     }
 
     #[test]

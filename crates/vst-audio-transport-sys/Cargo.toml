@@ -28,7 +28,6 @@ tempfile = "3"
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true
 vst-audio-ring.workspace = true
-thiserror.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

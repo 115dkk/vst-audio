@@ -18,7 +18,7 @@ impl Event {
     pub fn create() -> windows::core::Result<Self> {
         let attributes = SECURITY_ATTRIBUTES {
             nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-            bInheritHandle: true.into(),
+            bInheritHandle: false.into(),
             ..Default::default()
         };
         // SAFETY: valid attributes; unnamed, auto-reset, initially unsignalled event.
@@ -73,9 +73,9 @@ impl Wait for Event {
     }
 }
 
-/// A shared [`Event`] that is itself a [`Signal`] and a [`Wait`]. `Arc<Event>`
-/// cannot be one here (`Arc` is not a local type), so an owner that needs
-/// `Box<dyn Signal>`, such as the engine's `RingUpmixer`, holds this instead.
+/// A shared [`Event`] that is itself a [`Signal`] and a [`Wait`]. The ring crate
+/// already implements `Signal for Arc<T>`, but not `Wait for Arc<T>`; this wrapper
+/// retains shared waiting and compatibility with existing callers (audit #11 TD-80).
 #[derive(Clone, Debug)]
 pub struct SharedEvent(pub Arc<Event>);
 impl Signal for SharedEvent {

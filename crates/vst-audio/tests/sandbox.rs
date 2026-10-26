@@ -58,6 +58,14 @@ fn sandbox_probes_and_audio() {
             [loopback, 0, 0],
         ),
         (
+            "processes",
+            Some(SandboxPolicy {
+                processes: true,
+                ..Default::default()
+            }),
+            [0, 0, 1],
+        ),
+        (
             "writable-outside",
             Some(SandboxPolicy {
                 writable: vec![unrelated.path().into()],
@@ -104,7 +112,8 @@ fn sandbox_probes_and_audio() {
             if let Some(report) = &started.sandbox {
                 assert!(!report.mechanism.is_empty());
                 assert_eq!(report.network_denied, !policy.as_ref().unwrap().network);
-                assert!(report.processes_denied && report.writes_restricted);
+                assert_eq!(report.processes_denied, !policy.as_ref().unwrap().processes);
+                assert!(report.writes_restricted);
             }
             let request = started.control.get_state().unwrap();
             let Message::State { blob } = response(&mut started, request) else {
