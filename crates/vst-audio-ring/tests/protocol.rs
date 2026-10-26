@@ -227,6 +227,34 @@ fn late_blocks_are_processed_without_skipping() {
 }
 
 #[test]
+fn in_process_event_wakes_for_signal_and_peer_loss_under_race() {
+    for peer_loss in [false, true] {
+        for _ in 0..1_000 {
+            let event = Arc::new(InProcessEvent::new());
+            let waiter = Arc::clone(&event);
+            let waiting = thread::spawn(move || {
+                vst_audio_ring::Wait::wait(waiter.as_ref(), Duration::from_millis(20))
+            });
+            thread::yield_now();
+            if peer_loss {
+                event.peer_gone();
+            } else {
+                vst_audio_ring::Signal::signal(&event);
+            }
+            let result = waiting.join().unwrap();
+            assert_eq!(
+                result,
+                if peer_loss {
+                    Waited::PeerGone
+                } else {
+                    Waited::Signalled
+                }
+            );
+        }
+    }
+}
+
+#[test]
 fn fault_code_and_peer_gone_are_observable() {
     let storage = RegionBuf::new(geometry(1)).unwrap();
     let event = InProcessEvent::new();

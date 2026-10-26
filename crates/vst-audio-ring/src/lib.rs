@@ -42,7 +42,7 @@
 use std::array;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
 mod block;
@@ -286,13 +286,14 @@ pub enum Waited {
 struct EventInner {
     generation: AtomicU64,
     gone: AtomicBool,
+    contended: AtomicBool,
     observed: Mutex<u64>,
     changed: Condvar,
 }
 
-/// Same-process event for tests and adapters. `signal` only performs an atomic
-/// increment and a condition-variable notification; it neither locks nor
-/// allocates.
+/// Same-process event for tests and adapters. `signal` never blocks or allocates;
+/// it attempts the condition-variable mutex and uses the waiter's bounded atomic
+/// recheck when the waiter owns it.
 #[derive(Clone, Debug)]
 pub struct InProcessEvent(Arc<EventInner>);
 
@@ -301,6 +302,7 @@ impl InProcessEvent {
         Self(Arc::new(EventInner {
             generation: AtomicU64::new(0),
             gone: AtomicBool::new(false),
+            contended: AtomicBool::new(false),
             observed: Mutex::new(0),
             changed: Condvar::new(),
         }))
@@ -308,7 +310,38 @@ impl InProcessEvent {
 
     pub fn peer_gone(&self) {
         self.0.gone.store(true, Ordering::Release);
-        self.0.changed.notify_all();
+        self.notify(false);
+    }
+
+    fn notify(&self, one: bool) {
+        // A notifier that acquires `observed` cannot race between the waiter's
+        // predicate check and parking. `signal` must remain non-blocking, so a
+        // contended mutex sets a handoff flag that makes the waiter skip parking.
+        match self.0.observed.try_lock() {
+            Ok(_guard) => {
+                if one {
+                    self.0.changed.notify_one();
+                } else {
+                    self.0.changed.notify_all();
+                }
+            }
+            Err(TryLockError::Poisoned(error)) => {
+                let _guard = error.into_inner();
+                if one {
+                    self.0.changed.notify_one();
+                } else {
+                    self.0.changed.notify_all();
+                }
+            }
+            Err(TryLockError::WouldBlock) => {
+                self.0.contended.store(true, Ordering::Release);
+                if one {
+                    self.0.changed.notify_one();
+                } else {
+                    self.0.changed.notify_all();
+                }
+            }
+        }
     }
 }
 
@@ -321,7 +354,7 @@ impl Default for InProcessEvent {
 impl Signal for InProcessEvent {
     fn signal(&self) {
         self.0.generation.fetch_add(1, Ordering::Release);
-        self.0.changed.notify_one();
+        self.notify(true);
     }
 }
 
@@ -336,25 +369,42 @@ impl Wait for InProcessEvent {
             *observed = current;
             return Waited::Signalled;
         }
-        let (mut observed, result) = self
-            .0
-            .changed
-            .wait_timeout_while(observed, timeout, |seen| {
-                !self.0.gone.load(Ordering::Acquire)
-                    && self.0.generation.load(Ordering::Acquire) == *seen
-            })
-            .unwrap_or_else(|e| e.into_inner());
-        if self.0.gone.load(Ordering::Acquire) {
-            Waited::PeerGone
-        } else {
+        if self.0.contended.swap(false, Ordering::AcqRel) {
             let current = self.0.generation.load(Ordering::Acquire);
             if current != *observed {
                 *observed = current;
-                Waited::Signalled
-            } else if result.timed_out() {
-                Waited::TimedOut
-            } else {
-                Waited::Signalled
+                return Waited::Signalled;
+            }
+            if self.0.gone.load(Ordering::Acquire) {
+                return Waited::PeerGone;
+            }
+        }
+        let deadline = Instant::now() + timeout;
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return Waited::TimedOut;
+            }
+            let slice = deadline
+                .saturating_duration_since(now)
+                .min(Duration::from_millis(1));
+            let (next_observed, _) = self
+                .0
+                .changed
+                .wait_timeout_while(observed, slice, |seen| {
+                    !self.0.gone.load(Ordering::Acquire)
+                        && !self.0.contended.swap(false, Ordering::AcqRel)
+                        && self.0.generation.load(Ordering::Acquire) == *seen
+                })
+                .unwrap_or_else(|e| e.into_inner());
+            observed = next_observed;
+            if self.0.gone.load(Ordering::Acquire) {
+                return Waited::PeerGone;
+            }
+            let current = self.0.generation.load(Ordering::Acquire);
+            if current != *observed {
+                *observed = current;
+                return Waited::Signalled;
             }
         }
     }
