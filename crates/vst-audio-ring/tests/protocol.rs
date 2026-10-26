@@ -5,8 +5,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use vst_audio_ring::{
-    Consumer, Fault, Geometry, HeaderError, InProcessEvent, Pipeline, Producer, Publish, Region,
-    RegionBuf, RegionMemory, State, Waited,
+    Consumer, Event, EventBuffer, Fault, Geometry, HeaderError, InProcessEvent, Pipeline, Producer,
+    Publish, Region, RegionBuf, RegionMemory, State, Waited,
 };
 
 fn geometry(lanes: u32) -> Geometry {
@@ -361,6 +361,54 @@ fn cached_geometry_ignores_later_header_mutation() {
     let mut buffer = vec![0.0; samples];
     assert!(consumer.slot_mut(0, 2, &mut buffer, |_| {}));
     assert_eq!(buffer[0], 7.0);
+}
+
+#[test]
+fn corrupt_output_event_packets_are_rejected_and_clear_the_buffer() {
+    const CONTEXT_WORDS: usize = 32;
+    const PACKET_WORDS: usize = 2 + vst_audio_ring::MAX_EVENTS * 72;
+    const EVENT_WORDS: usize = 72;
+
+    let g = geometry(1);
+    for (count, kind, sysex_len) in [(257, 1, 0), (1, 5, 0), (1, 4, 0), (1, 4, 257)] {
+        let total = g.total_bytes().unwrap();
+        let prefix: Vec<_> = (0..g.mapping_split(total).unwrap() / 4)
+            .map(|_| std::sync::atomic::AtomicU32::new(0))
+            .collect();
+        let counters: Vec<_> = (0..vst_audio_ring::COUNTER_WORDS)
+            .map(|_| std::sync::atomic::AtomicU64::new(0))
+            .collect();
+        let event = InProcessEvent::new();
+        let region = Region::new(&prefix, &counters);
+        let mut producer = Producer::new(region, [None, None], &event);
+        producer.announce(g, 1).unwrap();
+        let mut consumer = Consumer::new(region, &event, [None, None]);
+        consumer.validate_and_ready(2).unwrap();
+        assert_eq!(producer.try_publish(0, 1, |_| {}), Publish::Published);
+        let mut valid = EventBuffer::default();
+        valid.push(Event::midi(3, 0, [0x90, 60, 100]));
+        assert!(consumer.output_packet(0, 1, &valid));
+        consumer.complete(0, 1);
+
+        let prefix_bytes = g.total_bytes().unwrap() - vst_audio_ring::COUNTER_BYTES;
+        let slot_words = (prefix_bytes - vst_audio_ring::HEADER_BYTES) / g.slots as usize / 4;
+        let output = vst_audio_ring::HEADER_BYTES / 4
+            + slot_words
+            + g.samples_per_slot()
+            + CONTEXT_WORDS
+            + PACKET_WORDS;
+        prefix[output].store(count, std::sync::atomic::Ordering::Relaxed);
+        prefix[output + 2].store(kind, std::sync::atomic::Ordering::Relaxed);
+        prefix[output + 2 + 3].store(sysex_len, std::sync::atomic::Ordering::Relaxed);
+        debug_assert!(output + 2 + EVENT_WORDS <= prefix.len());
+
+        let mut decoded = valid.clone();
+        assert!(producer.try_read(0, 1, |slot| {
+            assert!(!slot.output_events(&mut decoded));
+        }));
+        assert!(decoded.as_slice().is_empty());
+        assert_eq!(decoded.dropped, 0);
+    }
 }
 
 #[test]

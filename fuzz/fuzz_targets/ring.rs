@@ -53,6 +53,23 @@ fuzz_target!(|data: &[u8]| {
         let mut events = EventBuffer::default();
         let _ = consumer.input_packet(0, 1, &mut context, &mut events);
         let _ = consumer.output_packet(0, 1, &events);
+        const CONTEXT_WORDS: usize = 32;
+        const PACKET_WORDS: usize = 2 + MAX_EVENTS * 72;
+        let prefix_words = geometry.mapping_split(total).unwrap() / 4;
+        let slot_words = (prefix_words - HEADER_BYTES / 4) / geometry.slots as usize;
+        let output_start = HEADER_BYTES / 4
+            + slot_words
+            + geometry.samples_per_slot() * geometry.sample_format.words()
+            + CONTEXT_WORDS
+            + PACKET_WORDS;
+        for mutation in data.as_chunks::<8>().0 {
+            let index = output_start
+                + u32::from_le_bytes(mutation[..4].try_into().unwrap()) as usize % PACKET_WORDS;
+            words[index].store(
+                u32::from_le_bytes(mutation[4..].try_into().unwrap()),
+                Ordering::Relaxed,
+            );
+        }
         consumer.complete(0, 1);
         let _ = producer.try_read(0, 1, |slot| {
             let _ = slot.output_events(&mut events);
