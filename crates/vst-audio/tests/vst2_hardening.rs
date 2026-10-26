@@ -506,6 +506,7 @@ fn bad_parameter_getter_does_not_replace_recovery_checkpoint() {
         }
     }
     let bad_save = instance.controller().request(Command::SaveState).unwrap();
+    let mut request_failed = false;
     loop {
         match next_event(&instance) {
             HostEvent::State { request, bytes } if request == Some(bad_save) => {
@@ -514,9 +515,18 @@ fn bad_parameter_getter_does_not_replace_recovery_checkpoint() {
             HostEvent::Completed { request } if request == bad_save => {
                 panic!("bad getter SaveState completed successfully")
             }
-            // Native GetState errors are Faults, exposed as instance failure,
-            // not per-request errors. Recover must retain the last valid save.
+            // A native GetState error is a Fault: the request it answers fails
+            // first (audit #11 TD-11), then the instance. Recover must retain the
+            // last valid save.
+            HostEvent::RequestFailed { request, reason } if request == bad_save => {
+                assert!(reason.contains("invalid parameter state value"), "{reason}");
+                request_failed = true;
+            }
             HostEvent::Failed { reason } => {
+                assert!(
+                    request_failed,
+                    "the failed SaveState must end before the instance fails"
+                );
                 assert!(reason.contains("invalid parameter state value"), "{reason}");
                 break;
             }
