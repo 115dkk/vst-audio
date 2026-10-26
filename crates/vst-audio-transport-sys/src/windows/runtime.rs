@@ -448,15 +448,10 @@ impl ChildProcess {
     pub fn wait_for(&self, timeout: Duration) -> std::io::Result<bool> {
         self.resources().wait_for(timeout)
     }
-    /// Legacy boolean wait; use [`Self::wait_for`] to handle OS errors.
-    ///
-    /// # Panics
-    ///
-    /// Panics if waiting fails. This fail-loud policy no longer disguises an OS
-    /// error as a timeout.
+    /// Legacy boolean wait: `true` only for a confirmed exit, so an OS error reads
+    /// as `false`, as it did before. Use [`Self::wait_for`] to tell the two apart.
     pub fn wait(&self, timeout: Duration) -> bool {
-        self.wait_for(timeout)
-            .unwrap_or_else(|error| panic!("failed to wait for child process exit: {error}"))
+        self.wait_for(timeout).unwrap_or(false)
     }
     pub fn exit_code(&self) -> windows::core::Result<Option<u32>> {
         if !self
@@ -908,9 +903,8 @@ mod tests {
             error.code(),
             windows::core::HRESULT::from_win32(ERROR_ACCESS_DENIED.0)
         );
-        let panic = std::panic::catch_unwind(|| child.wait(Duration::ZERO)).unwrap_err();
-        let message = panic.downcast_ref::<String>().unwrap();
-        assert!(message.contains("failed to wait for child process exit"));
+        // The supervisor calls the legacy wait; an OS error must not panic it.
+        assert!(!child.wait(Duration::ZERO));
         // This artificial object owns no child: it only has a query handle to
         // ourselves and an empty job. Do not start an endless reaper for self.
         drop(child.resources.take());

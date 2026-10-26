@@ -740,15 +740,10 @@ impl ChildProcess {
             std::thread::sleep(remaining.min(Duration::from_millis(2)));
         }
     }
-    /// Legacy boolean wait; use [`Self::wait_for`] to handle OS errors.
-    ///
-    /// # Panics
-    ///
-    /// Panics if waiting fails. This fail-loud policy no longer disguises an OS
-    /// error as a timeout.
+    /// Legacy boolean wait: `true` only for a confirmed exit, so an OS error reads
+    /// as `false`, as it did before. Use [`Self::wait_for`] to tell the two apart.
     pub fn wait(&self, timeout: Duration) -> bool {
-        self.wait_for(timeout)
-            .unwrap_or_else(|error| panic!("failed to wait for child process exit: {error}"))
+        self.wait_for(timeout).unwrap_or(false)
     }
     pub fn terminate(&self, _: u32) -> io::Result<()> {
         #[cfg(test)]
@@ -945,7 +940,8 @@ mod tests {
         let start = Instant::now();
         let result = child.wait_for(Duration::from_secs(2));
         let elapsed = start.elapsed();
-        let legacy = std::panic::catch_unwind(|| child.wait(Duration::ZERO));
+        // The supervisor calls the legacy wait; an OS error must not panic it.
+        let legacy = child.wait(Duration::ZERO);
         // Drop's non-reaping probe returns ECHILD before signalling, and its
         // bounded wait also returns ECHILD. Never signal an already-reaped PID.
         drop(child);
@@ -955,9 +951,7 @@ mod tests {
             elapsed < Duration::from_secs(1),
             "error was delayed: {elapsed:?}"
         );
-        let panic = legacy.expect_err("legacy wait must panic on ECHILD");
-        let message = panic.downcast_ref::<String>().unwrap();
-        assert!(message.contains("failed to wait for child process exit"));
+        assert!(!legacy, "legacy wait reports an unconfirmed exit as false");
     }
 
     #[test]
