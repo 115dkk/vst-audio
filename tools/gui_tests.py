@@ -16,7 +16,8 @@ if rounds <= 0:
 worker, vst2, vst3 = prepare()
 subprocess.run(["cargo", "build", "--locked", "--manifest-path",
                 "examples/gui/Cargo.toml", "--workspace"], cwd=ROOT, check=True)
-gui_target = target_directory() / "debug"
+# The GUI consumers are their own workspace with their own target directory.
+gui_target = target_directory(workspace=ROOT / "examples/gui") / "debug"
 extension = ".exe" if sys.platform == "win32" else ""
 fixtures = [vst2, vst3]
 output = ROOT / "test-results"

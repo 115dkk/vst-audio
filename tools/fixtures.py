@@ -37,8 +37,9 @@ def copy_fresh(source, target):
     shutil.copyfile(source,staged)
     os.replace(staged,target)
 
-def target_directory(target=None):
-    directory=Path(os.environ.get("CARGO_TARGET_DIR",ROOT/"target"))
+def target_directory(target=None, workspace=ROOT):
+    """Cargo's output directory for `workspace`, after CARGO_TARGET_DIR and CARGO_BUILD_TARGET."""
+    directory=Path(os.environ.get("CARGO_TARGET_DIR",workspace/"target"))
     target=target or os.environ.get("CARGO_BUILD_TARGET")
     return directory/target if target else directory
 
