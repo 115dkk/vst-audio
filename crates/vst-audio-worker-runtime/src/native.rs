@@ -287,6 +287,18 @@ impl Plugin for Vst2 {
     }
 }
 
+fn finish_audio(
+    result: Result<(), StartError>,
+    audio: Option<thread::JoinHandle<()>>,
+) -> Result<(), StartError> {
+    let join = audio.map(thread::JoinHandle::join);
+    match (result, join) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Some(Err(_))) => Err(StartError("audio thread panicked".into())),
+        (Ok(()), _) => Ok(()),
+    }
+}
+
 pub fn host_main(args: Args) -> Result<(), StartError> {
     runtime::suppress_error_dialogs();
     #[cfg(target_os = "linux")]
@@ -780,9 +792,7 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
     })();
     stop.store(true, Ordering::Release);
     work.signal();
-    if let Some(audio) = audio {
-        let _ = audio.join();
-    }
+    let result = finish_audio(result, audio);
     if let Some(plugin) = plugin.as_mut() {
         plugin.deactivate();
     }
@@ -793,6 +803,23 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
 mod tests {
     use super::*;
     use vst_audio_protocol::{BusInfo, BusKind};
+
+    #[test]
+    fn finish_reports_audio_thread_panic_without_hiding_an_earlier_error() {
+        let panic = thread::spawn(|| panic!("audio panic"));
+        assert_eq!(
+            finish_audio(Ok(()), Some(panic)).unwrap_err().to_string(),
+            "audio thread panicked"
+        );
+
+        let panic = thread::spawn(|| panic!("audio panic"));
+        assert_eq!(
+            finish_audio(Err(StartError("earlier failure".into())), Some(panic))
+                .unwrap_err()
+                .to_string(),
+            "earlier failure"
+        );
+    }
 
     #[test]
     fn legacy_configure_preserves_declared_instrument_buses() {
