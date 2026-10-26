@@ -728,6 +728,14 @@ impl PluginProcess {
         options: &ProcessingOptions,
         state: Option<&[u8]>,
     ) -> Result<Started, StartError> {
+        // Refuse a state SetState could never carry before starting a worker for it
+        // (audit #11 TD-69), as set_state and RestoreState already do.
+        if state.is_some_and(|state| state.len() > vst_audio_protocol::MAX_STATE_BODY_BYTES) {
+            return Err(StartError::new(
+                StartErrorKind::InvalidInput,
+                "state too large",
+            ));
+        }
         if options.slots > MAX_SLOTS || !options.slots.is_power_of_two() || options.slots < 2 {
             return Err(StartError::new(
                 StartErrorKind::InvalidInput,
@@ -1085,6 +1093,23 @@ fn spawn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_initial_state_is_refused_before_a_worker_starts() {
+        // Audit #11 TD-69: no worker exists at this path, so only a check made
+        // before spawning can answer with the state error.
+        let error = PluginProcess::start_configured(
+            Path::new("/nonexistent/vst-audio-worker"),
+            Path::new("/nonexistent/plugin.vst3"),
+            PluginFormat::Vst3,
+            None,
+            &ProcessingOptions::default(),
+            Some(&vec![0; vst_audio_protocol::MAX_STATE_BODY_BYTES + 1]),
+        )
+        .expect_err("an oversized state must be refused");
+        assert_eq!(error.kind(), StartErrorKind::InvalidInput);
+        assert_eq!(error.to_string(), "state too large");
+    }
     #[cfg(unix)]
     use std::io;
     use vst_audio_protocol::Bus;
