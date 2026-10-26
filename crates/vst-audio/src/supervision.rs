@@ -456,6 +456,16 @@ pub(crate) fn supervise(
                                 emit(&events, &shared, HostEvent::LatencyChanged(frames))
                             }
                             Message::Fault { text, .. } => {
+                                if let Some(request) = request {
+                                    emit(
+                                        &events,
+                                        &shared,
+                                        HostEvent::RequestFailed {
+                                            request,
+                                            reason: text.clone(),
+                                        },
+                                    );
+                                }
                                 shared.set_lifecycle(Lifecycle::Failed);
                                 failure_reported = true;
                                 emit(&events, &shared, HostEvent::Failed { reason: text });
