@@ -638,6 +638,14 @@ fn encode_message(message: &Message, out: &mut Vec<u8>) -> Result<(), CodecError
             put_u32(out, *total);
             put_u16(out, entries.len() as u16);
             for entry in entries {
+                if !entry.value.is_finite()
+                    || !(0.0..=1.0).contains(&entry.value)
+                    || entry
+                        .default
+                        .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+                {
+                    return Err(CodecError::InvalidValue);
+                }
                 put_u32(out, entry.id);
                 out.push(
                     u8::from(entry.automatable)
