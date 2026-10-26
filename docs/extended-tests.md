@@ -31,7 +31,13 @@ is exported from the worker so instrumented `dlopen` plugins resolve the same
 runtime. Normal native tests, crash/hang scenarios, editor operations, f64/MIDI,
 recovery and stress all execute with instrumentation. Any sanitizer finding
 fails the job, including a finding from a worker whose death the isolation test
-otherwise expected. External plugin binaries are not sanitizer artifacts.
+otherwise expected. `VST_AUDIO_ASAN_TARGET` selects the sanitizer Cargo target
+directory when present; the default is `target/asan`. External plugin binaries
+are not sanitizer artifacts.
+
+Setting `VST_AUDIO_TRACE` to any value enables worker control tracing on stderr;
+its value is not parsed, so `VST_AUDIO_TRACE=0` also enables tracing. Tracing is
+for diagnostics and can be combined with native or sanitizer runs.
 
 Both lanes run on every CI push and pull request. The regular four-target jobs
 continue to compile and execute with the consumer's stable Rust toolchain.
