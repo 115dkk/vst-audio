@@ -237,6 +237,7 @@ impl AudioBuffer {
                 break;
             }
             consumer.complete(0, sequence);
+            consumer.beat();
         }
     }
 }
@@ -424,6 +425,65 @@ mod tests {
         buffer.drain(&consumer, &mut plugin);
         assert_eq!(producer.completed(0), 3);
         assert_eq!(plugin.seen, [1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn drain_beats_after_each_completed_block_while_producer_refills_ring() {
+        struct Refilling<'producer, 'region> {
+            producer: &'producer mut Producer<'region>,
+            next_sequence: u32,
+            last_sequence: u32,
+        }
+        impl Processor for Refilling<'_, '_> {
+            fn process(&mut self, _: &mut [&mut [f32]], _: usize) -> bool {
+                if self.next_sequence <= self.last_sequence {
+                    assert_eq!(
+                        self.producer.try_publish(0, self.next_sequence, |slot| {
+                            slot.copy_from(&[self.next_sequence as f32; 8]);
+                        }),
+                        vst_audio_ring::Publish::Published
+                    );
+                    self.next_sequence += 1;
+                }
+                true
+            }
+        }
+
+        let geometry = Geometry {
+            sample_format: vst_audio_ring::SampleFormat::F32,
+            lanes: 1,
+            slots: 2,
+            input_channels: 2,
+            output_channels: 2,
+            max_frames: 4,
+            sample_rate: 48000,
+            latency_bound_frames: 96000,
+        };
+        let memory = RegionBuf::new(geometry).unwrap();
+        let event = InProcessEvent::new();
+        let mut producer = Producer::new(memory.region(), [Some(&event), None], &event);
+        producer.announce(geometry, 1).unwrap();
+        let mut consumer = Consumer::new(memory.region(), &event, [Some(&event), None]);
+        consumer.validate_and_ready(2).unwrap();
+        assert_eq!(
+            producer.try_publish(0, 1, |slot| {
+                slot.copy_from(&[1.0; 8]);
+            }),
+            vst_audio_ring::Publish::Published
+        );
+        let heartbeat = memory.region().heartbeat();
+        let mut buffer = AudioBuffer::new(geometry).unwrap();
+        {
+            let mut processor = Refilling {
+                producer: &mut producer,
+                next_sequence: 2,
+                last_sequence: 4,
+            };
+            buffer.drain(&consumer, &mut processor);
+        }
+
+        assert_eq!(producer.completed(0), 4);
+        assert_eq!(memory.region().heartbeat(), heartbeat + 4);
     }
 
     #[test]
