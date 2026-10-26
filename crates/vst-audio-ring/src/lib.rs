@@ -537,7 +537,12 @@ impl Publisher {
         };
         let meta_offset =
             offset + self.geometry.samples_per_slot() * self.geometry.sample_format.words();
-        let metadata = &region.words32[meta_offset..meta_offset + METADATA_WORDS];
+        let Some(metadata) = region
+            .words32
+            .get(meta_offset..meta_offset + METADATA_WORDS)
+        else {
+            return Publish::Dropped;
+        };
         let mut writer = SlotWriter {
             samples,
             metadata,
@@ -579,9 +584,15 @@ impl Publisher {
         };
         let meta_offset =
             offset + self.geometry.samples_per_slot() * self.geometry.sample_format.words();
+        let Some(metadata) = region
+            .words32
+            .get(meta_offset..meta_offset + METADATA_WORDS)
+        else {
+            return false;
+        };
         read(SlotReader {
             samples,
-            metadata: &region.words32[meta_offset..meta_offset + METADATA_WORDS],
+            metadata,
             format: self.geometry.sample_format,
             frames: self.geometry.max_frames as usize,
             planes: self.geometry.planes(),

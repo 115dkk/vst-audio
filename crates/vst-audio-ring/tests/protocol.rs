@@ -353,6 +353,32 @@ fn both_lanes_are_independent() {
 }
 
 #[test]
+fn publisher_drops_a_region_truncated_after_slot_samples() {
+    let g = geometry(1);
+    let total = g.total_bytes().unwrap();
+    let prefix: Vec<_> = (0..g.mapping_split(total).unwrap() / 4)
+        .map(|_| std::sync::atomic::AtomicU32::new(0))
+        .collect();
+    let counters: Vec<_> = (0..vst_audio_ring::COUNTER_WORDS)
+        .map(|_| std::sync::atomic::AtomicU64::new(0))
+        .collect();
+    let event = InProcessEvent::new();
+    let full = Region::new(&prefix, &counters);
+    let mut producer = Producer::new(full, [None, None], &event);
+    producer.announce(g, 1).unwrap();
+    let mut consumer = Consumer::new(full, &event, [None, None]);
+    consumer.validate_and_ready(2).unwrap();
+    let publisher = producer.publisher().unwrap();
+
+    let sample_end = vst_audio_ring::HEADER_BYTES / 4 + g.samples_per_slot();
+    let truncated = Region::new(&prefix[..sample_end], &counters);
+    assert_eq!(
+        publisher.try_publish(truncated, 0, 2, None, |_| {}),
+        Publish::Dropped
+    );
+}
+
+#[test]
 fn corrupt_and_truncated_regions_are_rejected_at_boundary() {
     let event = InProcessEvent::new();
     let prefix: Vec<_> = (0..128)
