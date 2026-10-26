@@ -21,3 +21,9 @@ page polls the model through a Tauri command, so its smoke run also needs the
 webview, the page script and the IPC bridge to work. On Linux it needs
 WebKitGTK 4.1 (`libwebkit2gtk-4.1-dev` on Debian and Ubuntu); Windows needs
 the WebView2 runtime.
+
+On Linux, CI runs the smoke inside `dbus-run-session` with
+`tools/gui-session-bus.conf`, a session bus without services. GTK reads desktop
+settings from xdg-desktop-portal synchronously, and a hosted runner's portal
+never answers without a graphical session, which held the Tauri window for
+the 25 s D-Bus timeout.
