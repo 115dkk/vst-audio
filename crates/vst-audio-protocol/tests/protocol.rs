@@ -9,6 +9,67 @@ use vst_audio_protocol::{
     StateHistory, WatchState, decode_frame, encode_frame, read_frame,
 };
 
+fn editor_status(width: u32, height: u32, scale: f32) -> Message {
+    Message::EditorStatus(vst_audio_protocol::EditorStatus {
+        platform: vst_audio_protocol::EditorPlatform::X11,
+        scaling: vst_audio_protocol::EditorScaling::Plugin,
+        visible: false,
+        embedded: false,
+        width,
+        height,
+        scale,
+        resize_supported: true,
+        scale_supported: true,
+    })
+}
+
+#[test]
+fn editor_status_rejects_invalid_dimensions_and_scale() {
+    for message in [
+        editor_status(0, 200, 1.0),
+        editor_status(8193, 200, 1.0),
+        editor_status(320, 0, 1.0),
+        editor_status(320, 8193, 1.0),
+        editor_status(320, 200, 0.0),
+        editor_status(320, 200, 0.49),
+        editor_status(320, 200, 4.01),
+        editor_status(320, 200, f32::NAN),
+        editor_status(320, 200, f32::INFINITY),
+    ] {
+        assert!(matches!(
+            encode_frame(&Frame {
+                flags: 0,
+                request: 1,
+                message,
+            }),
+            Err(CodecError::InvalidValue)
+        ));
+    }
+
+    for (width, height, scale) in [(1, 1, 0.5), (8192, 8192, 4.0)] {
+        round_trip(editor_status(width, height, scale));
+    }
+
+    let valid = encode_frame(&Frame {
+        flags: 0,
+        request: 1,
+        message: editor_status(320, 200, 1.0),
+    })
+    .unwrap();
+    for (offset, bytes) in [
+        (15, 0_u32.to_le_bytes()),
+        (19, 8193_u32.to_le_bytes()),
+        (23, f32::NAN.to_bits().to_le_bytes()),
+    ] {
+        let mut invalid = valid.clone();
+        invalid[offset..offset + 4].copy_from_slice(&bytes);
+        assert!(matches!(
+            decode_frame(&invalid),
+            Err(CodecError::InvalidValue)
+        ));
+    }
+}
+
 #[test]
 fn editor_platforms_round_trip_and_reject_unknown_tags() {
     use vst_audio_protocol::{EditorPlatform, EditorScaling, EditorStatus};

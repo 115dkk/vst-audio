@@ -555,6 +555,13 @@ fn encode_message(message: &Message, out: &mut Vec<u8>) -> Result<(), CodecError
             out.push(*scaling as u8);
         }
         Message::EditorStatus(status) => {
+            if !(1..=8192).contains(&status.width)
+                || !(1..=8192).contains(&status.height)
+                || !status.scale.is_finite()
+                || !(0.5..=4.0).contains(&status.scale)
+            {
+                return Err(CodecError::InvalidValue);
+            }
             out.push(status.platform as u8);
             out.push(u8::from(status.visible));
             out.push(u8::from(status.embedded));
@@ -820,6 +827,13 @@ fn decode_message(kind: u16, body: &[u8]) -> Result<Option<Message>, CodecError>
             let width = cursor.u32()?;
             let height = cursor.u32()?;
             let scale = f32::from_bits(cursor.u32()?);
+            if !(1..=8192).contains(&width)
+                || !(1..=8192).contains(&height)
+                || !scale.is_finite()
+                || !(0.5..=4.0).contains(&scale)
+            {
+                return Err(CodecError::InvalidValue);
+            }
             let resize_supported = cursor.boolean()?;
             let scale_supported = cursor.boolean()?;
             Message::EditorStatus(EditorStatus {
