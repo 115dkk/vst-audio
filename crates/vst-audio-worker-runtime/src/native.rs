@@ -345,7 +345,13 @@ fn start_audio(
 ) -> Result<thread::JoinHandle<()>, StartError> {
     let (validated, validation) = mpsc::sync_channel(1);
     let audio = thread::spawn(move || {
-        let _mmcss = Mmcss::pro_audio();
+        let _mmcss = match Mmcss::pro_audio() {
+            Ok(mmcss) => Some(mmcss),
+            Err(failure) => {
+                eprintln!("failed to enable Pro Audio MMCSS: {failure}");
+                None
+            }
+        };
         let view = region.region();
         let mut consumer = Consumer::new(view, &*ready, [Some(&*done), None]);
         let result = consumer.validate_and_ready(std::process::id());
