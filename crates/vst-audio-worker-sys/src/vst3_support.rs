@@ -1,9 +1,4 @@
-#![allow(
-    unsafe_code,
-    non_snake_case,
-    clippy::multiple_unsafe_ops_per_block,
-    clippy::undocumented_unsafe_blocks
-)]
+#![allow(unsafe_code, non_snake_case)]
 //! Host-owned COM objects. Controller callbacks are UI-thread-only (SDK threading model).
 use crate::{
     editor::EditorWindow,
@@ -832,9 +827,12 @@ mod tests {
         let message = unsafe { vst3::ComPtr::<IMessage>::from_raw(pointer.cast()) }.unwrap();
         // SAFETY: terminated string remains readable through this synchronous call.
         unsafe { message.setMessageID(c"editor".as_ptr()) };
-        // SAFETY: retained message returns its copied terminated identifier.
+        // SAFETY: message retains the live IMessage interface for this call.
+        let id = unsafe { message.getMessageID() };
         assert_eq!(
-            unsafe { std::ffi::CStr::from_ptr(message.getMessageID()) },
+            // SAFETY: setMessageID copied a terminated identifier; message is still
+            // retained and its ID has not been changed since obtaining this pointer.
+            unsafe { std::ffi::CStr::from_ptr(id) },
             c"editor"
         );
         // SAFETY: retained message owns one stable attribute-list object.
@@ -843,33 +841,41 @@ mod tests {
         assert_eq!(attributes, unsafe { message.getAttributes() });
         // SAFETY: borrowed pointer remains valid while message is retained.
         let attributes = unsafe { ComRef::from_raw(attributes) }.unwrap();
-        // SAFETY: terminated IDs and writable scalar outputs satisfy the interface contract.
-        unsafe {
-            assert_eq!(attributes.setInt(c"int".as_ptr(), -17), kResultOk);
-            assert_eq!(attributes.setFloat(c"float".as_ptr(), 3.25), kResultOk);
-        }
+        assert_eq!(
+            // SAFETY: message retains attributes and the static ID is NUL-terminated.
+            unsafe { attributes.setInt(c"int".as_ptr(), -17) },
+            kResultOk
+        );
+        assert_eq!(
+            // SAFETY: message retains attributes and the static ID is NUL-terminated.
+            unsafe { attributes.setFloat(c"float".as_ptr(), 3.25) },
+            kResultOk
+        );
         let mut integer = 0;
         let mut float = 0.0;
-        // SAFETY: terminated IDs and writable scalar outputs satisfy the interface contract.
-        unsafe {
-            assert_eq!(attributes.getInt(c"int".as_ptr(), &mut integer), kResultOk);
-            assert_eq!(
-                attributes.getFloat(c"float".as_ptr(), &mut float),
-                kResultOk
-            );
-        }
+        assert_eq!(
+            // SAFETY: retained attributes, terminated ID, and an exclusive writable i64 output.
+            unsafe { attributes.getInt(c"int".as_ptr(), &mut integer) },
+            kResultOk
+        );
+        assert_eq!(
+            // SAFETY: retained attributes, terminated ID, and an exclusive writable f64 output.
+            unsafe { attributes.getFloat(c"float".as_ptr(), &mut float) },
+            kResultOk
+        );
         assert_eq!(integer, -17);
         assert_eq!(float, 3.25);
 
         let text = [b'a' as TChar, b'b' as TChar, b'c' as TChar, 0];
-        // SAFETY: text is terminated and ID is static and terminated.
         assert_eq!(
+            // SAFETY: message retains attributes; text and the static ID are terminated.
             unsafe { attributes.setString(c"text".as_ptr(), text.as_ptr()) },
             kResultOk
         );
         let mut truncated = [99 as TChar; 2];
-        // SAFETY: output has exactly the advertised byte capacity.
         assert_eq!(
+            // SAFETY: message retains attributes, the ID is terminated, and the
+            // exclusive TChar output has exactly the advertised byte capacity.
             unsafe {
                 attributes.getString(
                     c"text".as_ptr(),
@@ -882,8 +888,9 @@ mod tests {
         assert_eq!(truncated, [b'a' as TChar, 0]);
 
         let binary = [1_u8, 2, 3, 4];
-        // SAFETY: input points to four readable bytes.
         assert_eq!(
+            // SAFETY: message retains attributes, the ID is terminated, and binary
+            // supplies the advertised four readable bytes for the synchronous copy.
             unsafe {
                 attributes.setBinary(
                     c"data".as_ptr(),
@@ -895,26 +902,29 @@ mod tests {
         );
         let mut data = std::ptr::null();
         let mut size = 0;
-        // SAFETY: both outputs are writable and the ID is terminated.
         assert_eq!(
+            // SAFETY: message retains attributes; both outputs are exclusive and
+            // writable for their types, and the static ID is terminated.
             unsafe { attributes.getBinary(c"data".as_ptr(), &mut data, &mut size) },
             kResultOk
         );
         assert_eq!(size, 4);
-        // SAFETY: returned pointer remains valid until this value is replaced or the list dies.
         assert_eq!(
+            // SAFETY: getBinary returned four initialized bytes. The list is
+            // retained by message and this value has not been replaced.
             unsafe { std::slice::from_raw_parts(data.cast::<u8>(), 4) },
             binary
         );
-        // SAFETY: setting an unrelated scalar does not replace the binary value.
         assert_eq!(
+            // SAFETY: message retains attributes and the static ID is terminated.
             unsafe { attributes.setInt(c"other".as_ptr(), 1) },
             kResultOk
         );
         let mut same_data = std::ptr::null();
         let mut same_size = 0;
-        // SAFETY: both outputs are writable and the ID is terminated.
         assert_eq!(
+            // SAFETY: message retains attributes; both outputs are exclusive and
+            // writable for their types, and the static ID is terminated.
             unsafe { attributes.getBinary(c"data".as_ptr(), &mut same_data, &mut same_size) },
             kResultOk
         );
@@ -925,30 +935,37 @@ mod tests {
     fn host_attributes_reject_missing_null_and_limits() {
         let attributes = HostAttributeList::default();
         let mut integer = 0;
-        // SAFETY: terminated missing key and writable output.
         assert_eq!(
+            // SAFETY: terminated missing key and exclusive writable i64 output.
             unsafe { attributes.getInt(c"missing".as_ptr(), &mut integer) },
             kResultFalse
         );
-        // SAFETY: deliberately null arguments exercise validation without dereferencing them.
-        unsafe {
-            assert_eq!(attributes.setInt(std::ptr::null(), 1), kInvalidArgument);
-            assert_eq!(
-                attributes.getInt(c"value".as_ptr(), std::ptr::null_mut()),
-                kInvalidArgument
-            );
-            assert_eq!(
-                attributes.setString(c"value".as_ptr(), std::ptr::null()),
-                kInvalidArgument
-            );
-            assert_eq!(
-                attributes.setBinary(c"value".as_ptr(), std::ptr::null(), 0),
-                kInvalidArgument
-            );
-        }
-        let byte = 0_u8;
-        // SAFETY: oversized input is rejected before the one-byte pointer can be read.
         assert_eq!(
+            // SAFETY: this concrete implementation rejects a null ID in bounded_bytes
+            // before dereferencing it; no foreign implementation is called.
+            unsafe { attributes.setInt(std::ptr::null(), 1) },
+            kInvalidArgument
+        );
+        assert_eq!(
+            // SAFETY: getInt rejects the null output before any pointer access.
+            unsafe { attributes.getInt(c"value".as_ptr(), std::ptr::null_mut()) },
+            kInvalidArgument
+        );
+        assert_eq!(
+            // SAFETY: setString rejects the null string before any pointer access.
+            unsafe { attributes.setString(c"value".as_ptr(), std::ptr::null()) },
+            kInvalidArgument
+        );
+        assert_eq!(
+            // SAFETY: setBinary rejects the null data before any pointer access,
+            // including for this zero-byte request.
+            unsafe { attributes.setBinary(c"value".as_ptr(), std::ptr::null(), 0) },
+            kInvalidArgument
+        );
+        let byte = 0_u8;
+        assert_eq!(
+            // SAFETY: this concrete setBinary rejects oversized input before
+            // forming a slice or reading the deliberately undersized buffer.
             unsafe {
                 attributes.setBinary(
                     c"large".as_ptr(),
@@ -963,8 +980,8 @@ mod tests {
             // SAFETY: each CString is terminated and remains live for the call.
             assert_eq!(unsafe { attributes.setInt(key.as_ptr(), 1) }, kResultOk);
         }
-        // SAFETY: static terminated key exceeds the item limit by one.
         assert_eq!(
+            // SAFETY: the static key is terminated and remains readable for the call.
             unsafe { attributes.setInt(c"one-too-many".as_ptr(), 1) },
             kOutOfMemory
         );
@@ -983,14 +1000,27 @@ mod tests {
                 kResultOk
             );
             let unknown = pointer.cast::<FUnknown>();
-            // SAFETY: successful creation returned a live FUnknown-derived interface.
-            let after_add = unsafe { ((*(*unknown).vtbl).addRef)(unknown) };
+            // SAFETY: successful creation returned a live FUnknown-derived interface
+            // with one owned reference and the FUnknown-compatible vtable prefix.
+            let vtbl = unsafe { (*unknown).vtbl };
+            // SAFETY: the live host-created COM object has an initialized FUnknown vtable.
+            let add_ref = unsafe { (*vtbl).addRef };
+            // SAFETY: add_ref belongs to this live interface, whose creation reference is held.
+            let after_add = unsafe { add_ref(unknown) };
             assert_eq!(after_add, 2);
-            // SAFETY: balance the explicit addRef while retaining the creation reference.
-            let after_release = unsafe { ((*(*unknown).vtbl).release)(unknown) };
+            // SAFETY: the creation reference and explicit addRef keep unknown alive.
+            let vtbl = unsafe { (*unknown).vtbl };
+            // SAFETY: the retained host-created COM object's vtable is initialized and readable.
+            let release = unsafe { (*vtbl).release };
+            // SAFETY: release belongs to unknown; balance addRef, retaining the creation reference.
+            let after_release = unsafe { release(unknown) };
             assert_eq!(after_release, 1);
-            // SAFETY: release the original creation reference exactly once.
-            assert_eq!(unsafe { ((*(*unknown).vtbl).release)(unknown) }, 0);
+            // SAFETY: the original creation reference still keeps unknown alive.
+            let vtbl = unsafe { (*unknown).vtbl };
+            // SAFETY: the retained host-created COM object's vtable is initialized and readable.
+            let release = unsafe { (*vtbl).release };
+            // SAFETY: release the original reference exactly once; unknown is not used afterwards.
+            assert_eq!(unsafe { release(unknown) }, 0);
         }
     }
 
