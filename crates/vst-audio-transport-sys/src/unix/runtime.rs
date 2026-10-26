@@ -10,7 +10,7 @@ use std::{
     io,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
     path::Path,
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -344,12 +344,14 @@ fn spawn_handles_macos(
     };
     spawn_result(result)?;
     Ok(ChildProcess {
-        child: Mutex::new(MacChild {
+        child: Mutex::new(Some(MacChild {
             pid,
             exit_code: None,
-        }),
+        })),
         _parent: parent,
-        _sandbox: sandbox,
+        sandbox: Some(sandbox),
+        #[cfg(test)]
+        suppress_termination: false,
     })
 }
 
@@ -411,13 +413,15 @@ impl MacChild {
 #[derive(Debug)]
 pub struct ChildProcess {
     #[cfg(not(target_os = "macos"))]
-    child: Mutex<Child>,
+    child: Mutex<Option<Child>>,
     #[cfg(target_os = "macos")]
-    child: Mutex<MacChild>,
+    child: Mutex<Option<MacChild>>,
     // Only the parent retains the write end: death closes it even while a
     // plugin's main thread is blocked inside foreign code.
     _parent: ParentHandle,
-    _sandbox: crate::sandbox::SandboxLaunch,
+    sandbox: Option<crate::sandbox::SandboxLaunch>,
+    #[cfg(test)]
+    suppress_termination: bool,
 }
 
 pub fn spawn_handles(
@@ -467,9 +471,11 @@ pub fn spawn_handles(
         unsafe { command.pre_exec(prepare) };
         let child = command.spawn()?;
         Ok(ChildProcess {
-            child: Mutex::new(child),
+            child: Mutex::new(Some(child)),
             _parent: parent,
-            _sandbox: sandbox,
+            sandbox: Some(sandbox),
+            #[cfg(test)]
+            suppress_termination: false,
         })
     }
 }
@@ -528,11 +534,21 @@ impl ChildProcess {
     pub fn pid(&self) -> u32 {
         #[cfg(target_os = "macos")]
         {
-            self.child.lock().unwrap_or_else(|e| e.into_inner()).pid as u32
+            self.child
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .unwrap()
+                .pid as u32
         }
         #[cfg(not(target_os = "macos"))]
         {
-            self.child.lock().unwrap_or_else(|e| e.into_inner()).id()
+            self.child
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .unwrap()
+                .id()
         }
     }
     pub fn exit_code(&self) -> io::Result<Option<u32>> {
@@ -541,6 +557,8 @@ impl ChildProcess {
             self.child
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
+                .as_mut()
+                .unwrap()
                 .try_wait()
         }
         #[cfg(not(target_os = "macos"))]
@@ -549,6 +567,8 @@ impl ChildProcess {
                 .child
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
+                .as_mut()
+                .unwrap()
                 .try_wait()?
                 .map(|s| s.code().unwrap_or_else(|| 128 + s.signal().unwrap_or(0)) as u32))
         }
@@ -579,9 +599,14 @@ impl ChildProcess {
             .unwrap_or_else(|error| panic!("failed to wait for child process exit: {error}"))
     }
     pub fn terminate(&self, _: u32) -> io::Result<()> {
+        #[cfg(test)]
+        if self.suppress_termination {
+            return Ok(());
+        }
         #[cfg(target_os = "macos")]
         {
-            let mut child = self.child.lock().unwrap_or_else(|e| e.into_inner());
+            let mut owned = self.child.lock().unwrap_or_else(|e| e.into_inner());
+            let child = owned.as_mut().unwrap();
             if child.try_wait()?.is_some() {
                 return Ok(());
             }
@@ -598,7 +623,8 @@ impl ChildProcess {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let mut child = self.child.lock().unwrap_or_else(|e| e.into_inner());
+            let mut owned = self.child.lock().unwrap_or_else(|e| e.into_inner());
+            let child = owned.as_mut().unwrap();
             if child.try_wait()?.is_some() {
                 return Ok(());
             }
@@ -617,21 +643,61 @@ impl ChildProcess {
     }
 }
 
+// Debugger-visible diagnostic for the last-resort leak below. Logging to stderr
+// in Drop could itself block indefinitely; this counter performs no I/O.
+static REAPER_SPAWN_FAILURES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 impl Drop for ChildProcess {
     fn drop(&mut self) {
         let _ = self.terminate(0);
-        #[cfg(target_os = "macos")]
-        let _ = self
+        match self.wait_for(Duration::from_millis(100)) {
+            Ok(true) => return,
+            // An external waiter has already reaped the child. Never signal that
+            // PID again; it may now belong to an unrelated process.
+            Err(error) if error.raw_os_error() == Some(libc::ECHILD) => return,
+            Ok(false) | Err(_) => {}
+        }
+        // Only Drop takes these options, after the last public method call.
+        let child = self
             .child
             .get_mut()
             .unwrap_or_else(|e| e.into_inner())
-            .wait();
-        #[cfg(not(target_os = "macos"))]
-        let _ = self
-            .child
-            .get_mut()
-            .unwrap_or_else(|e| e.into_inner())
-            .wait();
+            .take()
+            .unwrap();
+        let sandbox = self.sandbox.take().unwrap();
+        // Keep a second owner until spawn succeeds: Builder::spawn drops its
+        // closure on failure, which must not delete a live child's TempDir.
+        let retained = Arc::new(Mutex::new(Some((child, sandbox))));
+        let task = Arc::clone(&retained);
+        let spawned = std::thread::Builder::new()
+            .name("vst-audio-child-reaper".into())
+            .spawn(move || {
+                let (mut child, _sandbox) = task
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take()
+                    .unwrap();
+                loop {
+                    match child.wait() {
+                        Ok(_) => break,
+                        Err(error) if error.raw_os_error() == Some(libc::ECHILD) => break,
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(_) => {
+                            // An error is not proof of exit. Retain ownership and
+                            // retry off the dropping thread without signalling a PID.
+                            std::thread::sleep(Duration::from_secs(1));
+                        }
+                    }
+                }
+                // The sandbox is released only after wait confirms exit/reaping.
+            });
+        if spawned.is_err() {
+            // Last-resort resource leak only on thread-spawn failure: preserving
+            // the owned child and its directory is safer than premature cleanup.
+            std::mem::forget(retained);
+            REAPER_SPAWN_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 
@@ -665,6 +731,70 @@ mod tests {
     }
 
     #[test]
+    fn drop_bounds_wait_and_reaps_before_removing_sandbox() {
+        let sandbox = crate::sandbox::SandboxLaunch::new(
+            Some(&crate::sandbox::SandboxPolicy::default()),
+            Path::new("/bin/sleep"),
+        )
+        .unwrap();
+        let temporary = sandbox.temporary().unwrap().to_owned();
+        let mut child = spawn_handles(
+            Path::new("/bin/sleep"),
+            &[OsString::from("1")],
+            &[],
+            parent_handle().unwrap(),
+            sandbox,
+        )
+        .unwrap();
+        // TD-43: model a worker that remains alive after termination is requested.
+        // The hook belongs to this child only; parallel tests still terminate normally.
+        child.suppress_termination = true;
+        let pid = child.pid() as libc::pid_t;
+        let start = Instant::now();
+        drop(child);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "Drop blocked for {elapsed:?}"
+        );
+        assert!(temporary.is_dir(), "sandbox removed before child exit");
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        // SAFETY: pid identifies this test's child and info is writable siginfo_t
+        // storage. WNOWAIT observes exit without stealing the reaper's ownership.
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        assert_eq!(result, 0, "child was already reaped");
+        // SAFETY: waitid succeeded and initialized the zeroed siginfo_t storage.
+        let info = unsafe { info.assume_init() };
+        // SAFETY: successful waitid supplies the SIGCHLD layout accessed by si_pid.
+        assert_eq!(unsafe { info.si_pid() }, 0, "child already exited");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while temporary.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !temporary.exists(),
+            "reaper did not remove sandbox after exit"
+        );
+        let mut status = 0;
+        // SAFETY: status is writable and waitpid validates this test's child PID.
+        // Only check after cleanup, so this probe cannot reap instead of the reaper.
+        let result = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        assert_eq!(result, -1, "child was not reaped before sandbox cleanup");
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+        eprintln!("Drop returned in {elapsed:?}; child reaped and sandbox removed");
+    }
+
+    #[test]
     fn wait_for_preserves_echild_after_external_reap() {
         let sandbox = crate::sandbox::SandboxLaunch::new(None, Path::new("/bin/sh")).unwrap();
         let args = [OsString::from("-c"), OsString::from("exit 0")];
@@ -695,7 +825,7 @@ mod tests {
         let result = child.wait_for(Duration::from_secs(2));
         let elapsed = start.elapsed();
         let legacy = std::panic::catch_unwind(|| child.wait(Duration::ZERO));
-        // Drop's try_wait returns ECHILD before signalling, and its blocking wait
+        // Drop's try_wait returns ECHILD before signalling, and its bounded wait
         // also returns ECHILD. Do not signal a PID that has already been reaped.
         drop(child);
         let error = result.expect_err("external reap must report ECHILD, not a timeout");
