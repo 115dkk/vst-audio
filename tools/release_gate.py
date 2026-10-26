@@ -36,7 +36,6 @@ import fnmatch
 import os
 import re
 import subprocess
-import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -257,7 +256,7 @@ def workspace_members() -> set[str]:
     return names
 
 
-def _commit_bump(old: str, new: str) -> str:
+def _commit_bump(old: str, new: str) -> str | None:
     members = workspace_members()
     _write(CARGO_TOML, set_workspace_version(_read(CARGO_TOML), members, old, new))
     for lock in LOCKS:
@@ -268,19 +267,15 @@ def _commit_bump(old: str, new: str) -> str:
          "41898282+github-actions[bot]@users.noreply.github.com")
     _run("git", "add", str(CARGO_TOML), *(str(lock) for lock in LOCKS if lock.exists()))
     _run("git", "commit", "-m", f"chore(release): v{new}")
-    for attempt in range(1, 4):
-        # A push made with the workflow token starts no workflow, so the bump
-        # commit does not release itself.
-        push = _run("git", "push", "origin", f"HEAD:{BRANCH}", check=False)
-        if push.returncode == 0:
-            return _git("rev-parse", "HEAD")
-        print(f"::warning::bump push rejected (attempt {attempt})\n{push.stderr}")
-        _run("git", "fetch", "origin", BRANCH, check=False)
-        if _run("git", "rebase", "FETCH_HEAD", check=False).returncode != 0:
-            _run("git", "rebase", "--abort", check=False)
-            raise SystemExit(f"{BRANCH} moved in a way the bump cannot rebase onto")
-        time.sleep(5)
-    raise SystemExit("bump push failed after 3 attempts")
+    # A push made with the workflow token starts no workflow, so the bump commit
+    # does not release itself. A rejection means main moved after this run made
+    # its release decision. Do not rebase the stale bump: the new main push starts
+    # another workflow, which decides the right version from that head.
+    push = _run("git", "push", "origin", f"HEAD:{BRANCH}", check=False)
+    if push.returncode == 0:
+        return _git("rev-parse", "HEAD")
+    print(f"::warning::bump push rejected; deferring release to the new {BRANCH}\n{push.stderr}")
+    return None
 
 
 def main() -> int:
@@ -314,7 +309,12 @@ def main() -> int:
         if os.environ.get("GITHUB_REF", f"refs/heads/{BRANCH}") != f"refs/heads/{BRANCH}":
             raise SystemExit(f"a bump commits to {BRANCH}")
         release_sha = _commit_bump(version, new_version)
-        print(f"bumped to v{new_version}; release_sha={release_sha}")
+        if release_sha is None:
+            action = "none"
+            release_sha = head
+            print(f"{BRANCH} moved; this run will not release")
+        else:
+            print(f"bumped to v{new_version}; release_sha={release_sha}")
 
     payload = (
         f"should_release={'false' if action == 'none' else 'true'}\n"
