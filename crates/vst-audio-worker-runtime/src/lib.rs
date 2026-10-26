@@ -84,6 +84,11 @@ pub trait Plugin {
     fn take_events(&mut self) -> PluginEvents;
 }
 
+/// Internal audio-thread boundary for the built-in VST2 and VST3 adapters.
+///
+/// External implementations are not supported. In particular, the default block
+/// methods do not promise event, transport, or f64 handling; both built-in adapters
+/// override them with their format-specific behavior.
 pub trait Processor: Send {
     /// In-place processing. Return false without changing samples when admission
     /// is closed; the ring must leave this sequence pending and retry on a wake.
