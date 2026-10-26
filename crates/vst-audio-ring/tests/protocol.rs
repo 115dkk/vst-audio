@@ -336,6 +336,20 @@ fn cached_geometry_ignores_later_header_mutation() {
 }
 
 #[test]
+fn producer_and_consumer_ignore_lanes_outside_the_geometry() {
+    let storage = RegionBuf::new(geometry(1)).unwrap();
+    let event = InProcessEvent::new();
+    let mut producer = Producer::new(storage.region(), [Some(&event), None], &event);
+    producer.announce(geometry(1), 1).unwrap();
+    let mut consumer = Consumer::new(storage.region(), &event, [Some(&event), None]);
+    consumer.validate_and_ready(2).unwrap();
+
+    assert_eq!(producer.try_publish(2, 1, |_| {}), Publish::Dropped);
+    consumer.complete(2, 7);
+    assert_eq!(producer.completed(0), 0);
+}
+
+#[test]
 fn both_lanes_are_independent() {
     let storage = RegionBuf::new(geometry(2)).unwrap();
     let event = InProcessEvent::new();

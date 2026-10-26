@@ -739,7 +739,10 @@ impl<'a> Producer<'a> {
         let Some(publisher) = self.publisher() else {
             return Publish::Dropped;
         };
-        publisher.try_publish(self.region, lane, sequence, self.work[lane], write)
+        let Some(work) = self.work.get(lane).copied() else {
+            return Publish::Dropped;
+        };
+        publisher.try_publish(self.region, lane, sequence, work, write)
     }
 
     pub fn try_read<F>(&self, lane: usize, sequence: u32, read: F) -> bool
@@ -1180,6 +1183,12 @@ impl<'a> Consumer<'a> {
     }
 
     pub fn complete(&self, lane: usize, sequence: u32) {
+        let Some(geometry) = self.geometry else {
+            return;
+        };
+        if lane >= geometry.lanes as usize {
+            return;
+        }
         self.region
             .store32(COMPLETED_I + lane, sequence.to_le(), Ordering::Release);
         if let Some(signal) = self.done[lane] {
