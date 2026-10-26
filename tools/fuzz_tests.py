@@ -4,7 +4,7 @@ from pathlib import Path
 import os
 import re
 import struct
-import subprocess
+from run import to_log
 
 ROOT=Path(__file__).resolve().parents[1]
 report=ROOT/"test-results/fuzz"
@@ -23,14 +23,14 @@ results=[]
 try:
     for target in ["control","ring"]:
         command=["cargo","+nightly-2026-10-20","fuzz","run",target,"--","-max_total_time="+str(seconds),"-max_len=65536","-rss_limit_mb=2048","-print_final_stats=1"]
-        result=subprocess.run(command,cwd=ROOT,capture_output=True,text=True,timeout=seconds+300)
-        output=result.stdout+result.stderr
-        (report/(target+".log")).write_text(output,encoding="utf-8")
-        print(output[-12000:],flush=True)
-        units=re.search(r"stat::number_of_executed_units:\s*(\d+)",output)
+        result=to_log(command,report/(target+".log"),cwd=ROOT,timeout=seconds+300,
+                      tail_bytes=12000)
+        print(result.tail,flush=True)
+        units=re.search(r"stat::number_of_executed_units:\s*(\d+)",result.tail)
         executions=int(units.group(1)) if units else 0
-        passed=result.returncode==0 and executions>100
-        results.append({"target":target,"seconds":seconds,"executions":executions,"passed":passed})
+        passed=result.returncode==0 and not result.timed_out and executions>100
+        results.append({"target":target,"seconds":seconds,"executions":executions,
+                        "timed_out":result.timed_out,"passed":passed})
         if not passed and result.returncode==0: raise RuntimeError("fuzzer did not execute enough inputs")
         if result.returncode: raise SystemExit(result.returncode)
 finally:

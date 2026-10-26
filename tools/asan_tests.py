@@ -2,9 +2,9 @@
 import json
 import os
 from pathlib import Path
-import subprocess
 import sys
 import uuid
+from run import to_log
 
 if sys.platform != "linux":
     raise SystemExit("This native sanitizer lane currently requires Linux")
@@ -21,15 +21,15 @@ env=dict(os.environ,
     RUSTFLAGS="-Zsanitizer=address -C link-arg=-Wl,--export-dynamic",
     ASAN_OPTIONS=f"detect_leaks=1:halt_on_error=1:log_path={output}/{report_prefix}",
     RUST_BACKTRACE="1")
-result=subprocess.run(["xvfb-run","-a",sys.executable,"tools/native_tests.py"],cwd=ROOT,env=env,capture_output=True,text=True,timeout=600)
-log=result.stdout+result.stderr
-(output/"native.log").write_text(log,encoding="utf-8")
-print(log[-32000:],flush=True)
+result=to_log(["xvfb-run","-a",sys.executable,"tools/native_tests.py"],output/"native.log",
+              cwd=ROOT,env=env,timeout=600,tail_bytes=32000)
+print(result.tail,flush=True)
 findings=[]
 for report in output.glob(report_prefix+".*"):
     contents=report.read_text(errors="replace")
     if "ERROR:" in contents or "SUMMARY:" in contents:
         findings.append(report.name)
-summary={"toolchain":"nightly-2026-10-20","native_exit":result.returncode,"findings":findings,"passed":result.returncode==0 and not findings}
+summary={"toolchain":"nightly-2026-10-20","native_exit":result.returncode,"timed_out":result.timed_out,
+         "findings":findings,"passed":result.returncode==0 and not result.timed_out and not findings}
 (output/"summary.json").write_text(json.dumps(summary,indent=2))
 if not summary["passed"]: raise SystemExit(1)

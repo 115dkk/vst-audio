@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 from fixtures import download, target_directory
+from run import to_log
 
 ROOT = Path(__file__).resolve().parents[1]
 PINS = {
@@ -308,12 +309,15 @@ def main():
         if sys.platform != "win32":
             import resource
             resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-        result = subprocess.run(["cargo", "test", "--locked", "-p", "vst-audio", "--test", "third_party", "--", "--ignored", "--nocapture", "--test-threads=1"], cwd=ROOT, env=env, capture_output=True, text=True, timeout=1500)
-        output = result.stdout + result.stderr
-        print(output[-131072:], flush=True)
-        (report_dir / "checks.log").write_text(output[-131072:], encoding="utf-8")
-        report["metrics"] = [json.loads(line.partition("METRIC ")[2]) for line in output.splitlines() if "METRIC " in line]
+        result = to_log(["cargo", "test", "--locked", "-p", "vst-audio", "--test",
+            "third_party", "--", "--ignored", "--nocapture", "--test-threads=1"],
+            report_dir / "checks.log", cwd=ROOT, env=env, timeout=1500, tail_bytes=131072)
+        print(result.tail, flush=True)
+        report["metrics"] = [json.loads(line.partition("METRIC ")[2]) for line in result.tail.splitlines()
+                             if "METRIC " in line]
         report["returncode"] = result.returncode
+        report["timed_out"] = result.timed_out
+        assert not result.timed_out, "semantic test timed out"
         assert len(report["metrics"]) >= 10, "semantic test measurements missing"
         report["known_upstream_limitations"]=[m["case"] for m in report["metrics"] if m["case"].startswith("known limitation:")]
         if sys.platform != "darwin":
@@ -322,17 +326,17 @@ def main():
                 "vst-audio-worker-sys/__test-drop-editor-edits", "--target-dir", mutant_target)
             mutant = mutant_target / "debug" / worker.name
             mutation_env = dict(env, VST_AUDIO_WORKER=str(mutant))
-            result = subprocess.run(["cargo", "test", "--locked", "-p", "vst-audio", "--test", "third_party",
-                "editor_input_eq_vst3", "--", "--exact", "--ignored", "--nocapture", "--test-threads=1"],
-                cwd=ROOT, env=mutation_env, capture_output=True, text=True, timeout=120)
-            output = result.stdout + result.stderr
-            print(output[-131072:], flush=True)
-            (report_dir / "mutation.log").write_text(output[-131072:], encoding="utf-8")
+            result = to_log(["cargo", "test", "--locked", "-p", "vst-audio", "--test",
+                "third_party", "editor_input_eq_vst3", "--", "--exact", "--ignored", "--nocapture",
+                "--test-threads=1"], report_dir / "mutation.log", cwd=ROOT, env=mutation_env,
+                timeout=120, tail_bytes=131072)
+            print(result.tail, flush=True)
             marker = "editor-to-processor sound assertion failed"
-            mutation_passed = result.returncode != 0 and marker in output
-            report["mutation"] = {"returncode": result.returncode, "sound_failure": marker in output,
-                "passed": mutation_passed,
-                "metrics": [json.loads(line.partition("METRIC ")[2]) for line in output.splitlines() if "METRIC " in line]}
+            mutation_passed = not result.timed_out and result.returncode != 0 and marker in result.tail
+            report["mutation"] = {"returncode": result.returncode, "timed_out": result.timed_out,
+                "sound_failure": marker in result.tail, "passed": mutation_passed,
+                "metrics": [json.loads(line.partition("METRIC ")[2]) for line in result.tail.splitlines()
+                            if "METRIC " in line]}
             assert mutation_passed, "mutation did not fail at the sound assertion"
         else:
             report["mutation"] = {"not_run": "macOS synthetic editor input is unsupported"}
