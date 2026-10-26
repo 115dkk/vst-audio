@@ -8,7 +8,7 @@ mod process;
 pub use linux_editor::LinuxEditor;
 pub use process::{
     BusChoice, BusSelector, ControlEvent, PluginControl, PluginProcess, ProcessingOptions,
-    StartError, Started,
+    StartError, StartErrorKind, Started,
 };
 pub use vst_audio_transport_sys::sandbox::{SandboxPolicy, SandboxReport};
 pub use vst_audio_transport_sys::{Event, SharedEvent, SharedRegion};

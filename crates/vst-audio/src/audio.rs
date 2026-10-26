@@ -1,5 +1,7 @@
 //! Variable callback adapter. Only bounded copies/atomics run in this module.
-use crate::{BlockEndpoint, Fallback, PluginControl, StartError, Started, api::Shared};
+use crate::{
+    BlockEndpoint, Fallback, PluginControl, StartError, StartErrorKind, Started, api::Shared,
+};
 #[cfg(test)]
 use crate::{BlockStatus, api::Lifecycle};
 use std::sync::Arc;
@@ -102,22 +104,30 @@ impl AudioEndpoint {
     ) -> Result<Self, StartError> {
         let g = active.geometry;
         let q = g.max_frames as usize;
-        let blocks = BlockEndpoint::new(active, depth, shared, next, retired)
-            .map_err(|error| StartError(format!("invalid block endpoint: {error:?}")))?;
-        let history_len =
-            g.latency_bound_frames
-                .checked_add((depth + 1).saturating_mul(g.max_frames))
-                .and_then(|frames| frames.checked_add(1))
-                .ok_or_else(|| StartError("fallback delay overflow".into()))? as usize;
+        let blocks = BlockEndpoint::new(active, depth, shared, next, retired).map_err(|error| {
+            StartError::new(
+                StartErrorKind::InvalidInput,
+                format!("invalid block endpoint: {error:?}"),
+            )
+        })?;
+        let history_len = g
+            .latency_bound_frames
+            .checked_add((depth + 1).saturating_mul(g.max_frames))
+            .and_then(|frames| frames.checked_add(1))
+            .ok_or_else(|| StartError::new(StartErrorKind::Start, "fallback delay overflow"))?
+            as usize;
         let history_samples = if fallback == Fallback::DelayedInput {
             history_len
                 .checked_mul(g.output_channels as usize)
-                .ok_or_else(|| StartError("fallback size overflow".into()))?
+                .ok_or_else(|| StartError::new(StartErrorKind::Start, "fallback size overflow"))?
         } else {
             0
         };
         if history_samples > 8 * 1024 * 1024 {
-            return Err(StartError("fallback delay exceeds 64 MiB budget".into()));
+            return Err(StartError::new(
+                StartErrorKind::Start,
+                "fallback delay exceeds 64 MiB budget",
+            ));
         }
         let f32 = g.sample_format == SampleFormat::F32;
         Ok(Self {

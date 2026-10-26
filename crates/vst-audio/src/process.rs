@@ -34,11 +34,54 @@ fn following_request(request: u32) -> u32 {
         request + 1
     }
 }
+/// Programmatic classification of application startup and control failures.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StartErrorKind {
+    /// The operation was cancelled by the caller.
+    Cancelled,
+    /// Caller input or configuration is invalid.
+    InvalidInput,
+    /// The current lifecycle does not allow the request.
+    NotRunning,
+    /// A bounded control queue has no available capacity.
+    QueueFull,
+    /// A control channel or load task has closed.
+    Disconnected,
+    /// An operating-system or I/O operation failed.
+    Io,
+    /// A control frame or protocol exchange was invalid.
+    Protocol,
+    /// Startup, worker rejection, or an operational resource limit prevented completion.
+    Start,
+}
+
+/// A classified application error whose display text retains the original diagnostic.
 #[derive(Debug, thiserror::Error)]
-#[error("{0}")]
-pub struct StartError(pub String);
-fn error(error: impl std::fmt::Display) -> StartError {
-    StartError(error.to_string())
+#[error("{message}")]
+pub struct StartError {
+    kind: StartErrorKind,
+    message: String,
+}
+impl StartError {
+    pub fn new(kind: StartErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    pub fn kind(&self) -> StartErrorKind {
+        self.kind
+    }
+}
+
+fn codec_error(error: CodecError) -> StartError {
+    let kind = if matches!(error, CodecError::Io(_)) {
+        StartErrorKind::Io
+    } else {
+        StartErrorKind::Protocol
+    };
+    StartError::new(kind, error.to_string())
 }
 
 struct Transport {
@@ -93,7 +136,14 @@ impl Transport {
                 request,
                 message,
             })
-            .map_err(error)
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => {
+                    StartError::new(StartErrorKind::QueueFull, error.to_string())
+                }
+                mpsc::TrySendError::Disconnected(_) => {
+                    StartError::new(StartErrorKind::Disconnected, error.to_string())
+                }
+            })
     }
     fn response(&self, request: u32, timeout: Duration) -> Result<Frame, StartError> {
         let deadline = Instant::now() + timeout;
@@ -103,40 +153,55 @@ impl Transport {
                 .as_ref()
                 .is_some_and(|flag| flag.load(Ordering::Acquire))
             {
-                return Err(StartError("operation cancelled".into()));
+                return Err(StartError::new(
+                    StartErrorKind::Cancelled,
+                    "operation cancelled",
+                ));
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return Err(StartError(format!(
-                    "worker response to request {request} timed out"
-                )));
+                return Err(StartError::new(
+                    StartErrorKind::Start,
+                    format!("worker response to request {request} timed out"),
+                ));
             }
             let frame = match self
                 .receive
                 .recv_timeout(remaining.min(Duration::from_millis(20)))
             {
-                Ok(frame) => frame.map_err(error)?,
+                Ok(frame) => frame.map_err(codec_error)?,
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(e) => return Err(error(e)),
+                Err(e) => {
+                    return Err(StartError::new(StartErrorKind::Disconnected, e.to_string()));
+                }
             };
             let Some(frame) = frame else {
                 let _ = self.process.wait(Duration::from_millis(100));
-                return Err(StartError(format!(
-                    "host closed control pipe; exit={:?}",
-                    self.process.exit_code().ok().flatten()
-                )));
+                return Err(StartError::new(
+                    StartErrorKind::Disconnected,
+                    format!(
+                        "host closed control pipe; exit={:?}",
+                        self.process.exit_code().ok().flatten()
+                    ),
+                ));
             };
             if let DecodedFrame::Known(frame) = frame {
                 if let Message::Fault { code, text } | Message::RequestError { code, text } =
                     &frame.message
                 {
-                    return Err(StartError(format!("host fault {code}: {text}")));
+                    return Err(StartError::new(
+                        StartErrorKind::Start,
+                        format!("host fault {code}: {text}"),
+                    ));
                 }
                 if frame.request == request {
                     return Ok(frame);
                 }
                 if self.pending.borrow().len() >= 64 {
-                    return Err(StartError("too many unsolicited startup messages".into()));
+                    return Err(StartError::new(
+                        StartErrorKind::Protocol,
+                        "too many unsolicited startup messages",
+                    ));
                 }
                 self.pending.borrow_mut().push_back(frame);
             }
@@ -239,12 +304,18 @@ fn resolve_buses(
         .as_ref()
         .map(|selector| (selector.0)(inputs, outputs))
         .transpose()
-        .map_err(|reason| StartError(format!("bus selection: {reason}")))?;
+        .map_err(|reason| {
+            StartError::new(
+                StartErrorKind::InvalidInput,
+                format!("bus selection: {reason}"),
+            )
+        })?;
     if selected.as_ref().is_some_and(|choice| {
         choice.inputs.len() != inputs.len() || choice.outputs.len() != outputs.len()
     }) {
-        return Err(StartError(
-            "bus selection must configure every declared bus".into(),
+        return Err(StartError::new(
+            StartErrorKind::InvalidInput,
+            "bus selection must configure every declared bus",
         ));
     }
     let default = |buses: &[BusInfo]| {
@@ -340,7 +411,10 @@ impl PluginControl {
     }
     pub fn parameters(&mut self, start: u32, count: u16) -> Result<u32, StartError> {
         if count == 0 || count > 32 {
-            return Err(StartError("parameter page size must be 1..=32".into()));
+            return Err(StartError::new(
+                StartErrorKind::InvalidInput,
+                "parameter page size must be 1..=32",
+            ));
         }
         self.request(
             Message::ListParameters { start, count },
@@ -349,7 +423,10 @@ impl PluginControl {
     }
     pub fn set_parameter(&mut self, id: u32, value: f64) -> Result<u32, StartError> {
         if !value.is_finite() || !(0.0..=1.0).contains(&value) {
-            return Err(StartError("invalid normalized parameter".into()));
+            return Err(StartError::new(
+                StartErrorKind::InvalidInput,
+                "invalid normalized parameter",
+            ));
         }
         self.request(Message::SetParameter { id, value }, RequestKind::StateSave)
     }
@@ -358,7 +435,10 @@ impl PluginControl {
     }
     pub fn set_state(&mut self, blob: &[u8]) -> Result<u32, StartError> {
         if blob.len() > vst_audio_protocol::MAX_STATE_BODY_BYTES {
-            return Err(StartError("state too large".into()));
+            return Err(StartError::new(
+                StartErrorKind::InvalidInput,
+                "state too large",
+            ));
         }
         self.request(
             Message::SetState {
@@ -411,7 +491,9 @@ impl PluginControl {
         self.process.pid()
     }
     pub fn exit_code(&self) -> Result<Option<u32>, StartError> {
-        self.process.exit_code().map_err(error)
+        self.process
+            .exit_code()
+            .map_err(|error| StartError::new(StartErrorKind::Io, error.to_string()))
     }
     pub fn poll(&mut self, now_ms: u64) -> Vec<ControlEvent> {
         let mut events = Vec::new();
@@ -547,10 +629,13 @@ impl PluginProcess {
         state: Option<&[u8]>,
     ) -> Result<Started, StartError> {
         if options.slots > MAX_SLOTS || !options.slots.is_power_of_two() || options.slots < 2 {
-            return Err(StartError(format!(
-                "ring slots must be a power of two in 2..={MAX_SLOTS}, got {}",
-                options.slots
-            )));
+            return Err(StartError::new(
+                StartErrorKind::InvalidInput,
+                format!(
+                    "ring slots must be a power of two in 2..={MAX_SLOTS}, got {}",
+                    options.slots
+                ),
+            ));
         }
         let rate = options.sample_rate;
         let frames = options.quantum;
@@ -565,7 +650,7 @@ impl PluginProcess {
             sample_rate: rate,
             latency_bound_frames: rate
                 .checked_mul(2)
-                .ok_or_else(|| StartError("invalid rate".into()))?,
+                .ok_or_else(|| StartError::new(StartErrorKind::InvalidInput, "invalid rate"))?,
         };
         let (process, transport, region, work, done, ready) = spawn(
             exe,
@@ -579,7 +664,7 @@ impl PluginProcess {
         let mut watch = ControlWatch::new(0);
         let hello = transport.response(0, Duration::from_secs(5))?;
         if hello.message != Message::hello() {
-            return Err(StartError("expected Hello".into()));
+            return Err(StartError::new(StartErrorKind::Protocol, "expected Hello"));
         }
         watch.received(0, &hello);
         transport.send(
@@ -587,7 +672,9 @@ impl PluginProcess {
             Message::Load {
                 path: plugin
                     .to_str()
-                    .ok_or_else(|| StartError("plugin path must be UTF-8".into()))?
+                    .ok_or_else(|| {
+                        StartError::new(StartErrorKind::InvalidInput, "plugin path must be UTF-8")
+                    })?
                     .into(),
                 format,
                 class_id: class,
@@ -602,16 +689,22 @@ impl PluginProcess {
             ..
         } = loaded.message
         else {
-            return Err(StartError("expected Loaded".into()));
+            return Err(StartError::new(StartErrorKind::Protocol, "expected Loaded"));
         };
         transport.send(2, Message::Describe)?;
         let Message::Features(capabilities) =
             transport.response(2, Duration::from_secs(10))?.message
         else {
-            return Err(StartError("expected capabilities".into()));
+            return Err(StartError::new(
+                StartErrorKind::Protocol,
+                "expected capabilities",
+            ));
         };
         if options.sample_format == SampleFormat::F64 && !capabilities.f64 {
-            return Err(StartError("plugin does not support f64".into()));
+            return Err(StartError::new(
+                StartErrorKind::Start,
+                "plugin does not support f64",
+            ));
         }
         let (selected_inputs, selected_outputs) = resolve_buses(&inputs, &outputs, options)?;
         let setup = ProcessingSetup {
@@ -623,12 +716,18 @@ impl PluginProcess {
             outputs: selected_outputs,
         };
         if !setup.valid() {
-            return Err(StartError("invalid processing setup".into()));
+            return Err(StartError::new(
+                StartErrorKind::InvalidInput,
+                "invalid processing setup",
+            ));
         }
         let input_wave_bits = speaker_bits(&setup.inputs);
         let output_wave_bits = speaker_bits(&setup.outputs);
         if latency_frames > maximum.latency_bound_frames {
-            return Err(StartError("unsupported plugin latency".into()));
+            return Err(StartError::new(
+                StartErrorKind::Start,
+                "unsupported plugin latency",
+            ));
         }
         let geometry = Geometry {
             input_channels: u32::from(ProcessingSetup::channels(&setup.inputs)),
@@ -641,11 +740,11 @@ impl PluginProcess {
         let publisher = {
             let view = region
                 .region_for(geometry)
-                .map_err(|e| error(format!("{e:?}")))?;
+                .map_err(|e| StartError::new(StartErrorKind::InvalidInput, format!("{e:?}")))?;
             let mut producer = Producer::new(view, [Some(&*work), None], &*ready);
             producer
                 .announce_at(geometry, std::process::id(), options.sequence_origin)
-                .map_err(|e| error(format!("{e:?}")))?;
+                .map_err(|e| StartError::new(StartErrorKind::InvalidInput, format!("{e:?}")))?;
             transport.send(3, Message::Prepare(setup.clone()))?;
             expect_ack(transport.response(3, Duration::from_secs(10))?)?;
             if let Some(blob) = state {
@@ -660,11 +759,14 @@ impl PluginProcess {
             transport.send(5, Message::Activate)?;
             expect_ack(transport.response(5, Duration::from_secs(10))?)?;
             if producer.wait_ready(Duration::from_secs(10)) != Waited::Signalled {
-                return Err(StartError("ring readiness timeout".into()));
+                return Err(StartError::new(
+                    StartErrorKind::Start,
+                    "ring readiness timeout",
+                ));
             }
             producer
                 .publisher()
-                .ok_or_else(|| StartError("ring was not announced".into()))?
+                .ok_or_else(|| StartError::new(StartErrorKind::Start, "ring was not announced"))?
         };
         watch.activated(origin.elapsed().as_millis() as u64);
         let mut control = PluginControl {
@@ -687,7 +789,10 @@ impl PluginProcess {
         }
         let latency_frames = control.latency();
         if latency_frames > maximum.latency_bound_frames {
-            return Err(StartError("unsupported configured plugin latency".into()));
+            return Err(StartError::new(
+                StartErrorKind::Start,
+                "unsupported configured plugin latency",
+            ));
         }
         Ok(Started {
             sandbox,
@@ -726,8 +831,9 @@ impl PluginProcess {
                 .extension()
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("vst3"))
         {
-            return Err(StartError(
-                "scan format does not match plugin extension".into(),
+            return Err(StartError::new(
+                StartErrorKind::InvalidInput,
+                "scan format does not match plugin extension",
             ));
         }
         let geometry = Geometry {
@@ -744,23 +850,28 @@ impl PluginProcess {
             spawn(exe, path, geometry, None, policy, crate::LinuxEditor::Auto)?;
         sandbox_report(&transport, policy)?;
         if transport.response(0, Duration::from_secs(5))?.message != Message::hello() {
-            return Err(StartError("expected Hello".into()));
+            return Err(StartError::new(StartErrorKind::Protocol, "expected Hello"));
         }
         transport.send(
             1,
             Message::Scan {
                 path: path
                     .to_str()
-                    .ok_or_else(|| StartError("plugin path must be UTF-8".into()))?
+                    .ok_or_else(|| {
+                        StartError::new(StartErrorKind::InvalidInput, "plugin path must be UTF-8")
+                    })?
                     .into(),
             },
         )?;
         let reply = transport.response(1, Duration::from_secs(60))?;
         let Message::Classes { entries } = reply.message else {
-            return Err(StartError("expected Classes".into()));
+            return Err(StartError::new(
+                StartErrorKind::Protocol,
+                "expected Classes",
+            ));
         };
         if !process.wait(Duration::from_secs(2)) {
-            return Err(StartError("scan did not exit".into()));
+            return Err(StartError::new(StartErrorKind::Start, "scan did not exit"));
         }
         Ok(entries)
     }
@@ -769,7 +880,7 @@ fn expect_ack(frame: Frame) -> Result<(), StartError> {
     if frame.message == Message::Ack {
         Ok(())
     } else {
-        Err(StartError("expected Ack".into()))
+        Err(StartError::new(StartErrorKind::Protocol, "expected Ack"))
     }
 }
 type Spawned = (
@@ -788,8 +899,9 @@ fn sandbox_report(
         .map(|policy| {
             let reply = transport.response(0, Duration::from_secs(10))?;
             let Message::Sandboxed { mechanism } = reply.message else {
-                return Err(StartError(
-                    "worker did not confirm sandbox installation".into(),
+                return Err(StartError::new(
+                    StartErrorKind::Start,
+                    "worker did not confirm sandbox installation",
                 ));
             };
             Ok(crate::SandboxReport::applied(policy, mechanism))
@@ -804,22 +916,31 @@ fn spawn(
     policy: Option<&crate::SandboxPolicy>,
     linux_editor: crate::LinuxEditor,
 ) -> Result<Spawned, StartError> {
-    let sandbox =
-        vst_audio_transport_sys::sandbox::SandboxLaunch::new(policy, plugin).map_err(error)?;
+    let sandbox = vst_audio_transport_sys::sandbox::SandboxLaunch::new(policy, plugin)
+        .map_err(|error| StartError::new(StartErrorKind::Io, error.to_string()))?;
     let region = Arc::new(
         SharedRegion::create(
             geometry
                 .total_bytes()
-                .map_err(|e| error(format!("{e:?}")))?,
+                .map_err(|e| StartError::new(StartErrorKind::InvalidInput, format!("{e:?}")))?,
         )
-        .map_err(error)?,
+        .map_err(|error| StartError::new(StartErrorKind::Io, error.to_string()))?,
     );
-    let input = Pipe::create(false).map_err(error)?;
-    let output = Pipe::create(true).map_err(error)?;
-    let work = Arc::new(Event::create().map_err(error)?);
-    let done = Arc::new(Event::create().map_err(error)?);
-    let ready = Arc::new(Event::create().map_err(error)?);
-    let parent = runtime::parent_handle().map_err(error)?;
+    let input = Pipe::create(false)
+        .map_err(|error| StartError::new(StartErrorKind::Io, error.to_string()))?;
+    let output = Pipe::create(true)
+        .map_err(|error| StartError::new(StartErrorKind::Io, error.to_string()))?;
+    let work = Arc::new(
+        Event::create().map_err(|error| StartError::new(StartErrorKind::Io, error.to_string()))?,
+    );
+    let done = Arc::new(
+        Event::create().map_err(|error| StartError::new(StartErrorKind::Io, error.to_string()))?,
+    );
+    let ready = Arc::new(
+        Event::create().map_err(|error| StartError::new(StartErrorKind::Io, error.to_string()))?,
+    );
+    let parent = runtime::parent_handle()
+        .map_err(|error| StartError::new(StartErrorKind::Io, error.to_string()))?;
     let values = [
         input.child_value() as u64,
         output.child_value() as u64,
@@ -850,8 +971,10 @@ fn spawn(
     args.push("--linux-editor".into());
     args.push(linux_editor.argument().into());
     sandbox.arguments(&mut args);
-    let process =
-        Arc::new(runtime::spawn_handles(exe, &args, &values, parent, sandbox).map_err(error)?);
+    let process = Arc::new(
+        runtime::spawn_handles(exe, &args, &values, parent, sandbox)
+            .map_err(|error| StartError::new(StartErrorKind::Io, error.to_string()))?,
+    );
     drop(input.child);
     drop(output.child);
     let transport = Transport::new(output.parent, input.parent, cancel, process.clone());
@@ -933,7 +1056,7 @@ mod tests {
         assert_eq!(
             resolve_buses(&[bus(BusKind::Main)], &[], &wrong_length)
                 .unwrap_err()
-                .0,
+                .to_string(),
             "bus selection must configure every declared bus"
         );
         let failed = ProcessingOptions {
@@ -943,8 +1066,30 @@ mod tests {
         assert!(
             resolve_buses(&[], &[], &failed)
                 .unwrap_err()
-                .0
+                .to_string()
                 .starts_with("bus selection:")
+        );
+    }
+
+    #[test]
+    fn start_rejects_invalid_slots_before_launching_a_worker() {
+        let options = ProcessingOptions {
+            slots: 3,
+            ..Default::default()
+        };
+        let error = PluginProcess::start_configured(
+            Path::new("unused-worker"),
+            Path::new("unused-plugin"),
+            PluginFormat::Vst2,
+            None,
+            &options,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), StartErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            format!("ring slots must be a power of two in 2..={MAX_SLOTS}, got 3")
         );
     }
 
