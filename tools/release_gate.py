@@ -36,6 +36,7 @@ import fnmatch
 import os
 import re
 import subprocess
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -235,6 +236,17 @@ def _git(*args) -> str:
     return _run("git", *args).stdout.strip()
 
 
+def _fetch_tags() -> None:
+    for attempt in range(1, 4):
+        result = _run("git", "fetch", "--tags", "--force", "--quiet", "origin", check=False)
+        if result.returncode == 0:
+            return
+        print(f"::warning::tag fetch failed (attempt {attempt})\n{result.stderr}")
+        if attempt < 3:
+            time.sleep(5)
+    raise SystemExit("tag fetch failed after 3 attempts")
+
+
 def _read(path: Path) -> str:
     with open(path, encoding="utf-8", newline="") as fh:
         return fh.read()
@@ -280,7 +292,7 @@ def _commit_bump(old: str, new: str) -> str | None:
 
 def main() -> int:
     head = os.environ.get("GITHUB_SHA") or _git("rev-parse", "HEAD")
-    _run("git", "fetch", "--tags", "--force", "--quiet", "origin", check=False)
+    _fetch_tags()
     tags = set(_git("tag", "-l", "v*").splitlines())
     version = workspace_version(_read(CARGO_TOML))
     current_tag = f"v{version}"

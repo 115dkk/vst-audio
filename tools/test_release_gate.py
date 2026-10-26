@@ -87,6 +87,14 @@ class Gate(unittest.TestCase):
         self.assertIn('name = "vst-audio-gui-example"\nversion = "0.1.0"', lock)
         self.assertIn('name = "vst3"\nversion = "0.1.0"', lock)
 
+    def test_failed_tag_fetch_exits(self):
+        failed = subprocess.CompletedProcess([], 1, "", "network unavailable")
+        with mock.patch.object(g, "_run", return_value=failed) as run, \
+                mock.patch.object(g.time, "sleep"):
+            with self.assertRaisesRegex(SystemExit, "tag fetch failed after 3 attempts"):
+                g._fetch_tags()
+        self.assertEqual(run.call_count, 3)
+
     def test_rejected_bump_push_defers_release_to_new_main(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "output"
@@ -120,6 +128,7 @@ class Gate(unittest.TestCase):
                     mock.patch.object(g, "published_on_crates_io", return_value=False), \
                     mock.patch.object(g, "_write"), \
                     mock.patch.object(g, "_git", side_effect=git), \
+                    mock.patch.object(g, "_fetch_tags"), \
                     mock.patch.object(g, "_run", side_effect=run):
                 with contextlib.redirect_stdout(io.StringIO()):
                     self.assertEqual(g.main(), 0)
