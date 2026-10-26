@@ -4,7 +4,10 @@ use std::{
     ffi::c_void,
     sync::atomic::{AtomicBool, AtomicU32, Ordering},
 };
-use vst_audio_worker_sys::{vst2::*, vst2_events::TimeInfo};
+use vst_audio_worker_sys::{
+    vst2::*,
+    vst2_events::{Events, TimeInfo},
+};
 
 #[repr(C)]
 struct Instance {
@@ -408,7 +411,7 @@ unsafe extern "C" fn dispatch(
                 mode.store(12, Ordering::Relaxed);
                 return 1;
             }
-            if chunk[0] != 1 || chunk[1] > 20 {
+            if chunk[0] != 1 || chunk[1] > 21 {
                 return 0;
             }
             if chunk[1] == 5 {
@@ -504,6 +507,21 @@ unsafe extern "C" fn process(
         let callback = unsafe { (*raw).host };
         // SAFETY: automate carries no borrowed payload.
         unsafe { callback(effect, MASTER_AUTOMATE, 0, 0, std::ptr::null_mut(), 0.5) };
+    }
+    if mode == 21 {
+        // Audit #11 TD-06: a violating VST2 plugin sends only the common header,
+        // not a full MidiEvent, but advertises 24 bytes (the old host minimum).
+        // Box<[i32; 4]> requests exactly 16 heap bytes; there is no MIDI payload.
+        let header = Box::new([1i32, 24, 0, 0]);
+        let mut events = Events {
+            count: 1,
+            reserved: 0,
+            events: [header.as_ptr().cast()],
+        };
+        // SAFETY: the aligned list and its common 16-byte header remain live for
+        // this synchronous callback. The deliberately false short size is the
+        // fixture's contract violation; no payload is read by the fixture.
+        unsafe { host(effect, 8, 0, 0, (&mut events as *mut Events<1>).cast()) };
     }
     if mode == 9 || (mode == 17 && observations[9].load(Ordering::Relaxed) != 0) {
         observations[8].fetch_add(1, Ordering::Relaxed);

@@ -77,6 +77,50 @@ fn block(s: &Started, sequence: u32) -> f32 {
 }
 #[test]
 #[ignore = "native fixtures required"]
+fn short_midi_header_is_dropped_and_worker_keeps_processing() {
+    let (worker, plugin) = paths();
+    let mut instance = Host::new(worker)
+        .spawn(
+            &PluginDescriptor::new(plugin, PluginFormat::Vst2),
+            &Configuration::default(),
+            Some(&[1, 21]),
+        )
+        .unwrap();
+    let mut audio = instance.take_audio().unwrap();
+    let generation = audio.generation();
+    let input = [0.25f32; 128];
+    let mut samples = [[0.0f32; 128]; 6];
+    let mut outputs: Vec<_> = samples.iter_mut().map(|plane| &mut plane[..]).collect();
+    let mut received = [vst_audio::AudioEvent::default(); 4];
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut processed = 0;
+    while processed < 3 {
+        let report = audio.process_events(
+            128,
+            &[&input, &input],
+            &mut outputs,
+            vst_audio::Transport::default(),
+            &[],
+            &mut received,
+        );
+        if report.status == AudioStatus::Processed {
+            assert_eq!((report.events_written, report.events_dropped), (0, 1));
+            assert_eq!(outputs[0][100], 0.25);
+            assert_eq!(outputs[4][100], 0.125);
+            assert_eq!(audio.generation(), generation);
+            processed += 1;
+        }
+        assert_eq!(instance.status(), vst_audio::Status::Running);
+        assert!(
+            Instant::now() < deadline,
+            "short MIDI stopped worker processing"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+#[ignore = "native fixtures required"]
 fn callbacks_time_latency_and_opaque_state() {
     let mut s = start(7);
     block(&s, 1);
