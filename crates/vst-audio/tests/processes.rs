@@ -159,6 +159,7 @@ fn drop_removes_helper_after_worker_leader_exits() {
     );
 }
 
+#[cfg(target_os = "linux")]
 const INHERITANCE_TEST: &str = "plugin_helper_inherits_no_worker_descriptors";
 
 #[cfg(target_os = "linux")]
