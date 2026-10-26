@@ -6,6 +6,10 @@ use std::os::windows::{
     io::{AsRawHandle, FromRawHandle, OwnedHandle},
 };
 use std::path::Path;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::Duration;
 use windows::{
     Win32::{
@@ -267,13 +271,26 @@ impl InheritedDuplicates {
 }
 
 #[derive(Debug)]
-pub struct ChildProcess {
+struct ChildResources {
     job: OwnedHandle,
     process: OwnedHandle,
-    pid: u32,
     _sandbox: crate::sandbox::SandboxLaunch,
+    #[cfg(test)]
+    fail_wait: std::sync::atomic::AtomicBool,
+}
+
+#[derive(Debug)]
+pub struct ChildProcess {
+    resources: Option<Arc<ChildResources>>,
+    pid: u32,
+    #[cfg(test)]
+    suppress_termination: bool,
 }
 impl ChildProcess {
+    fn resources(&self) -> &ChildResources {
+        self.resources.as_deref().expect("owned child resources")
+    }
+
     /// Low-level launch preserving the supplied handle identities and arguments.
     /// Every selected handle must already be inheritable and remain live through
     /// this call. Use `spawn_handles` for the worker CLI and private app resources.
@@ -390,13 +407,21 @@ impl ChildProcess {
         let process = own(info.hProcess);
         let thread = own(info.hThread);
         let child = Self {
-            job,
-            process,
+            resources: Some(Arc::new(ChildResources {
+                job,
+                process,
+                _sandbox: sandbox,
+                #[cfg(test)]
+                fail_wait: std::sync::atomic::AtomicBool::new(false),
+            })),
             pid: info.dwProcessId,
-            _sandbox: sandbox,
+            #[cfg(test)]
+            suppress_termination: false,
         };
         // SAFETY: child is still suspended and both handles remain owned.
-        let assigned = unsafe { AssignProcessToJobObject(raw(&child.job), raw(&child.process)) };
+        let assigned = unsafe {
+            AssignProcessToJobObject(raw(&child.resources().job), raw(&child.resources().process))
+        };
         if let Err(error) = assigned {
             let _ = child.terminate(3);
             return Err(error);
@@ -412,29 +437,15 @@ impl ChildProcess {
         self.pid
     }
     pub fn handle(&self) -> HANDLE {
-        raw(&self.process)
+        raw(&self.resources().process)
     }
     pub fn duplicate_handle(&self) -> std::io::Result<OwnedHandle> {
-        self.process.try_clone()
+        self.resources().process.try_clone()
     }
     /// Waits for confirmed exit, returning `false` only when the timeout expires.
     /// OS errors retain their raw Win32 error code.
     pub fn wait_for(&self, timeout: Duration) -> std::io::Result<bool> {
-        // SAFETY: owned process handle remains valid for the whole wait.
-        let result = unsafe {
-            WaitForSingleObject(
-                self.handle(),
-                timeout.as_millis().min(u128::from(u32::MAX - 1)) as u32,
-            )
-        };
-        match result {
-            WAIT_OBJECT_0 => Ok(true),
-            WAIT_TIMEOUT => Ok(false),
-            WAIT_FAILED => Err(std::io::Error::last_os_error()),
-            status => Err(std::io::Error::other(format!(
-                "unexpected process wait status: {status:?}"
-            ))),
-        }
+        self.resources().wait_for(timeout)
     }
     /// Legacy boolean wait; use [`Self::wait_for`] to handle OS errors.
     ///
@@ -459,6 +470,10 @@ impl ChildProcess {
         Ok(Some(code))
     }
     pub fn terminate(&self, code: u32) -> windows::core::Result<()> {
+        #[cfg(test)]
+        if self.suppress_termination {
+            return Ok(());
+        }
         // SAFETY: owned child process handle carries terminate access.
         unsafe { TerminateProcess(self.handle(), code) }
     }
@@ -492,13 +507,69 @@ pub fn parent_value(parent: &OwnedHandle) -> usize {
     parent.as_raw_handle() as usize
 }
 
+impl ChildResources {
+    fn wait_for(&self, timeout: Duration) -> std::io::Result<bool> {
+        #[cfg(test)]
+        if self.fail_wait.swap(false, Ordering::Relaxed) {
+            return Err(std::io::Error::from_raw_os_error(
+                ERROR_ACCESS_DENIED.0 as i32,
+            ));
+        }
+        // SAFETY: owned process handle remains valid for the whole wait.
+        let result = unsafe {
+            WaitForSingleObject(
+                raw(&self.process),
+                timeout.as_millis().min(u128::from(u32::MAX - 1)) as u32,
+            )
+        };
+        match result {
+            WAIT_OBJECT_0 => Ok(true),
+            WAIT_TIMEOUT => Ok(false),
+            WAIT_FAILED => Err(std::io::Error::last_os_error()),
+            status => Err(std::io::Error::other(format!(
+                "unexpected process wait status: {status:?}"
+            ))),
+        }
+    }
+}
+
+// Debugger-visible diagnostic: stderr/logging in foreground Drop could block.
+static REAPER_SPAWN_FAILURES: AtomicUsize = AtomicUsize::new(0);
+
 impl Drop for ChildProcess {
     fn drop(&mut self) {
+        if self.resources.is_none() {
+            return;
+        }
         let _ = self.terminate(0);
-        // Bounded: the private temporary directory can only be removed once the
-        // worker has gone, but a process stuck in a driver must not hang the app.
-        // SAFETY: owned process handle stays live until wait completes. This is off the audio thread.
-        unsafe { WaitForSingleObject(self.handle(), 5000) };
+        // Keep the existing bounded foreground wait, off the audio thread.
+        if matches!(self.wait_for(Duration::from_secs(5)), Ok(true)) {
+            return;
+        }
+        let resources = self.resources.take().expect("owned child resources");
+        let reaper = Arc::clone(&resources);
+        // Retain the caller's Arc until spawn succeeds: a rejected spawn drops
+        // its closure, which must not release a still-live worker's sandbox.
+        if std::thread::Builder::new()
+            .name("vst-audio-reaper".into())
+            .spawn(move || {
+                loop {
+                    match reaper.wait_for(Duration::from_secs(5)) {
+                        Ok(true) => break,
+                        Ok(false) => {}
+                        // WAIT_FAILED is not exit confirmation. Keep every
+                        // resource and back off rather than spinning on errors.
+                        Err(_) => std::thread::sleep(Duration::from_secs(1)),
+                    }
+                }
+            })
+            .is_err()
+        {
+            // No safe cleanup is possible without confirmed exit. Deliberately
+            // retain the bundle rather than delete a running worker's storage.
+            REAPER_SPAWN_FAILURES.fetch_add(1, Ordering::Relaxed);
+            std::mem::forget(resources);
+        }
     }
 }
 fn quote_argument(argument: &OsStr) -> windows::core::Result<OsString> {
@@ -740,6 +811,76 @@ mod tests {
     }
 
     #[test]
+    fn drop_wait_error_retains_temporary_until_reaper_confirms_exit() {
+        use std::io::Write;
+
+        let exe = std::env::current_exe().unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().to_owned();
+        // Only storage ownership is under test; avoid requiring AppContainer
+        // setup for the unit-test executable.
+        let sandbox = crate::sandbox::SandboxLaunch {
+            policy: None,
+            temporary: Some(temporary),
+            plugin: exe.clone(),
+        };
+        let mut gate = Pipe::create(false).unwrap();
+        let mut child = spawn_handles(
+            &exe,
+            &[
+                "--exact".into(),
+                "runtime::tests::reaper_wait_child".into(),
+                "--ignored".into(),
+                "--".into(),
+                "--control-in".into(),
+                gate.child_value().to_string().into(),
+            ],
+            &[gate.child_value() as u64],
+            parent_handle().unwrap(),
+            sandbox,
+        )
+        .unwrap();
+        let process = child.duplicate_handle().unwrap();
+        // The child cannot exit normally until this test releases the pipe.
+        // Suppress termination to model a delayed kill; fail the actual wait
+        // boundary once so Drop must hand ownership to the background reaper.
+        child.suppress_termination = true;
+        child.resources().fail_wait.store(true, Ordering::Relaxed);
+        drop(child);
+        assert!(!process_gone(&process));
+        assert!(path.exists(), "Drop removed storage before confirmed exit");
+
+        gate.parent.write_all(&[1]).unwrap();
+        // SAFETY: this independently owned duplicate retains SYNCHRONIZE rights.
+        let status = unsafe { WaitForSingleObject(raw(&process), 15_000) };
+        assert_eq!(status, WAIT_OBJECT_0);
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while path.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !path.exists(),
+            "reaper did not remove storage after child exit"
+        );
+    }
+
+    #[test]
+    #[ignore = "subprocess entry point for drop_wait_error_retains_temporary_until_reaper_confirms_exit"]
+    fn reaper_wait_child() {
+        use std::io::Read;
+
+        let args: Vec<_> = std::env::args().collect();
+        let index = args.iter().position(|arg| arg == "--control-in").unwrap();
+        let handle = args[index + 1].parse().unwrap();
+        let mut byte = [0];
+        inherited_file(handle)
+            .unwrap()
+            .read_exact(&mut byte)
+            .unwrap();
+        assert_eq!(byte, [1]);
+    }
+
+    #[test]
     fn process_wait_errors_preserve_access_denied() {
         let pid = std::process::id();
         // SAFETY: the current process exists; OpenProcess returns a fresh owned
@@ -748,11 +889,15 @@ mod tests {
             own(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.unwrap());
         // SAFETY: unnamed job with default security; no process is assigned to it.
         let job = own(unsafe { CreateJobObjectW(None, None) }.unwrap());
-        let child = ChildProcess {
-            job,
-            process,
+        let mut child = ChildProcess {
+            resources: Some(Arc::new(ChildResources {
+                job,
+                process,
+                _sandbox: crate::sandbox::SandboxLaunch::new(None, Path::new("unused")).unwrap(),
+                fail_wait: std::sync::atomic::AtomicBool::new(false),
+            })),
             pid,
-            _sandbox: crate::sandbox::SandboxLaunch::new(None, Path::new("unused")).unwrap(),
+            suppress_termination: false,
         };
 
         let error = child.wait_for(Duration::ZERO).unwrap_err();
@@ -765,7 +910,8 @@ mod tests {
         let panic = std::panic::catch_unwind(|| child.wait(Duration::ZERO)).unwrap_err();
         let message = panic.downcast_ref::<String>().unwrap();
         assert!(message.contains("failed to wait for child process exit"));
-        // Drop cannot terminate this process: the handle has no terminate right.
-        // Its wait also fails immediately, and the empty job owns no processes.
+        // This artificial object owns no child: it only has a query handle to
+        // ourselves and an empty job. Do not start an endless reaper for self.
+        drop(child.resources.take());
     }
 }
