@@ -33,6 +33,27 @@ fn plugin_error(error: impl std::fmt::Display) -> PluginError {
     PluginError(error.to_string())
 }
 
+fn scan_format(path: &Path) -> Result<PluginFormat, StartError> {
+    let extension = path
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or_else(|| StartError("unknown plugin extension".into()))?;
+    if extension.eq_ignore_ascii_case("vst3") {
+        return Ok(PluginFormat::Vst3);
+    }
+    #[cfg(target_os = "windows")]
+    let vst2 = extension.eq_ignore_ascii_case("dll");
+    #[cfg(target_os = "macos")]
+    let vst2 = extension.eq_ignore_ascii_case("vst");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let vst2 = extension.eq_ignore_ascii_case("so");
+    if vst2 {
+        Ok(PluginFormat::Vst2)
+    } else {
+        Err(StartError(format!("unknown plugin extension: {extension}")))
+    }
+}
+
 fn loaded<'a>(
     plugin: &'a mut Option<Box<dyn Plugin>>,
 ) -> Result<&'a mut (dyn Plugin + 'static), StartError> {
@@ -585,33 +606,34 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
                             .transpose()
                             .map_err(error)?;
                         let reply = match message {
-                            Message::Scan { path } => {
-                                if Path::new(&path)
-                                    .extension()
-                                    .is_some_and(|ext| ext.eq_ignore_ascii_case("vst3"))
-                                {
+                            Message::Scan { path } => match scan_format(Path::new(&path))? {
+                                PluginFormat::Vst3 => {
                                     let module = vst_audio_worker_sys::vst3::Vst3Module::load(
                                         Path::new(&path),
                                     )
                                     .map_err(error)?;
-                                    let entries = module
-                                        .scan()
-                                        .map_err(error)?
-                                        .into_iter()
-                                        .map(|class| ClassInfo {
-                                            id: class.id,
-                                            name: class.name,
-                                            vendor: class.vendor,
-                                            category: class.category,
-                                        })
-                                        .collect();
-                                    return Ok(Message::Classes { entries });
+                                    Ok(Message::Classes {
+                                        entries: module
+                                            .scan()
+                                            .map_err(error)?
+                                            .into_iter()
+                                            .map(|class| ClassInfo {
+                                                id: class.id,
+                                                name: class.name,
+                                                vendor: class.vendor,
+                                                category: class.category,
+                                            })
+                                            .collect(),
+                                    })
                                 }
-                                let scanned = Vst2Plugin::load(Path::new(&path)).map_err(error)?;
-                                Ok(Message::Classes {
-                                    entries: scanned.classes().map_err(error)?,
-                                })
-                            }
+                                PluginFormat::Vst2 => {
+                                    let scanned =
+                                        Vst2Plugin::load(Path::new(&path)).map_err(error)?;
+                                    Ok(Message::Classes {
+                                        entries: scanned.classes().map_err(error)?,
+                                    })
+                                }
+                            },
                             Message::Load {
                                 path,
                                 format,
@@ -881,6 +903,20 @@ mod tests {
                 .unwrap_err()
                 .to_string(),
             "earlier failure"
+        );
+    }
+
+    #[test]
+    fn scan_rejects_unknown_plugin_extension() {
+        assert_eq!(
+            scan_format(Path::new("plugin.vst3")).unwrap(),
+            PluginFormat::Vst3
+        );
+        assert!(
+            scan_format(Path::new("plugin.unknown"))
+                .unwrap_err()
+                .to_string()
+                .contains("unknown plugin extension")
         );
     }
 
