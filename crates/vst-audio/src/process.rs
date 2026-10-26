@@ -35,7 +35,9 @@ fn following_request(request: u32) -> u32 {
     }
 }
 /// Programmatic classification of application startup and control failures.
+/// New kinds may be added without a breaking release.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum StartErrorKind {
     /// The operation was cancelled by the caller.
     Cancelled,
