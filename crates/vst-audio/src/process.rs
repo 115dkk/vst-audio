@@ -439,6 +439,8 @@ pub struct PluginControl {
     exit_seen: bool,
     pub needs_respawn: bool,
     transport_failed: bool,
+    checkpoint_pending: bool,
+    checkpoint_failure: Option<String>,
 }
 impl PluginControl {
     pub fn state_history(&self) -> vst_audio_protocol::StateHistory {
@@ -477,6 +479,18 @@ impl PluginControl {
     }
     pub fn get_state(&mut self) -> Result<u32, StartError> {
         self.request(Message::GetState, RequestKind::StateSave)
+    }
+    fn request_checkpoint(&mut self) {
+        match self.get_state() {
+            Ok(_) => self.checkpoint_pending = false,
+            Err(error) if error.kind() == StartErrorKind::QueueFull => {
+                self.checkpoint_pending = true;
+            }
+            Err(error) => {
+                self.checkpoint_pending = false;
+                self.checkpoint_failure = Some(error.to_string());
+            }
+        }
     }
     pub fn set_state(&mut self, blob: &[u8]) -> Result<u32, StartError> {
         if blob.len() > vst_audio_protocol::MAX_STATE_BODY_BYTES {
@@ -553,6 +567,15 @@ impl PluginControl {
         E: std::fmt::Display,
     {
         let mut events = Vec::new();
+        if self.checkpoint_pending {
+            self.request_checkpoint();
+        }
+        if let Some(reason) = self.checkpoint_failure.take() {
+            events.push(ControlEvent::TransportError {
+                operation: "write",
+                reason,
+            });
+        }
         // Query the OS even when a pipe write is blocked. Only publishing a
         // successful exit waits for pending write diagnostics, never the query.
         let status = if self.exit_seen { Ok(None) } else { status() };
@@ -578,7 +601,7 @@ impl PluginControl {
                 Ok(Some(DecodedFrame::Known(frame))) => {
                     let action = self.watch.received(now_ms, &frame);
                     if action == Action::SaveStateNow {
-                        let _ = self.get_state();
+                        self.request_checkpoint();
                     }
                     if action != Action::None {
                         events.push(ControlEvent::Action(action));
@@ -648,7 +671,7 @@ impl PluginControl {
                     let _ = self.process.terminate(3);
                 }
                 Action::SaveStateNow => {
-                    let _ = self.get_state();
+                    self.request_checkpoint();
                 }
                 Action::Spawn => {
                     self.needs_respawn = true;
@@ -889,6 +912,8 @@ impl PluginProcess {
             exit_seen: false,
             needs_respawn: false,
             transport_failed: false,
+            checkpoint_pending: false,
+            checkpoint_failure: None,
         };
         let saved = control.get_state()?;
         let state_reply = control.transport.response(saved, Duration::from_secs(10))?;
@@ -1188,6 +1213,8 @@ mod tests {
                 exit_seen: false,
                 needs_respawn: false,
                 transport_failed: false,
+                checkpoint_pending: false,
+                checkpoint_failure: None,
             },
             release_input,
         )
@@ -1315,6 +1342,85 @@ mod tests {
                 "{policy:?}"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn automatic_checkpoint_retries_after_the_control_queue_drains() {
+        struct GatedCapture {
+            entered: mpsc::Sender<()>,
+            release: mpsc::Receiver<()>,
+            blocked: bool,
+            bytes: Arc<std::sync::Mutex<Vec<u8>>>,
+        }
+        impl Write for GatedCapture {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if !self.blocked {
+                    self.blocked = true;
+                    self.entered.send(()).unwrap();
+                    self.release.recv().unwrap();
+                }
+                self.bytes.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (entered, observed) = mpsc::channel();
+        let (release, blocked) = mpsc::channel();
+        let bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (mut control, _input) = test_control(GatedCapture {
+            entered,
+            release: blocked,
+            blocked: false,
+            bytes: bytes.clone(),
+        });
+        control.get_state().unwrap();
+        observed.recv_timeout(Duration::from_secs(1)).unwrap();
+        for _ in 0..8 {
+            control.get_state().unwrap();
+        }
+
+        let (frames, received) = mpsc::sync_channel(1);
+        control.transport.receive = received;
+        frames
+            .send(Ok(Some(DecodedFrame::Known(Frame {
+                flags: 0,
+                request: 0,
+                message: Message::EditorClosed,
+            }))))
+            .unwrap();
+        control.poll_with_status(0, || Ok::<_, io::Error>(None));
+        release.send(()).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            control.poll_with_status(1, || Ok::<_, io::Error>(None));
+            if control.transport.queued_writes.load(Ordering::Acquire) == 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "checkpoint retry was not written"
+            );
+            thread::yield_now();
+        }
+        let captured = bytes.lock().unwrap().clone();
+        let mut input = io::Cursor::new(captured);
+        let mut requests = Vec::new();
+        while let Some(frame) = read_frame(&mut input).unwrap() {
+            let DecodedFrame::Known(frame) = frame else {
+                panic!("application wrote an unknown frame")
+            };
+            if frame.message == Message::GetState {
+                requests.push(frame.request);
+            }
+        }
+        assert_eq!(requests.len(), 10);
+        assert_eq!(&requests[..9], &[6, 7, 8, 9, 10, 11, 12, 13, 14]);
+        assert!(requests[9] > 14, "the deferred checkpoint was not retried");
     }
 
     #[cfg(unix)]
