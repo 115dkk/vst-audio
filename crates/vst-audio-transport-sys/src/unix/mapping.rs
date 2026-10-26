@@ -54,7 +54,25 @@ impl SharedRegion {
         {
             return Err(io::Error::other("inherited mapping already opened"));
         }
-        Self::map(crate::runtime::inherited_file(value)?, bytes)
+        let file = crate::runtime::inherited_file(value)?;
+        #[cfg(target_os = "linux")]
+        {
+            // audit #11 TD-01: an inherited unsealed file can be truncated by its sender;
+            // opening_an_unsealed_descriptor_is_refused covers that case.
+            // SAFETY: live owned descriptor; F_GET_SEALS has no pointer payload.
+            let seals = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GET_SEALS) };
+            if seals < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let required = libc::F_SEAL_SHRINK | libc::F_SEAL_GROW;
+            if seals & required != required {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "mapping must be sealed against shrinking and growing",
+                ));
+            }
+        }
+        Self::map(file, bytes)
     }
     fn map(file: File, bytes: usize) -> io::Result<Self> {
         if !(vst_audio_ring::MIN_REGION_BYTES..vst_audio_ring::MAX_REGION_BYTES).contains(&bytes)
@@ -131,14 +149,15 @@ impl SharedRegion {
 /// Creates the file behind a new application mapping, already at its final length.
 fn backing_file(bytes: usize) -> io::Result<File> {
     #[cfg(target_os = "linux")]
-    match sealed_memfd(bytes) {
-        // Only a kernel without memfd_create falls back to an unsealed file.
-        Err(error) if error.raw_os_error() == Some(libc::ENOSYS) => {}
-        result => return result,
+    {
+        sealed_memfd(bytes)
     }
-    let file = tempfile::tempfile()?;
-    file.set_len(bytes as u64)?;
-    Ok(file)
+    #[cfg(not(target_os = "linux"))]
+    {
+        let file = tempfile::tempfile()?;
+        file.set_len(bytes as u64)?;
+        Ok(file)
+    }
 }
 
 /// An anonymous memory file that no descriptor holder can shrink or grow.
@@ -181,6 +200,72 @@ impl Drop for SharedRegion {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opening_an_unsealed_descriptor_is_refused() {
+        const CASE_ENV: &str = "VST_AUDIO_MAPPING_SEAL_TEST";
+        let Ok(case) = std::env::var(CASE_ENV) else {
+            for case in ["unsealed", "tempfile", "shrink-only", "grow-only", "sealed"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "mapping::tests::opening_an_unsealed_descriptor_is_refused",
+                        "--nocapture",
+                    ])
+                    .env(CASE_ENV, case)
+                    .output()
+                    .unwrap();
+                assert!(
+                    String::from_utf8_lossy(&output.stdout).contains("running 1 test"),
+                    "child must execute the descriptor test",
+                );
+                assert!(
+                    output.status.success(),
+                    "{case}:\n{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                );
+            }
+            return;
+        };
+        let bytes = 64 * 1024;
+        let file = if case == "tempfile" {
+            tempfile::tempfile().unwrap()
+        } else {
+            use std::os::fd::{FromRawFd, OwnedFd};
+            // SAFETY: constant NUL-terminated name and documented memfd flags.
+            let fd = unsafe {
+                libc::memfd_create(
+                    c"vst-audio-unsealed-test".as_ptr(),
+                    libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+                )
+            };
+            assert!(fd >= 0, "{}", io::Error::last_os_error());
+            // SAFETY: memfd_create returned a new descriptor with no other owner.
+            File::from(unsafe { OwnedFd::from_raw_fd(fd) })
+        };
+        file.set_len(bytes as u64).unwrap();
+        let seals = match case.as_str() {
+            "shrink-only" => libc::F_SEAL_SHRINK,
+            "grow-only" => libc::F_SEAL_GROW,
+            "sealed" => libc::F_SEAL_SHRINK | libc::F_SEAL_GROW,
+            _ => 0,
+        };
+        if seals != 0 {
+            // SAFETY: live owned descriptor; adding seals has no pointer payload.
+            let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, seals) };
+            assert_eq!(result, 0);
+        }
+        let result = SharedRegion::open(file.as_raw_fd() as usize, bytes);
+        if case == "sealed" {
+            let region = result.unwrap();
+            assert_eq!(region.bytes(), bytes);
+            assert_eq!(region.latency_bound(), 0);
+        } else {
+            assert!(result.is_err(), "{case} descriptor must not be mapped");
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        }
+    }
 
     #[test]
     fn worker_descriptor_cannot_resize_the_application_mapping() {
