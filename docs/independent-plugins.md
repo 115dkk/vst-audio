@@ -9,9 +9,11 @@ dumps are not artifacts or cache entries.
 
 Pinned sources:
 
-- [DPF 4238e1c](https://github.com/DISTRHO/DPF/tree/4238e1c7f0351bbe488d79f0899c540543ac7583):
-  MIDI Through and Latency, both VST2 and VST3. The harness only selects the
-  existing DSP source files and build targets; it does not patch upstream code.
+- [DPF b801214](https://github.com/DISTRHO/DPF/tree/b801214e9ce41b56907e1c6c84859b6b4536917d):
+  MIDI Through, Latency, Parameters and SendNote, both VST2 and VST3. The harness
+  only selects existing source files and build targets; it does not patch upstream code.
+- [DPF-Plugins df5cb65](https://github.com/DISTRHO/DPF-Plugins/tree/df5cb658a2d8dc6e944d8c26a53853a7c0c6c2b2):
+  3 Band EQ and MVerb, both VST2 and VST3.
 - [VST3 SDK 3cdf9c](https://github.com/steinbergmedia/vst3sdk/tree/3cdf9ca5d1f5b1b21e0a86832aa4abe55607bd96):
   ADelay and mda DX10. SDK submodule commits are resolved from this pinned tree.
 

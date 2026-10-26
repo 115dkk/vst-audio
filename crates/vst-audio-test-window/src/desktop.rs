@@ -169,39 +169,41 @@ impl Drop for Apartment {
 }
 thread_local! { static COM: Apartment = Apartment::new(); }
 /// Bounds of the first named UIA descendant, optionally restricted by class.
-pub fn find_named(top: u64, name: &str, class: Option<&str>) -> Option<Rect> {
+pub fn find_named(
+    top: u64,
+    name: &str,
+    class: Option<&str>,
+) -> windows::core::Result<Option<Rect>> {
     COM.with(|_| {});
     // SAFETY: COM is initialized on this thread; result is retained only within this call.
     let automation: IUIAutomation =
-        unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) }.ok()?;
+        unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) }?;
     // SAFETY: UIA validates the HWND; no raw caller pointers are retained.
-    let root = unsafe { automation.ElementFromHandle(hwnd(top)) }.ok()?;
+    let root = unsafe { automation.ElementFromHandle(hwnd(top)) }?;
     let value = VARIANT::from(name);
     // SAFETY: live automation object and initialized string variant.
-    let mut condition =
-        unsafe { automation.CreatePropertyCondition(UIA_NamePropertyId, &value) }.ok()?;
+    let mut condition = unsafe { automation.CreatePropertyCondition(UIA_NamePropertyId, &value) }?;
     if let Some(class) = class {
         let value = VARIANT::from(class);
         // SAFETY: live automation object and initialized string variant.
-        let other =
-            unsafe { automation.CreatePropertyCondition(UIA_ClassNamePropertyId, &value) }.ok()?;
+        let other = unsafe { automation.CreatePropertyCondition(UIA_ClassNamePropertyId, &value) }?;
         // SAFETY: both conditions are owned COM references valid for this call.
-        condition = unsafe { automation.CreateAndCondition(&condition, &other) }.ok()?;
+        condition = unsafe { automation.CreateAndCondition(&condition, &other) }?;
     }
     // SAFETY: live root and condition, descendant-only search.
-    let element = unsafe { root.FindFirst(TreeScope_Descendants, &condition) }.ok()?;
+    let element = unsafe { root.FindFirst(TreeScope_Descendants, &condition) }?;
     // SAFETY: owned element reference, read-only property query.
-    if unsafe { element.CurrentIsOffscreen() }.ok()?.as_bool() {
-        return None;
+    if unsafe { element.CurrentIsOffscreen() }?.as_bool() {
+        return Ok(None);
     }
     // SAFETY: owned element reference, read-only property query.
-    let rect: Rect = unsafe { element.CurrentBoundingRectangle() }.ok()?.into();
+    let rect: Rect = unsafe { element.CurrentBoundingRectangle() }?.into();
     let screen = desktop_rect();
-    (rect.width() > 0
+    Ok((rect.width() > 0
         && rect.height() > 0
         && screen.contains(rect.left, rect.top)
         && screen.contains(rect.right - 1, rect.bottom - 1))
-    .then_some(rect)
+    .then_some(rect))
 }
 /// RGBA pixels of a screen rectangle as composed on the desktop.
 pub fn capture(rect: Rect) -> Vec<u8> {

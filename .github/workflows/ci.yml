@@ -43,6 +43,10 @@ jobs:
         # headless compositor, with and without an X server for Auto fallback.
         run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update -qq && sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y xvfb xauth weston xwayland
       - run: cargo fmt --all -- --check
+      - name: Release gate unit tests
+        if: runner.os == 'Linux'
+        working-directory: tools
+        run: python3 -m unittest test_release_gate
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo test --locked --workspace
       - run: cargo doc --locked --workspace --no-deps
@@ -241,11 +245,16 @@ jobs:
           rustup toolchain install
           rustup toolchain install nightly-2026-10-20 --profile minimal --component rust-src
           cargo install cargo-fuzz --version 0.13.2 --locked
+          cargo install cargo-audit --version 0.22.2 --locked
           sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update -qq
           sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y xvfb xauth
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           shared-key: extended
+      - name: Audit workspace and GUI dependencies
+        run: |
+          cargo audit --file Cargo.lock
+          cargo audit --file examples/gui/Cargo.lock
       - name: Coverage-guided protocol and ring fuzzing
         run: python3 tools/fuzz_tests.py
       - name: Native worker and fixture memory checks

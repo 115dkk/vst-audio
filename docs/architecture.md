@@ -173,11 +173,12 @@ host child window remains alive. DPF unregisters its `IRunLoop` timer during
 `removed()`, and the host rechecks timer registration before each callback. This
 ordering matters because destroying an X parent also destroys its children; a
 plugin that subsequently calls `XGetGeometry`, `XUnmapWindow`, or `XDestroyWindow`
-would otherwise use stale resource IDs. After a plugin has loaded, Linux workers
-also install a dynamically resolved `XSetErrorHandler` from an already-loaded
-`libX11.so.6` (`RTLD_NOLOAD`) so a protocol error is reported once per event and
-returns without terminating the worker. This handler covers X protocol errors,
-not Xlib I/O errors such as a lost server connection.
+would otherwise use stale resource IDs. Before loading a plugin, Linux workers preload `libX11.so.6` when it is installed
+and register a dynamically resolved `XSetErrorHandler`. Preloading matters because
+JUCE may load Xlib only when its editor opens, after the host must already have
+replaced Xlib's process-terminating default protocol-error handler. The handler
+reports once per event and returns without terminating the worker. It covers X
+protocol errors, not Xlib I/O errors such as a lost server connection.
 
 ## Data planes
 

@@ -79,13 +79,22 @@ def main():
                         child = subprocess.Popen(["cargo", "test", "--locked", "-p", "vst-audio", "--test", "wayland",
                             "compositor_disconnect_closes_editor_and_preserves_audio", "--", "--ignored", "--nocapture"],
                             cwd=ROOT, env=dict(env, VST_AUDIO_KILL_MARKER=str(marker)))
-                        deadline = time.monotonic() + 20
-                        while not marker.exists() and child.poll() is None and time.monotonic() < deadline:
-                            time.sleep(0.01)
-                        weston.terminate()
-                        weston.wait(timeout=5)
-                        if child.wait(timeout=15):
-                            failures.append(("wayland", "disconnect", scale))
+                        try:
+                            deadline = time.monotonic() + 20
+                            while not marker.exists() and child.poll() is None and time.monotonic() < deadline:
+                                time.sleep(0.01)
+                            weston.terminate()
+                            weston.wait(timeout=5)
+                            if child.wait(timeout=15):
+                                failures.append(("wayland", "disconnect", scale))
+                        finally:
+                            if child.poll() is None:
+                                child.terminate()
+                                try:
+                                    child.wait(timeout=5)
+                                except subprocess.TimeoutExpired:
+                                    child.kill()
+                                    child.wait()
                 finally:
                     weston.terminate()
                     try:

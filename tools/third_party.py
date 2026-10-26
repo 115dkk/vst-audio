@@ -13,7 +13,8 @@ import stat
 import subprocess
 import sys
 import tempfile
-from fixtures import download
+from fixtures import download, target_directory
+from run import to_log
 
 ROOT = Path(__file__).resolve().parents[1]
 PINS = {
@@ -35,6 +36,31 @@ EAPO = ("https://github.com/115dkk/equalizerapo-xt/releases/download/v2.60.6/Equ
 # plugin binary in the external build tree.
 MESA = ("https://github.com/pal1000/mesa-dist-win/releases/download/26.2.4/mesa3d-26.2.4-release-msvc.7z",
         "351fc8c8b695878ffb3eaa044b3ead08672a48b1a045e3c3e3975811df0f6695")
+
+
+def diagnostic_outcome(platform, returncode, timed_out, metric_count, mutation_passed=None):
+    """Combine ordinary and platform-applicable mutation diagnostics."""
+    ordinary_failures = []
+    if timed_out:
+        ordinary_failures.append("semantic test timed out")
+    if returncode:
+        ordinary_failures.append(f"semantic test exited with {returncode}")
+    if metric_count < 10:
+        ordinary_failures.append(f"semantic test produced {metric_count} METRIC records; need 10")
+    mutation_scheduled = platform != "darwin"
+    failures = list(ordinary_failures)
+    if mutation_scheduled and mutation_passed is not True:
+        failures.append("mutation diagnostics incomplete" if mutation_passed is None
+                        else "mutation did not fail at the sound assertion")
+    return {
+        "ordinary_passed": not ordinary_failures,
+        "ordinary_failures": ordinary_failures,
+        "mutation_scheduled": mutation_scheduled,
+        "mutation_passed": mutation_passed,
+        "passed": not failures,
+        "failures": failures,
+    }
+
 
 def run(*command, cwd=ROOT):
     subprocess.run(list(map(str, command)), cwd=cwd, check=True)
@@ -276,7 +302,7 @@ def main():
         if options.build_only:
             return
         run("cargo", "build", "--locked", "-p", "vst-audio-worker")
-        target = Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "target"))
+        target = target_directory()
         worker = target / "debug" / ("vst-audio-worker.exe" if sys.platform == "win32" else "vst-audio-worker")
         if sys.platform == "win32":
             installed = install_software_opengl(root, paths.values())
@@ -308,36 +334,44 @@ def main():
         if sys.platform != "win32":
             import resource
             resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-        result = subprocess.run(["cargo", "test", "--locked", "-p", "vst-audio", "--test", "third_party", "--", "--ignored", "--nocapture", "--test-threads=1"], cwd=ROOT, env=env, capture_output=True, text=True, timeout=1500)
-        output = result.stdout + result.stderr
-        print(output[-131072:], flush=True)
-        (report_dir / "checks.log").write_text(output[-131072:], encoding="utf-8")
-        report["metrics"] = [json.loads(line.partition("METRIC ")[2]) for line in output.splitlines() if "METRIC " in line]
+        result = to_log(["cargo", "test", "--locked", "-p", "vst-audio", "--test",
+            "third_party", "--", "--ignored", "--nocapture", "--test-threads=1"],
+            report_dir / "checks.log", cwd=ROOT, env=env, timeout=1500, tail_bytes=131072)
+        print(result.tail, flush=True)
+        report["metrics"] = [json.loads(line.partition("METRIC ")[2]) for line in result.tail.splitlines()
+                             if "METRIC " in line]
         report["returncode"] = result.returncode
-        assert len(report["metrics"]) >= 10, "semantic test measurements missing"
+        report["timed_out"] = result.timed_out
         report["known_upstream_limitations"]=[m["case"] for m in report["metrics"] if m["case"].startswith("known limitation:")]
-        if sys.platform != "darwin":
+        outcome = diagnostic_outcome(sys.platform, result.returncode, result.timed_out,
+                                     len(report["metrics"]))
+        report["diagnostics"] = outcome
+        if outcome["mutation_scheduled"]:
             mutant_target = root / "mutation-target"
             run("cargo", "build", "--locked", "-p", "vst-audio-worker", "--features",
                 "vst-audio-worker-sys/__test-drop-editor-edits", "--target-dir", mutant_target)
             mutant = mutant_target / "debug" / worker.name
             mutation_env = dict(env, VST_AUDIO_WORKER=str(mutant))
-            result = subprocess.run(["cargo", "test", "--locked", "-p", "vst-audio", "--test", "third_party",
-                "editor_input_eq_vst3", "--", "--exact", "--ignored", "--nocapture", "--test-threads=1"],
-                cwd=ROOT, env=mutation_env, capture_output=True, text=True, timeout=120)
-            output = result.stdout + result.stderr
-            print(output[-131072:], flush=True)
-            (report_dir / "mutation.log").write_text(output[-131072:], encoding="utf-8")
+            result = to_log(["cargo", "test", "--locked", "-p", "vst-audio", "--test",
+                "third_party", "editor_input_eq_vst3", "--", "--exact", "--ignored", "--nocapture",
+                "--test-threads=1"], report_dir / "mutation.log", cwd=ROOT, env=mutation_env,
+                timeout=120, tail_bytes=131072)
+            print(result.tail, flush=True)
             marker = "editor-to-processor sound assertion failed"
-            mutation_passed = result.returncode != 0 and marker in output
-            report["mutation"] = {"returncode": result.returncode, "sound_failure": marker in output,
-                "passed": mutation_passed,
-                "metrics": [json.loads(line.partition("METRIC ")[2]) for line in output.splitlines() if "METRIC " in line]}
-            assert mutation_passed, "mutation did not fail at the sound assertion"
+            mutation_passed = not result.timed_out and result.returncode != 0 and marker in result.tail
+            report["mutation"] = {"returncode": result.returncode, "timed_out": result.timed_out,
+                "sound_failure": marker in result.tail, "passed": mutation_passed,
+                "metrics": [json.loads(line.partition("METRIC ")[2]) for line in result.tail.splitlines()
+                            if "METRIC " in line]}
+            outcome = diagnostic_outcome(sys.platform, report["returncode"], report["timed_out"],
+                                         len(report["metrics"]), mutation_passed)
         else:
             report["mutation"] = {"not_run": "macOS synthetic editor input is unsupported"}
-        if report["returncode"]:
-            raise SystemExit(report["returncode"])
+            outcome = diagnostic_outcome(sys.platform, report["returncode"], report["timed_out"],
+                                         len(report["metrics"]))
+        report["diagnostics"] = outcome
+        if not outcome["passed"]:
+            raise RuntimeError("; ".join(outcome["failures"]))
         report["passed"] = True
     finally:
         (report_dir / "summary.json").write_text(json.dumps(report, indent=2), encoding="utf-8")

@@ -1,5 +1,12 @@
 """Unit tests of the pure parts of release_gate.py."""
+import contextlib
+import io
+import os
+from pathlib import Path
+import subprocess
+import tempfile
 import unittest
+from unittest import mock
 
 import release_gate as g
 
@@ -37,6 +44,8 @@ class Gate(unittest.TestCase):
         self.assertTrue(g.ships("Cargo.lock"))
         self.assertFalse(g.ships("crates/vst-audio/tests/native.rs"))
         self.assertFalse(g.ships("crates/vst-audio-testplugin/src/lib.rs"))
+        self.assertFalse(g.ships("crates/vst-audio-test-advanced/src/lib.rs"))
+        self.assertFalse(g.ships("crates/vst-audio-test-window/src/lib.rs"))
         self.assertFalse(g.ships("docs/roadmap.md"))
         self.assertFalse(g.ships(".github/workflows/ci.yml"))
 
@@ -77,6 +86,54 @@ class Gate(unittest.TestCase):
         self.assertIn('name = "vst-audio"\nversion = "0.2.0"', lock)
         self.assertIn('name = "vst-audio-gui-example"\nversion = "0.1.0"', lock)
         self.assertIn('name = "vst3"\nversion = "0.1.0"', lock)
+
+    def test_failed_tag_fetch_exits(self):
+        failed = subprocess.CompletedProcess([], 1, "", "network unavailable")
+        with mock.patch.object(g, "_run", return_value=failed) as run, \
+                mock.patch.object(g.time, "sleep"):
+            with self.assertRaisesRegex(SystemExit, "tag fetch failed after 3 attempts"):
+                g._fetch_tags()
+        self.assertEqual(run.call_count, 3)
+
+    def test_rejected_bump_push_defers_release_to_new_main(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "output"
+            pushes = 0
+
+            def run(*args, **_kwargs):
+                nonlocal pushes
+                if args[:3] == ("git", "push", "origin"):
+                    pushes += 1
+                    if pushes == 1:
+                        return subprocess.CompletedProcess([], 1, "", "non-fast-forward")
+                return subprocess.CompletedProcess([], 0, "", "")
+
+            def git(*args):
+                if args[:2] == ("tag", "-l"):
+                    return "v0.1.0"
+                if args[:2] == ("diff", "--name-only"):
+                    return "Cargo.toml"
+                if args[0] == "log":
+                    return "fix: change"
+                return "b" * 40
+
+            with mock.patch.dict(os.environ, {
+                "GITHUB_SHA": "a" * 40,
+                "GITHUB_REF": "refs/heads/main",
+                "GITHUB_OUTPUT": str(output),
+            }, clear=False), mock.patch.object(g, "CARGO_TOML", Path(directory) / "Cargo.toml"), \
+                    mock.patch.object(g, "LOCKS", ()), \
+                    mock.patch.object(g, "_read", return_value=TOML), \
+                    mock.patch.object(g, "workspace_members", return_value={"vst-audio", "vst-audio-ring"}), \
+                    mock.patch.object(g, "published_on_crates_io", return_value=False), \
+                    mock.patch.object(g, "_write"), \
+                    mock.patch.object(g, "_git", side_effect=git), \
+                    mock.patch.object(g, "_fetch_tags"), \
+                    mock.patch.object(g, "_run", side_effect=run):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(g.main(), 0)
+            self.assertIn("should_release=false", output.read_text())
+            self.assertEqual(pushes, 1)
 
 
 if __name__ == "__main__":
