@@ -73,7 +73,6 @@ pub struct AudioEndpoint {
     blocks: BlockEndpoint,
     fallback: Fallback,
     max_callback_frames: u32,
-    stream_position: u64,
     fill: usize,
     output_at: usize,
     ready: bool,
@@ -134,7 +133,6 @@ impl AudioEndpoint {
             blocks,
             fallback,
             max_callback_frames,
-            stream_position: 0,
             fill: 0,
             output_at: 0,
             ready: false,
@@ -424,7 +422,6 @@ impl AudioEndpoint {
             self.history_at = (self.history_at + segment) % self.history_len;
             self.fill += segment;
             self.output_at += segment;
-            self.stream_position = self.stream_position.saturating_add(segment as u64);
             frame += segment;
             if self.fill == q {
                 self.finish_quantum();
