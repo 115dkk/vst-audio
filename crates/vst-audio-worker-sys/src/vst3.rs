@@ -475,6 +475,23 @@ impl Vst3Plugin {
             }
         }
         if let Some(controller) = &plugin.controller {
+            // SAFETY: initialized controller queried on its creating main thread.
+            let count = unsafe { controller.getParameterCount() };
+            if !(0..=16_384).contains(&count) {
+                return Err(PluginError("invalid parameter count".into()));
+            }
+            let mut ids = Vec::with_capacity(count as usize);
+            for index in 0..count {
+                // SAFETY: ParameterInfo is a plain fixed-array/integer/float SDK record.
+                let mut info: ParameterInfo = unsafe { std::mem::zeroed() };
+                check(
+                    // SAFETY: enumerated index and writable output on the controller thread.
+                    unsafe { controller.getParameterInfo(index, &mut info) },
+                    "getParameterInfo",
+                )?;
+                ids.push(info.id);
+            }
+            plugin.shared.edits.set_known_parameters(ids);
             check(
                 // SAFETY: main-thread controller and retained host handler.
                 unsafe { controller.setComponentHandler(plugin.handler.as_ptr()) },

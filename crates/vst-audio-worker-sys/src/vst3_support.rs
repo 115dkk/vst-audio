@@ -6,7 +6,7 @@ use crate::{
     state_buffer::StateBuffer,
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ffi::{c_char, c_void},
     io::{Seek, SeekFrom, Write},
     rc::Rc,
@@ -21,6 +21,7 @@ use vst3::{Class, ComRef, ComWrapper, Steinberg::Vst::*, Steinberg::*};
 use vst3::{wl_display, wl_surface, xdg_surface, xdg_toplevel};
 
 pub(crate) const CAPACITY: usize = 256;
+const DEFERRED_EDIT_LIMIT: usize = 16_384;
 
 pub(crate) struct Edits {
     slots: [(AtomicU32, AtomicU64); CAPACITY],
@@ -28,6 +29,8 @@ pub(crate) struct Edits {
     write: AtomicUsize,
     pub flags: AtomicU32,
     pub notifications: Notifications,
+    // Initialized and queried on the main thread only, never by the audio consumer.
+    known_parameters: Mutex<HashSet<u32>>,
     // Editor edits that did not fit the processor queue, latest value per ID.
     // Main thread only; flushed in order before newer edits are queued.
     deferred: Mutex<Vec<(u32, f64)>>,
@@ -40,20 +43,35 @@ impl Edits {
             write: AtomicUsize::new(0),
             flags: AtomicU32::new(0),
             notifications: Notifications::new(),
+            known_parameters: Mutex::new(HashSet::new()),
             deferred: Mutex::new(Vec::new()),
         }
+    }
+    /// Installs the controller's enumerated IDs on the main thread before attaching
+    /// its handler. The audio consumer never accesses this set.
+    pub fn set_known_parameters(&self, ids: impl IntoIterator<Item = u32>) {
+        *self
+            .known_parameters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = ids.into_iter().collect();
     }
     /// Queues an editor edit for the processor. A burst larger than the queue
     /// keeps each parameter's latest value for the next main-thread flush, so the
     /// processor never stays on a value the editor already replaced.
-    fn push_edit(&self, id: u32, value: f64) {
+    fn push_edit(&self, id: u32, value: f64, known_count: usize) {
         let mut deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
         if deferred.is_empty() && self.push(id, value) {
             return;
         }
+        let has_capacity = deferred.len() < known_count.min(DEFERRED_EDIT_LIMIT);
         match deferred.iter_mut().find(|(pending, _)| *pending == id) {
             Some(entry) => entry.1 = value,
-            None => deferred.push((id, value)),
+            None if has_capacity => {
+                deferred.push((id, value));
+            }
+            None => {
+                self.flags.fetch_or(1, Ordering::Release);
+            }
         }
     }
     /// Moves deferred editor edits into the processor queue as space frees.
@@ -567,7 +585,15 @@ impl IComponentHandlerTrait for Handler {
         kResultOk
     }
     unsafe fn performEdit(&self, id: u32, value: f64) -> tresult {
-        if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+        let known = self
+            .0
+            .known_parameters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Faulty VST3 controllers can invent IDs (audit #11 TD-33). Reject them
+        // before either queue: perform_edit_unknown_id_flood_requests_refresh_without_retaining_edits
+        // reproduces the unbounded overflow that otherwise follows.
+        if !known.contains(&id) || !value.is_finite() || !(0.0..=1.0).contains(&value) {
             self.0.flags.fetch_or(1, Ordering::Release);
             return kInvalidArgument;
         }
@@ -578,7 +604,7 @@ impl IComponentHandlerTrait for Handler {
         });
         // Test only: never enable __test-drop-editor-edits in distribution builds.
         if !cfg!(feature = "__test-drop-editor-edits") {
-            self.0.push_edit(id, value);
+            self.0.push_edit(id, value, known.len());
         }
         kResultOk
     }
@@ -785,6 +811,62 @@ impl IPlugFrameTrait for Frame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn perform_edit_unknown_id_flood_requests_refresh_without_retaining_edits() {
+        let edits = Arc::new(Edits::new());
+        let handler = ComWrapper::new(Handler(edits.clone()))
+            .to_com_ptr::<IComponentHandler>()
+            .unwrap();
+        // Audit #11 TD-33: a faulty controller invents thousands of parameter IDs,
+        // including callbacks before the host has installed its metadata IDs.
+        for id in 10_000..14_096 {
+            // SAFETY: retained host handler called synchronously on its main thread;
+            // performEdit takes scalar arguments and validates the foreign ID.
+            let _ = unsafe { handler.performEdit(id, 0.5) };
+        }
+        assert_eq!(edits.deferred.lock().unwrap().len(), 0);
+        assert_eq!(edits.pop(), None);
+        assert!(edits.notifications.drain().is_empty());
+        assert_eq!(edits.flags.load(Ordering::Acquire) & 1, 1);
+    }
+
+    #[cfg(not(feature = "__test-drop-editor-edits"))]
+    #[test]
+    fn perform_edit_known_overflow_keeps_latest_values_during_unknown_id_flood() {
+        let edits = Arc::new(Edits::new());
+        edits.set_known_parameters([7, 19]);
+        let handler = ComWrapper::new(Handler(edits.clone()))
+            .to_com_ptr::<IComponentHandler>()
+            .unwrap();
+        for _ in 0..256 {
+            // SAFETY: retained handler on its main thread, scalar known ID/value.
+            let _ = unsafe { handler.performEdit(7, 0.25) };
+        }
+        for (id, value) in [(7, 0.5), (19, 0.5), (7, 0.75), (19, 1.0)] {
+            // SAFETY: retained handler on its main thread, scalar known ID/value.
+            let _ = unsafe { handler.performEdit(id, value) };
+        }
+        assert_eq!(edits.deferred.lock().unwrap().len(), 2);
+        assert_eq!(edits.notifications.drain().len(), 260);
+        for id in 10_000..14_096 {
+            // SAFETY: retained handler on its main thread; the concrete host rejects
+            // these scalar IDs without invoking foreign plugin code.
+            assert_eq!(unsafe { handler.performEdit(id, 0.5) }, kInvalidArgument);
+        }
+        assert_eq!(edits.deferred.lock().unwrap().len(), 2);
+        assert!(edits.notifications.drain().is_empty());
+        assert_eq!(edits.flags.load(Ordering::Acquire) & 1, 1);
+        for _ in 0..256 {
+            assert_eq!(edits.pop(), Some((7, 0.25)));
+        }
+        assert_eq!(edits.pop(), None);
+        edits.flush_deferred();
+        assert_eq!(edits.pop(), Some((7, 0.75)));
+        assert_eq!(edits.pop(), Some((19, 1.0)));
+        assert_eq!(edits.pop(), None);
+        assert!(edits.deferred.lock().unwrap().is_empty());
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
