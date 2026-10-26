@@ -6,7 +6,7 @@ use std::{
     path::Path,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{self, Receiver, SyncSender},
     },
     thread,
@@ -89,7 +89,14 @@ struct Transport {
     cancel: Option<Arc<AtomicBool>>,
     pending: std::cell::RefCell<std::collections::VecDeque<Frame>>,
     send: SyncSender<Frame>,
+    queued_writes: Arc<AtomicUsize>,
     receive: Receiver<Result<Option<DecodedFrame>, CodecError>>,
+    failures: Receiver<TransportFailure>,
+}
+#[derive(Debug)]
+struct TransportFailure {
+    operation: &'static str,
+    reason: String,
 }
 impl std::fmt::Debug for Transport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -104,7 +111,10 @@ impl Transport {
         process: Arc<ChildProcess>,
     ) -> Self {
         let (tx, rx) = mpsc::sync_channel(8);
+        let queued_writes = Arc::new(AtomicUsize::new(0));
+        let writer_queue = queued_writes.clone();
         let (frames, received) = mpsc::sync_channel(2);
+        let (failed, failures) = mpsc::sync_channel(2);
         thread::spawn(move || {
             loop {
                 let result = read_frame(&mut input);
@@ -116,8 +126,21 @@ impl Transport {
         });
         thread::spawn(move || {
             while let Ok(frame) = rx.recv() {
-                if write_frame(&mut output, &frame).is_err() {
-                    break;
+                match write_frame(&mut output, &frame) {
+                    Ok(()) => {
+                        writer_queue.fetch_sub(1, Ordering::Release);
+                    }
+                    Err(error) => {
+                        let _ = failed.send(TransportFailure {
+                            operation: "write",
+                            reason: error.to_string(),
+                        });
+                        // Reject further sends and abandon every queued frame before
+                        // publishing completion; the failure was enqueued above.
+                        drop(rx);
+                        writer_queue.store(0, Ordering::Release);
+                        break;
+                    }
                 }
             }
         });
@@ -126,22 +149,33 @@ impl Transport {
             cancel,
             pending: Default::default(),
             send: tx,
+            queued_writes,
             receive: received,
+            failures,
         }
     }
     fn send(&self, request: u32, message: Message) -> Result<(), StartError> {
+        self.queued_writes.fetch_add(1, Ordering::Release);
         self.send
             .try_send(Frame {
                 flags: 0,
                 request,
                 message,
             })
-            .map_err(|error| match error {
-                mpsc::TrySendError::Full(_) => {
-                    StartError::new(StartErrorKind::QueueFull, error.to_string())
-                }
-                mpsc::TrySendError::Disconnected(_) => {
-                    StartError::new(StartErrorKind::Disconnected, error.to_string())
+            .map_err(|error| {
+                // The failed writer may already have abandoned the entire queue.
+                let _ =
+                    self.queued_writes
+                        .try_update(Ordering::Release, Ordering::Relaxed, |count| {
+                            Some(count.saturating_sub(1))
+                        });
+                match error {
+                    mpsc::TrySendError::Full(_) => {
+                        StartError::new(StartErrorKind::QueueFull, error.to_string())
+                    }
+                    mpsc::TrySendError::Disconnected(_) => {
+                        StartError::new(StartErrorKind::Disconnected, error.to_string())
+                    }
                 }
             })
     }
@@ -381,6 +415,14 @@ pub enum ControlEvent {
     Action(Action),
     Exited(u32),
     NeedsRespawn,
+    /// Terminal control failure: abandon this control and apply the recovery policy.
+    /// `operation` is `"write"`, `"read/decode"`, or `"process status"`;
+    /// `reason` retains the source codec or operating-system diagnostic.
+    /// This is not a native process-exit status; `Exited` reports only an OS result.
+    TransportError {
+        operation: &'static str,
+        reason: String,
+    },
 }
 #[derive(Debug)]
 pub struct PluginControl {
@@ -394,6 +436,7 @@ pub struct PluginControl {
     clock_base: u64,
     exit_seen: bool,
     pub needs_respawn: bool,
+    transport_failed: bool,
 }
 impl PluginControl {
     pub fn state_history(&self) -> vst_audio_protocol::StateHistory {
@@ -496,7 +539,30 @@ impl PluginControl {
             .map_err(|error| StartError::new(StartErrorKind::Io, error.to_string()))
     }
     pub fn poll(&mut self, now_ms: u64) -> Vec<ControlEvent> {
+        let process = self.process.clone();
+        self.poll_with_status(now_ms, || process.exit_code())
+    }
+    fn poll_with_status<E>(
+        &mut self,
+        now_ms: u64,
+        status: impl FnOnce() -> Result<Option<u32>, E>,
+    ) -> Vec<ControlEvent>
+    where
+        E: std::fmt::Display,
+    {
         let mut events = Vec::new();
+        // Query the OS even when a pipe write is blocked. Only publishing a
+        // successful exit waits for pending write diagnostics, never the query.
+        let status = if self.exit_seen { Ok(None) } else { status() };
+        let writes_pending = self.transport.queued_writes.load(Ordering::Acquire) != 0;
+        // The writer publishes its failure before releasing the queue count.
+        // Drain after Acquire so an observed completion cannot hide that failure.
+        for failure in self.transport.failures.try_iter() {
+            events.push(ControlEvent::TransportError {
+                operation: failure.operation,
+                reason: failure.reason,
+            });
+        }
         for _ in 0..64 {
             let pending = self.transport.pending.borrow_mut().pop_front();
             let frame = if let Some(frame) = pending {
@@ -518,7 +584,20 @@ impl PluginControl {
                     events.push(ControlEvent::Message(frame));
                 }
                 Ok(Some(DecodedFrame::Unknown(_))) => {}
-                _ => {
+                Ok(None) => {
+                    if !matches!(
+                        self.watch.state(),
+                        vst_audio_protocol::WatchState::Stopping
+                            | vst_audio_protocol::WatchState::Stopped
+                    ) {
+                        let _ = self.process.terminate(3);
+                    }
+                }
+                Err(error) => {
+                    events.push(ControlEvent::TransportError {
+                        operation: "read/decode",
+                        reason: error.to_string(),
+                    });
                     if !matches!(
                         self.watch.state(),
                         vst_audio_protocol::WatchState::Stopping
@@ -529,20 +608,39 @@ impl PluginControl {
                 }
             }
         }
-        let exit = if self.exit_seen {
-            None
-        } else {
-            self.process.exit_code().ok().flatten()
+        let exit = match status {
+            Ok(exit) if !writes_pending => exit,
+            Ok(_) => None,
+            Err(error) => {
+                events.push(ControlEvent::TransportError {
+                    operation: "process status",
+                    reason: error.to_string(),
+                });
+                None
+            }
         };
         if let Some(code) = exit {
             self.exit_seen = true;
             events.push(ControlEvent::Exited(code));
         }
-        for action in self.watch.poll(
-            now_ms,
-            self.region.region().heartbeat(),
-            exit.map(|code| code as i32),
-        ) {
+        // A broken transport abandons the process logically, without inventing
+        // an OS Exited event or counting the later native exit as another crash.
+        let watch_exit = if self.transport_failed {
+            None
+        } else if events
+            .iter()
+            .any(|event| matches!(event, ControlEvent::TransportError { .. }))
+        {
+            self.transport_failed = true;
+            let _ = self.process.terminate(3);
+            Some(1)
+        } else {
+            exit.map(|code| code as i32)
+        };
+        for action in self
+            .watch
+            .poll(now_ms, self.region.region().heartbeat(), watch_exit)
+        {
             match action {
                 Action::Kill { .. } | Action::Disable { .. } => {
                     let _ = self.process.terminate(3);
@@ -780,6 +878,7 @@ impl PluginProcess {
             clock_base: 0,
             exit_seen: false,
             needs_respawn: false,
+            transport_failed: false,
         };
         let saved = control.get_state()?;
         let state_reply = control.transport.response(saved, Duration::from_secs(10))?;
@@ -984,7 +1083,415 @@ fn spawn(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::io;
     use vst_audio_protocol::Bus;
+
+    #[cfg(unix)]
+    struct BlockingRead(mpsc::Receiver<()>);
+
+    #[cfg(unix)]
+    impl Read for BlockingRead {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            let _ = self.0.recv();
+            Ok(0)
+        }
+    }
+
+    #[cfg(unix)]
+    struct FailingWriter;
+
+    #[cfg(unix)]
+    impl Write for FailingWriter {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "injected broken control pipe",
+            ))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    fn test_control(output: impl Write + Send + 'static) -> (PluginControl, mpsc::Sender<()>) {
+        let parent = runtime::parent_handle().unwrap();
+        let sandbox =
+            vst_audio_transport_sys::sandbox::SandboxLaunch::new(None, Path::new("/bin/sh"))
+                .unwrap();
+        let process = Arc::new(
+            runtime::spawn_handles(
+                Path::new("/bin/sh"),
+                &["-c".into(), "exec sleep 60".into()],
+                &[],
+                parent,
+                sandbox,
+            )
+            .unwrap(),
+        );
+        let geometry = Geometry {
+            sample_format: SampleFormat::F32,
+            lanes: 1,
+            slots: 2,
+            input_channels: 1,
+            output_channels: 1,
+            max_frames: 1,
+            sample_rate: 48_000,
+            latency_bound_frames: 48_000,
+        };
+        let region = Arc::new(SharedRegion::create(geometry.total_bytes().unwrap()).unwrap());
+        region.region_for(geometry).unwrap();
+        let work = Arc::new(Event::create().unwrap());
+        let (release_input, input) = mpsc::channel();
+        let transport = Transport::new(BlockingRead(input), output, None, process.clone());
+        let mut watch = ControlWatch::new(0);
+        watch.restore_running(0, 0);
+        (
+            PluginControl {
+                process,
+                transport,
+                region,
+                work,
+                watch,
+                next_request: FIRST_REQUEST,
+                origin: Instant::now(),
+                clock_base: 0,
+                exit_seen: false,
+                needs_respawn: false,
+                transport_failed: false,
+            },
+            release_input,
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_pipe_failure_reaches_host_and_fails_pending_request() {
+        use crate::api::{Launch, Shared};
+        use crate::{
+            Command, Configuration, HostEvent, Instance, PluginDescriptor, RecoveryPolicy,
+        };
+        for policy in [
+            RecoveryPolicy::Manual,
+            RecoveryPolicy::Automatic {
+                attempts: 1,
+                backoff_ms: 10,
+            },
+            RecoveryPolicy::Watch,
+        ] {
+            let (mut control, _input) = test_control(io::sink());
+            // This approved transport seam makes both failures available in the
+            // same poll batch, without native kill timing or a fixture mutation.
+            let (frames, received) = mpsc::sync_channel(2);
+            control.transport.receive = received;
+            frames
+                .send(Ok(Some(DecodedFrame::Known(Frame {
+                    flags: 0,
+                    request: FIRST_REQUEST,
+                    message: Message::Fault {
+                        code: 1,
+                        text: "generic worker fault".into(),
+                    },
+                }))))
+                .unwrap();
+            frames
+                .send(Err(CodecError::Io(io::Error::other(
+                    "injected control read failure",
+                ))))
+                .unwrap();
+            let shared = Shared::for_audio_test(0);
+            let (requests, commands) = mpsc::sync_channel(8);
+            let (events, received) = mpsc::sync_channel(16);
+            let instance = Instance::for_supervision_test(requests, received, shared.clone());
+            let first = instance.controller().request(Command::SaveState).unwrap();
+            let second = instance.controller().request(Command::SaveState).unwrap();
+            let geometry = Geometry {
+                sample_format: SampleFormat::F32,
+                lanes: 1,
+                slots: 2,
+                input_channels: 1,
+                output_channels: 1,
+                max_frames: 1,
+                sample_rate: 48_000,
+                latency_bound_frames: 48_000,
+            };
+            let (updates, _next) = rtrb::RingBuffer::new(2);
+            let (_retired, retirements) = rtrb::RingBuffer::new(2);
+            let supervisor = thread::spawn(move || {
+                crate::supervision::supervise(
+                    control,
+                    commands,
+                    events,
+                    shared,
+                    updates,
+                    retirements,
+                    crate::supervision::RecoveryConfig {
+                        launch: Launch {
+                            worker: "/nonexistent/td15-worker".into(),
+                            plugin: PluginDescriptor::new(
+                                "/nonexistent/td15-plugin",
+                                PluginFormat::Vst3,
+                            ),
+                            configuration: Configuration {
+                                recovery: policy,
+                                ..Configuration::default()
+                            },
+                        },
+                        geometry,
+                        setup: ProcessingSetup {
+                            sample_rate: 48_000,
+                            quantum: 1,
+                            sample_format: SampleFormat::F32,
+                            offline: false,
+                            inputs: vec![],
+                            outputs: vec![],
+                        },
+                    },
+                )
+            });
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut failures = Vec::new();
+            let mut reasons = Vec::new();
+            let mut recovery_attempted = false;
+            while Instant::now() < deadline {
+                if let Some(event) = instance.try_next_event() {
+                    match event {
+                        HostEvent::RequestFailed { request, reason } => {
+                            failures.push((request, reason))
+                        }
+                        HostEvent::Failed { reason } if reason.starts_with("recovery failed:") => {
+                            recovery_attempted = true;
+                            break;
+                        }
+                        HostEvent::Failed { reason } => reasons.push(reason),
+                        HostEvent::RecoveryRequired if policy == RecoveryPolicy::Manual => break,
+                        _ => {}
+                    }
+                } else {
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+            drop(instance);
+            supervisor.join().unwrap();
+            let expected = "control transport read/decode failed: Io(Custom { kind: Other, error: \"injected control read failure\" })";
+            assert_eq!(reasons, [expected], "{policy:?}");
+            assert_eq!(
+                failures,
+                [(first, expected.into()), (second, expected.into())],
+                "{policy:?}"
+            );
+            assert_eq!(
+                recovery_attempted,
+                policy != RecoveryPolicy::Manual,
+                "{policy:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn poll_reports_writer_failure_before_transport_ends() {
+        let (mut control, _input) = test_control(FailingWriter);
+        control.get_state().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let events = control.poll(control.elapsed_ms());
+            if let Some(ControlEvent::TransportError { operation, reason }) = events
+                .into_iter()
+                .find(|event| matches!(event, ControlEvent::TransportError { .. }))
+            {
+                assert_eq!(operation, "write");
+                assert!(reason.contains("injected broken control pipe"), "{reason}");
+                break;
+            }
+            assert!(Instant::now() < deadline, "writer failure was not reported");
+            thread::yield_now();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn poll_reports_reader_decode_failure_instead_of_eof() {
+        let (mut control, _input) = test_control(io::sink());
+        control.transport = Transport::new(
+            io::Cursor::new(vec![8, 0]),
+            io::sink(),
+            None,
+            control.process.clone(),
+        );
+        assert_transport_error(&mut control, "read/decode", "Truncated");
+    }
+
+    #[cfg(unix)]
+    fn assert_transport_error(control: &mut PluginControl, operation: &str, source: &str) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let events = control.poll(control.elapsed_ms());
+            if let Some(reason) = events.iter().find_map(|event| match event {
+                ControlEvent::TransportError {
+                    operation: found,
+                    reason,
+                } if *found == operation => Some(reason),
+                _ => None,
+            }) {
+                assert!(reason.contains(source), "{reason}");
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "missing {operation} failure: {events:?}"
+            );
+            thread::yield_now();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn poll_reports_malformed_frame_and_reader_io_source() {
+        struct FailingRead;
+        impl Read for FailingRead {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("injected read I/O failure"))
+            }
+        }
+        for (input, source) in [
+            (
+                Box::new(io::Cursor::new(vec![0_u8, 0, 0, 0])) as Box<dyn Read + Send>,
+                "InvalidLength",
+            ),
+            (Box::new(FailingRead), "injected read I/O failure"),
+        ] {
+            let (mut control, _input) = test_control(io::sink());
+            control.transport = Transport::new(input, io::sink(), None, control.process.clone());
+            assert_transport_error(&mut control, "read/decode", source);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn poll_reports_writer_encoding_failure() {
+        let (mut control, _input) = test_control(io::sink());
+        control
+            .transport
+            .send(
+                17,
+                Message::Fault {
+                    code: 1,
+                    text: "x".repeat(vst_audio_protocol::MAX_STRING_BYTES + 1),
+                },
+            )
+            .unwrap();
+        assert_transport_error(&mut control, "write", "StringTooLong");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn poll_queries_status_while_writer_is_blocked() {
+        struct BlockedWriter(mpsc::Sender<()>, mpsc::Receiver<()>);
+        impl Write for BlockedWriter {
+            fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+                self.0.send(()).unwrap();
+                let _ = self.1.recv();
+                Err(io::Error::other("released blocked writer"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let (entered, observed) = mpsc::channel();
+        let (release, blocked) = mpsc::channel();
+        let (mut control, _input) = test_control(BlockedWriter(entered, blocked));
+        control.get_state().unwrap();
+        observed.recv_timeout(Duration::from_secs(1)).unwrap();
+        let events = control.poll_with_status(0, || {
+            Err::<Option<u32>, _>(io::Error::other("status failed while write blocked"))
+        });
+        drop(release);
+        assert!(
+            events.iter().any(|event| matches!(event,
+                ControlEvent::TransportError { operation: "process status", reason }
+                    if reason.contains("status failed while write blocked")
+            )),
+            "{events:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn poll_reports_failure_and_exit_after_abandoning_queued_writes() {
+        struct GatedWriter(mpsc::Sender<()>, mpsc::Receiver<()>);
+        impl Write for GatedWriter {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                self.0.send(()).unwrap();
+                self.1.recv().unwrap();
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "queued writer failed",
+                ))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let (entered, observed) = mpsc::channel();
+        let (release, blocked) = mpsc::channel();
+        let (mut control, _input) = test_control(GatedWriter(entered, blocked));
+        control.get_state().unwrap();
+        observed.recv_timeout(Duration::from_secs(1)).unwrap();
+        control.get_state().unwrap();
+        control.get_state().unwrap();
+        control.process.terminate(3).unwrap();
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut failure_seen = false;
+        loop {
+            for event in control.poll(control.elapsed_ms()) {
+                match event {
+                    ControlEvent::TransportError {
+                        operation: "write",
+                        reason,
+                    } => {
+                        assert!(reason.contains("queued writer failed"), "{reason}");
+                        failure_seen = true;
+                    }
+                    ControlEvent::Exited(_) => {
+                        assert!(failure_seen, "native exit hid the queued writer failure");
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "abandoned queue hid the native exit"
+            );
+            thread::yield_now();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn poll_reports_process_status_query_failure() {
+        let (mut control, _input) = test_control(io::sink());
+        let events = control.poll_with_status(control.elapsed_ms(), || {
+            Err::<Option<u32>, _>(io::Error::other("injected status query failure"))
+        });
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                ControlEvent::TransportError { operation: "process status", reason }
+                    if reason.contains("injected status query failure")
+            )),
+            "{events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ControlEvent::Exited(_)))
+        );
+    }
 
     fn bus(kind: BusKind) -> BusInfo {
         BusInfo {

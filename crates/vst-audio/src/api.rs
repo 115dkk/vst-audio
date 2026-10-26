@@ -679,6 +679,19 @@ pub struct Instance {
     audio: Option<AudioEndpoint>,
 }
 impl Instance {
+    #[cfg(all(test, unix))]
+    pub(crate) fn for_supervision_test(
+        requests: mpsc::SyncSender<(RequestId, Command)>,
+        events: mpsc::Receiver<HostEvent>,
+        shared: Arc<Shared>,
+    ) -> Self {
+        Self {
+            controller: Controller { requests, shared },
+            events,
+            audio: None,
+        }
+    }
+
     fn new(
         started: Started,
         fallback: Fallback,
