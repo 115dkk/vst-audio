@@ -485,30 +485,9 @@ impl PluginControl {
         std::mem::replace(&mut self.watch, ControlWatch::new(now))
     }
     /// `now_ms` uses the same caller-owned clock as subsequent `poll` calls.
-    /// Replays the restored watch's latency into its new running state.
+    /// Keeps this new worker's latency while restoring the prior watch history.
     pub fn restore_watch(&mut self, mut watch: ControlWatch, now_ms: u64) {
-        let hello = Frame {
-            flags: 0,
-            request: 0,
-            message: Message::hello(),
-        };
-        watch.received(now_ms, &hello);
-        let latency_frames = watch.latency();
-        watch.received(
-            now_ms,
-            &Frame {
-                flags: 0,
-                request: 0,
-                message: Message::Loaded {
-                    name: String::new(),
-                    vendor: String::new(),
-                    latency_frames,
-                    inputs: vec![],
-                    outputs: vec![],
-                },
-            },
-        );
-        watch.activated(now_ms);
+        watch.restore_running(now_ms, self.watch.latency());
         self.origin = Instant::now();
         self.clock_base = now_ms;
         self.watch = watch;
