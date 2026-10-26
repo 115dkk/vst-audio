@@ -1287,6 +1287,11 @@ impl HostWatch {
         Action::None
     }
 
+    /// Starts the request deadline. State saves and editor operations use the
+    /// same bound because both are control-thread round trips: neither is safe
+    /// to leave pending while worker health is uncertain. `kind` remains in the
+    /// public contract for diagnostics and future policy without changing the
+    /// current deadline (audit #11 TD-92).
     pub fn request_sent(&mut self, now_ms: u64, request: u32, _kind: RequestKind) -> Action {
         self.pending_requests.retain(|(id, _)| *id != request);
         self.pending_requests.push((request, now_ms));
