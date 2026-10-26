@@ -306,6 +306,9 @@ def _commit_bump(old: str, new: str, decided: str) -> str | None:
 
 
 def main() -> int:
+    # A bump commits and pushes to main, so only the release workflow may run this.
+    if os.environ.get("GITHUB_ACTIONS") != "true":
+        raise SystemExit("release_gate.py commits and pushes to main; run it only from the release workflow")
     head = os.environ.get("GITHUB_SHA") or _git("rev-parse", "HEAD")
     _fetch_tags()
     tags = set(_git("tag", "-l", "v*").splitlines())
