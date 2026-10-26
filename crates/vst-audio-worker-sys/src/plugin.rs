@@ -624,22 +624,13 @@ impl Vst2Plugin {
         {
             return Ok(());
         }
-        self.shared
-            .callback
-            .editor_open
-            .store(false, Ordering::Release);
-        self.shared.callback.size.store(0, Ordering::Release);
-        if self.editor.is_some() {
-            let control = self.shared.calls();
-            let _dpi = self.editor.as_ref().map(editor_scaling::scope);
-            // Reset the old Plugin session before closing: some VST2 adapters
-            // retain the scale across EDIT_CLOSE. Off/Stretch opens send nothing.
-            if self.editor_scaling == EditorScaling::Plugin && self.editor_scale != 1.0 {
-                set_vst2_scale(&control, 1.0);
-            }
-            control.call(EDIT_CLOSE, 0, 0, std::ptr::null_mut(), 0.0);
-            self.editor = None;
-        }
+        teardown_vst2_editor(
+            &self.shared,
+            &mut self.editor,
+            self.editor_scaling == EditorScaling::Plugin && self.editor_scale != 1.0,
+            true,
+            false,
+        );
         let control = self.shared.calls();
         if control.effect().flags & HAS_EDITOR == 0 {
             return Err(PluginError("plugin has no editor".into()));
@@ -822,20 +813,13 @@ impl Vst2Plugin {
     }
     pub fn request_editor_close(&mut self) -> Result<(), PluginError> {
         if self.editor.is_some() {
-            self.shared
-                .callback
-                .editor_open
-                .store(false, Ordering::Release);
-            self.shared.callback.size.store(0, Ordering::Release);
-            let control = self.shared.calls();
-            let _dpi = self.editor.as_ref().map(editor_scaling::scope);
-            // Reset the old Plugin session before closing: some VST2 adapters
-            // retain the scale across EDIT_CLOSE. Off/Stretch opens send nothing.
-            if self.editor_scaling == EditorScaling::Plugin && self.editor_scale != 1.0 {
-                set_vst2_scale(&control, 1.0);
-            }
-            control.call(EDIT_CLOSE, 0, 0, std::ptr::null_mut(), 0.0);
-            self.editor = None;
+            teardown_vst2_editor(
+                &self.shared,
+                &mut self.editor,
+                self.editor_scaling == EditorScaling::Plugin && self.editor_scale != 1.0,
+                true,
+                false,
+            );
             self.closed = true;
         }
         Ok(())
@@ -873,16 +857,13 @@ impl Vst2Plugin {
                 }
             }
             if closed {
-                self.shared
-                    .callback
-                    .editor_open
-                    .store(false, Ordering::Release);
-                self.shared.callback.size.store(0, Ordering::Release);
-                if self.editor_scaling == EditorScaling::Plugin && self.editor_scale != 1.0 {
-                    set_vst2_scale(&control, 1.0);
-                }
-                control.call(EDIT_CLOSE, 0, 0, std::ptr::null_mut(), 0.0);
-                self.editor = None;
+                teardown_vst2_editor(
+                    &self.shared,
+                    &mut self.editor,
+                    self.editor_scaling == EditorScaling::Plugin && self.editor_scale != 1.0,
+                    false,
+                    false,
+                );
                 self.closed = true;
             }
         }
@@ -906,6 +887,38 @@ impl Vst2Plugin {
                 .load(Ordering::Acquire)
                 .then_some(RESTART_REQUIRED),
         }
+    }
+}
+fn teardown_vst2_editor(
+    shared: &Shared,
+    editor: &mut Option<EditorWindow>,
+    reset_scale: bool,
+    enter_dpi_scope: bool,
+    exclusive: bool,
+) {
+    shared.callback.editor_open.store(false, Ordering::Release);
+    shared.callback.size.store(0, Ordering::Release);
+    if editor.is_some() {
+        // Drop excludes DSP; ordinary editor calls retain audio admission.
+        let control = if exclusive {
+            shared.control()
+        } else {
+            shared.calls()
+        };
+        // Idle already holds its scope; Drop intentionally enters none.
+        let _dpi = if enter_dpi_scope {
+            editor.as_ref().map(editor_scaling::scope)
+        } else {
+            None
+        };
+        // Some VST2 adapters retain scale across EDIT_CLOSE. Reset only the
+        // old Plugin session; Drop and Off/Stretch sessions send nothing.
+        if reset_scale {
+            set_vst2_scale(&control, 1.0);
+        }
+        control.call(EDIT_CLOSE, 0, 0, std::ptr::null_mut(), 0.0);
+        // The plugin view must close before its native parent is destroyed.
+        *editor = None;
     }
 }
 // DPF b801214e distrho/src/DistrhoPluginVST2.cpp:948 and
@@ -942,16 +955,7 @@ fn resize_vst2(control: &Control<'_>, window: &EditorWindow) -> Result<(), Plugi
 }
 impl Drop for Vst2Plugin {
     fn drop(&mut self) {
-        self.shared
-            .callback
-            .editor_open
-            .store(false, Ordering::Release);
-        self.shared.callback.size.store(0, Ordering::Release);
-        if self.editor.is_some() {
-            let control = self.shared.control();
-            control.call(EDIT_CLOSE, 0, 0, std::ptr::null_mut(), 0.0);
-            self.editor = None;
-        }
+        teardown_vst2_editor(&self.shared, &mut self.editor, false, false, true);
         self.deactivate();
         let control = self.shared.control();
         control.call(CLOSE, 0, 0, std::ptr::null_mut(), 0.0);
