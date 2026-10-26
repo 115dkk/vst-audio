@@ -44,6 +44,37 @@ pub enum Phase {
     Closed,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("request is invalid in this host phase")]
+pub(crate) struct Refusal;
+
+impl Phase {
+    pub(crate) fn accept(self, message: &Message) -> Result<Self, Refusal> {
+        match (self, message) {
+            (Phase::Closed, _) => Err(Refusal),
+            (_, Message::Shutdown) => Ok(Phase::Closed),
+            (Phase::Loaded, Message::Configure { .. } | Message::Prepare(_)) => {
+                Ok(Phase::Configured)
+            }
+            (Phase::Configured | Phase::Active, Message::Activate) => Ok(Phase::Active),
+            (
+                phase,
+                Message::Scan { .. }
+                | Message::Describe
+                | Message::GetState
+                | Message::SetState { .. }
+                | Message::Editor(_)
+                | Message::OpenEditor { .. }
+                | Message::OpenEditorIn { .. }
+                | Message::CloseEditor
+                | Message::ListParameters { .. }
+                | Message::SetParameter { .. },
+            ) => Ok(phase),
+            _ => Err(Refusal),
+        }
+    }
+}
+
 pub struct Session<P> {
     plugin: P,
     phase: Phase,
@@ -96,45 +127,52 @@ impl<P: Plugin> Session<P> {
         }
     }
     fn handle(&mut self, message: Message) -> Result<Message, PluginError> {
-        match message {
+        let next_phase = self
+            .phase
+            .accept(&message)
+            .map_err(|error| PluginError(error.to_string()))?;
+        let reply = match message {
             Message::Configure {
                 rate,
                 max_frames,
                 in_channels,
                 out_channels,
-            } if self.phase == Phase::Loaded => {
+            } => {
                 self.plugin
                     .configure(rate, max_frames, in_channels, out_channels)?;
-                self.phase = Phase::Configured;
-                Ok(Message::Ack)
+                Message::Ack
             }
-            Message::Activate if self.phase == Phase::Configured => {
+            Message::Prepare(setup) => {
+                self.plugin.configure_audio(&setup)?;
+                Message::Ack
+            }
+            Message::Activate => {
                 self.plugin.activate()?;
-                self.phase = Phase::Active;
-                Ok(Message::Ack)
+                Message::Ack
             }
-            Message::GetState if self.phase != Phase::Closed => Ok(Message::State {
+            Message::GetState => Message::State {
                 blob: self.plugin.get_state()?,
-            }),
-            Message::SetState { blob } if self.phase != Phase::Closed => {
+            },
+            Message::SetState { blob } => {
                 self.plugin.set_state(&blob)?;
-                Ok(Message::Ack)
+                Message::Ack
             }
-            Message::OpenEditor { scaling } if self.phase != Phase::Closed => {
+            Message::OpenEditor { scaling } => {
                 self.plugin.open_editor(scaling)?;
-                Ok(Message::Ack)
+                Message::Ack
             }
-            Message::OpenEditorIn { parent, scaling } if self.phase != Phase::Closed => {
+            Message::OpenEditorIn { parent, scaling } => {
                 self.plugin.open_editor_in(parent, scaling)?;
-                Ok(Message::Ack)
+                Message::Ack
             }
             Message::Shutdown => {
                 self.plugin.deactivate();
-                self.phase = Phase::Closed;
-                Ok(Message::Ack)
+                Message::Ack
             }
-            _ => Err(PluginError("request is invalid in this host phase".into())),
-        }
+            _ => return Err(PluginError("request is invalid in this host phase".into())),
+        };
+        self.phase = next_phase;
+        Ok(reply)
     }
 }
 
@@ -574,6 +612,39 @@ mod tests {
     }
 
     #[test]
+    fn phase_accepts_the_shared_worker_lifecycle() {
+        let prepare = Message::Prepare(vst_audio_protocol::ProcessingSetup {
+            sample_rate: 48000,
+            quantum: 4,
+            sample_format: vst_audio_ring::SampleFormat::F32,
+            offline: false,
+            inputs: vec![],
+            outputs: vec![
+                Bus {
+                    channels: 2,
+                    arrangement: 3,
+                }
+                .into(),
+            ],
+        });
+
+        assert_eq!(Phase::Loaded.accept(&prepare).unwrap(), Phase::Configured);
+        assert_eq!(
+            Phase::Configured.accept(&Message::Activate).unwrap(),
+            Phase::Active
+        );
+        assert_eq!(
+            Phase::Active.accept(&Message::GetState).unwrap(),
+            Phase::Active
+        );
+        assert_eq!(
+            Phase::Active.accept(&Message::Shutdown).unwrap(),
+            Phase::Closed
+        );
+        assert!(Phase::Closed.accept(&Message::GetState).is_err());
+    }
+
+    #[test]
     fn frame_session_and_ring_round_trip() {
         let geometry = Geometry {
             sample_format: vst_audio_ring::SampleFormat::F32,
@@ -654,7 +725,6 @@ mod tests {
             Message::State { blob: vec![1, 2] }
         );
         session.serve(request(6, Message::Shutdown));
-        assert_eq!(session.phase(), Phase::Closed);
         assert!(!session.plugin_mut().active);
     }
 }

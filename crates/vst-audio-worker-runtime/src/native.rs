@@ -1,7 +1,7 @@
 //! Executes foreign calls exclusively inside the worker.
 use crate::{
     EditPhase, ParameterEdit, Plugin, PluginError, PluginEvents, PluginInfo, Processor,
-    host::{Args, AudioBuffer},
+    host::{Args, AudioBuffer, Phase},
     layout::{default_arrangement, vst2_arrangement},
 };
 use std::{
@@ -359,7 +359,7 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
     let stop = Arc::new(AtomicBool::new(false));
     let mut audio = None;
     let mut plugin: Option<Box<dyn Plugin>> = None;
-    let mut configured = false;
+    let mut phase: Option<Phase> = None;
     let mut failed = false;
     let mut reported_latency: Option<u32> = None;
     // Always join audio before lifecycle teardown, including malformed frames
@@ -418,207 +418,219 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
                         }),
                         other => other,
                     };
-                    let reply: Result<Message, StartError> = (|| match message {
-                        Message::Scan { path } => {
-                            if Path::new(&path)
-                                .extension()
-                                .is_some_and(|ext| ext.eq_ignore_ascii_case("vst3"))
-                            {
-                                let module =
-                                    vst_audio_worker_sys::vst3::Vst3Module::load(Path::new(&path))
-                                        .map_err(error)?;
-                                let entries = module
-                                    .scan()
-                                    .map_err(error)?
-                                    .into_iter()
-                                    .map(|class| ClassInfo {
-                                        id: class.id,
-                                        name: class.name,
-                                        vendor: class.vendor,
-                                        category: class.category,
-                                    })
-                                    .collect();
-                                return Ok(Message::Classes { entries });
-                            }
-                            let scanned = Vst2Plugin::load(Path::new(&path)).map_err(error)?;
-                            Ok(Message::Classes {
-                                entries: scanned.classes().map_err(error)?,
-                            })
-                        }
-                        Message::Load {
-                            path,
-                            format,
-                            class_id,
-                        } if plugin.is_none() => {
-                            let loaded: Box<dyn Plugin> = match format {
-                                PluginFormat::Vst2 => {
-                                    Box::new(Vst2::load(Path::new(&path), class_id).map_err(error)?)
-                                }
-                                PluginFormat::Vst3 => Box::new(
-                                    crate::vst3::Vst3::load(Path::new(&path), class_id)
-                                        .map_err(error)?,
-                                ),
-                            };
-                            let info = loaded.info();
-                            reported_latency = Some(info.latency_frames);
-                            plugin = Some(loaded);
-                            Ok(Message::Loaded {
-                                name: info.name,
-                                vendor: info.vendor,
-                                latency_frames: info.latency_frames,
-                                inputs: info.inputs,
-                                outputs: info.outputs,
-                            })
-                        }
-                        Message::Describe => {
-                            Ok(Message::Features(loaded(&mut plugin)?.capabilities()))
-                        }
-                        Message::Prepare(setup) if !configured => {
-                            if !setup.valid() {
-                                return Err(StartError("invalid audio configuration".into()));
-                            }
-                            let rate = setup.sample_rate;
-                            let max_frames = setup.quantum;
-                            let in_channels =
-                                vst_audio_protocol::ProcessingSetup::channels(&setup.inputs);
-                            let out_channels =
-                                vst_audio_protocol::ProcessingSetup::channels(&setup.outputs);
-                            let plugin = loaded(&mut plugin)?;
-                            plugin.configure_audio(&setup).map_err(error)?;
-                            let latency = plugin.info().latency_frames;
-                            if Some(latency) != reported_latency {
-                                write_frame(
-                                    &mut output,
-                                    &Frame {
-                                        flags: 0,
-                                        request: 0,
-                                        message: Message::LatencyChanged { frames: latency },
-                                    },
-                                )
-                                .map_err(error)?;
-                                reported_latency = Some(latency);
-                            }
-                            let geometry = Geometry {
-                                sample_format: setup.sample_format,
-                                lanes: 1,
-                                slots: args.slots,
-                                input_channels: in_channels.into(),
-                                output_channels: out_channels.into(),
-                                max_frames,
-                                sample_rate: rate,
-                                latency_bound_frames: region.latency_bound(),
-                            };
-                            region
-                                .region_for(geometry)
-                                .map_err(|e| error(format!("{e:?}")))?;
-                            let (validated, validation) = mpsc::sync_channel(1);
-                            let mut scratch =
-                                AudioBuffer::new(geometry).map_err(|e| error(format!("{e:?}")))?;
-                            let mut processor = plugin.take_processor().map_err(error)?;
-                            let region = region.clone();
-                            let work = work.clone();
-                            let done = done.clone();
-                            let ready = ready.clone();
-                            let stop = stop.clone();
-                            audio = Some(thread::spawn(move || {
-                                let _mmcss = Mmcss::pro_audio();
-                                let view = region.region();
-                                let mut consumer =
-                                    Consumer::new(view, &*ready, [Some(&*done), None]);
-                                let result = consumer.validate_and_ready(std::process::id());
-                                let valid = result == Ok(geometry);
-                                let _ = validated.send(valid);
-                                if !valid {
-                                    consumer.fault(vst_audio_ring::Fault::LayoutMismatch as u32);
-                                    return;
-                                }
-                                while !stop.load(Ordering::Acquire) {
-                                    let wake = work.wait(Duration::from_millis(100));
-                                    consumer.beat();
-                                    if wake == Waited::PeerGone
-                                        || view.state() != Some(State::Ready)
-                                    {
-                                        break;
-                                    }
-                                    scratch.drain(&consumer, processor.as_mut());
-                                }
-                                processor.stop();
-                            }));
-                            if !validation
-                                .recv_timeout(Duration::from_secs(5))
-                                .map_err(error)?
-                            {
-                                return Err(StartError("ring validation failed".into()));
-                            }
-                            configured = true;
-                            Ok(Message::Ack)
-                        }
-                        Message::Activate if configured => {
-                            plugin
-                                .as_mut()
-                                .expect("configured plugin")
-                                .activate()
-                                .map_err(error)?;
-                            Ok(Message::Ack)
-                        }
-                        Message::SetState { blob } => {
-                            loaded(&mut plugin)?.set_state(&blob).map_err(error)?;
-                            Ok(Message::Ack)
-                        }
-                        Message::GetState => Ok(Message::State {
-                            blob: loaded(&mut plugin)?.get_state().map_err(error)?,
-                        }),
-                        Message::Editor(action) => {
-                            match loaded(&mut plugin)?.editor_action(action).map_err(error)? {
-                                vst_audio_protocol::EditorReply::Status(s) => {
-                                    Ok(Message::EditorStatus(s))
-                                }
-                                vst_audio_protocol::EditorReply::Image(i) => {
-                                    Ok(Message::EditorImage(i))
-                                }
-                            }
-                        }
-                        Message::OpenEditor { scaling } => {
-                            loaded(&mut plugin)?.open_editor(scaling).map_err(error)?;
-                            Ok(Message::Ack)
-                        }
-                        Message::OpenEditorIn { parent, scaling } => {
-                            let plugin = loaded(&mut plugin)?;
-                            plugin.open_editor_in(parent, scaling).map_err(|failure| {
-                                // Windows may refuse a Low-integrity child of a higher
-                                // parent; the native error stays in diagnostics.
-                                #[cfg(windows)]
-                                if args.sandbox
-                                    && failure.0.starts_with("embedded window creation failed:")
+                    let reply: Result<Message, StartError> = (|| {
+                        let next_phase = phase
+                            .map(|current| current.accept(&message))
+                            .transpose()
+                            .map_err(error)?;
+                        let reply = match message {
+                            Message::Scan { path } => {
+                                if Path::new(&path)
+                                    .extension()
+                                    .is_some_and(|ext| ext.eq_ignore_ascii_case("vst3"))
                                 {
-                                    eprintln!("sandboxed editor: {failure}");
-                                    return StartError(
+                                    let module = vst_audio_worker_sys::vst3::Vst3Module::load(
+                                        Path::new(&path),
+                                    )
+                                    .map_err(error)?;
+                                    let entries = module
+                                        .scan()
+                                        .map_err(error)?
+                                        .into_iter()
+                                        .map(|class| ClassInfo {
+                                            id: class.id,
+                                            name: class.name,
+                                            vendor: class.vendor,
+                                            category: class.category,
+                                        })
+                                        .collect();
+                                    return Ok(Message::Classes { entries });
+                                }
+                                let scanned = Vst2Plugin::load(Path::new(&path)).map_err(error)?;
+                                Ok(Message::Classes {
+                                    entries: scanned.classes().map_err(error)?,
+                                })
+                            }
+                            Message::Load {
+                                path,
+                                format,
+                                class_id,
+                            } if plugin.is_none() => {
+                                let loaded: Box<dyn Plugin> = match format {
+                                    PluginFormat::Vst2 => Box::new(
+                                        Vst2::load(Path::new(&path), class_id).map_err(error)?,
+                                    ),
+                                    PluginFormat::Vst3 => Box::new(
+                                        crate::vst3::Vst3::load(Path::new(&path), class_id)
+                                            .map_err(error)?,
+                                    ),
+                                };
+                                let info = loaded.info();
+                                reported_latency = Some(info.latency_frames);
+                                plugin = Some(loaded);
+                                phase = Some(Phase::Loaded);
+                                Ok(Message::Loaded {
+                                    name: info.name,
+                                    vendor: info.vendor,
+                                    latency_frames: info.latency_frames,
+                                    inputs: info.inputs,
+                                    outputs: info.outputs,
+                                })
+                            }
+                            Message::Describe => {
+                                Ok(Message::Features(loaded(&mut plugin)?.capabilities()))
+                            }
+                            Message::Prepare(setup) => {
+                                if !setup.valid() {
+                                    return Err(StartError("invalid audio configuration".into()));
+                                }
+                                let rate = setup.sample_rate;
+                                let max_frames = setup.quantum;
+                                let in_channels =
+                                    vst_audio_protocol::ProcessingSetup::channels(&setup.inputs);
+                                let out_channels =
+                                    vst_audio_protocol::ProcessingSetup::channels(&setup.outputs);
+                                let plugin = loaded(&mut plugin)?;
+                                plugin.configure_audio(&setup).map_err(error)?;
+                                let latency = plugin.info().latency_frames;
+                                if Some(latency) != reported_latency {
+                                    write_frame(
+                                        &mut output,
+                                        &Frame {
+                                            flags: 0,
+                                            request: 0,
+                                            message: Message::LatencyChanged { frames: latency },
+                                        },
+                                    )
+                                    .map_err(error)?;
+                                    reported_latency = Some(latency);
+                                }
+                                let geometry = Geometry {
+                                    sample_format: setup.sample_format,
+                                    lanes: 1,
+                                    slots: args.slots,
+                                    input_channels: in_channels.into(),
+                                    output_channels: out_channels.into(),
+                                    max_frames,
+                                    sample_rate: rate,
+                                    latency_bound_frames: region.latency_bound(),
+                                };
+                                region
+                                    .region_for(geometry)
+                                    .map_err(|e| error(format!("{e:?}")))?;
+                                let (validated, validation) = mpsc::sync_channel(1);
+                                let mut scratch = AudioBuffer::new(geometry)
+                                    .map_err(|e| error(format!("{e:?}")))?;
+                                let mut processor = plugin.take_processor().map_err(error)?;
+                                let region = region.clone();
+                                let work = work.clone();
+                                let done = done.clone();
+                                let ready = ready.clone();
+                                let stop = stop.clone();
+                                audio = Some(thread::spawn(move || {
+                                    let _mmcss = Mmcss::pro_audio();
+                                    let view = region.region();
+                                    let mut consumer =
+                                        Consumer::new(view, &*ready, [Some(&*done), None]);
+                                    let result = consumer.validate_and_ready(std::process::id());
+                                    let valid = result == Ok(geometry);
+                                    let _ = validated.send(valid);
+                                    if !valid {
+                                        consumer
+                                            .fault(vst_audio_ring::Fault::LayoutMismatch as u32);
+                                        return;
+                                    }
+                                    while !stop.load(Ordering::Acquire) {
+                                        let wake = work.wait(Duration::from_millis(100));
+                                        consumer.beat();
+                                        if wake == Waited::PeerGone
+                                            || view.state() != Some(State::Ready)
+                                        {
+                                            break;
+                                        }
+                                        scratch.drain(&consumer, processor.as_mut());
+                                    }
+                                    processor.stop();
+                                }));
+                                if !validation
+                                    .recv_timeout(Duration::from_secs(5))
+                                    .map_err(error)?
+                                {
+                                    return Err(StartError("ring validation failed".into()));
+                                }
+                                Ok(Message::Ack)
+                            }
+                            Message::Activate => {
+                                plugin
+                                    .as_mut()
+                                    .expect("configured plugin")
+                                    .activate()
+                                    .map_err(error)?;
+                                Ok(Message::Ack)
+                            }
+                            Message::SetState { blob } => {
+                                loaded(&mut plugin)?.set_state(&blob).map_err(error)?;
+                                Ok(Message::Ack)
+                            }
+                            Message::GetState => Ok(Message::State {
+                                blob: loaded(&mut plugin)?.get_state().map_err(error)?,
+                            }),
+                            Message::Editor(action) => {
+                                match loaded(&mut plugin)?.editor_action(action).map_err(error)? {
+                                    vst_audio_protocol::EditorReply::Status(s) => {
+                                        Ok(Message::EditorStatus(s))
+                                    }
+                                    vst_audio_protocol::EditorReply::Image(i) => {
+                                        Ok(Message::EditorImage(i))
+                                    }
+                                }
+                            }
+                            Message::OpenEditor { scaling } => {
+                                loaded(&mut plugin)?.open_editor(scaling).map_err(error)?;
+                                Ok(Message::Ack)
+                            }
+                            Message::OpenEditorIn { parent, scaling } => {
+                                let plugin = loaded(&mut plugin)?;
+                                plugin.open_editor_in(parent, scaling).map_err(|failure| {
+                                    // Windows may refuse a Low-integrity child of a higher
+                                    // parent; the native error stays in diagnostics.
+                                    #[cfg(windows)]
+                                    if args.sandbox
+                                        && failure.0.starts_with("embedded window creation failed:")
+                                    {
+                                        eprintln!("sandboxed editor: {failure}");
+                                        return StartError(
                                         "parent window is not accessible from the sandboxed worker"
                                             .into(),
                                     );
-                                }
-                                error(failure)
-                            })?;
-                            Ok(Message::Ack)
+                                    }
+                                    error(failure)
+                                })?;
+                                Ok(Message::Ack)
+                            }
+                            Message::CloseEditor => {
+                                loaded(&mut plugin)?.close_editor().map_err(error)?;
+                                Ok(Message::Ack)
+                            }
+                            Message::ListParameters { start, count } => {
+                                let (total, entries) = loaded(&mut plugin)?
+                                    .parameters(start, count)
+                                    .map_err(error)?;
+                                Ok(Message::Parameters { total, entries })
+                            }
+                            Message::SetParameter { id, value } => {
+                                loaded(&mut plugin)?
+                                    .set_parameter(id, value)
+                                    .map_err(error)?;
+                                Ok(Message::Ack)
+                            }
+                            Message::Shutdown => Ok(Message::Ack),
+                            _ => Err(StartError("invalid host request".into())),
+                        }?;
+                        if let Some(next_phase) = next_phase {
+                            phase = Some(next_phase);
                         }
-                        Message::CloseEditor => {
-                            loaded(&mut plugin)?.close_editor().map_err(error)?;
-                            Ok(Message::Ack)
-                        }
-                        Message::ListParameters { start, count } => {
-                            let (total, entries) = loaded(&mut plugin)?
-                                .parameters(start, count)
-                                .map_err(error)?;
-                            Ok(Message::Parameters { total, entries })
-                        }
-                        Message::SetParameter { id, value } => {
-                            loaded(&mut plugin)?
-                                .set_parameter(id, value)
-                                .map_err(error)?;
-                            Ok(Message::Ack)
-                        }
-                        Message::Shutdown => Ok(Message::Ack),
-                        _ => Err(StartError("invalid host request".into())),
+                        Ok(reply)
                     })();
                     let scan = matches!(&reply, Ok(Message::Classes { .. }));
                     let fault = reply.is_err() && !recoverable;
