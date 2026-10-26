@@ -764,6 +764,10 @@ fn decode_message(kind: u16, body: &[u8]) -> Result<Option<Message>, CodecError>
         },
         kind::CLASSES => {
             let count = cursor.u16()? as usize;
+            const MIN_CLASS_BYTES: usize = 16 + 2 + 2 + 2;
+            if count > cursor.remaining() / MIN_CLASS_BYTES {
+                return Err(CodecError::Truncated);
+            }
             let mut entries = Vec::with_capacity(count);
             for _ in 0..count {
                 entries.push(ClassInfo {
@@ -1102,6 +1106,10 @@ impl<'a> Cursor<'a> {
     }
     fn bus_infos(&mut self) -> Result<Vec<BusInfo>, CodecError> {
         let count = self.u16()? as usize;
+        const MIN_BUS_BYTES: usize = 2 + 8 + 1 + 1 + 2;
+        if count > self.remaining() / MIN_BUS_BYTES {
+            return Err(CodecError::Truncated);
+        }
         let mut buses = Vec::with_capacity(count);
         for _ in 0..count {
             let layout = Bus {
