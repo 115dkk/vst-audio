@@ -18,7 +18,7 @@ impl Event {
     pub fn create() -> windows::core::Result<Self> {
         let attributes = SECURITY_ATTRIBUTES {
             nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-            bInheritHandle: true.into(),
+            bInheritHandle: false.into(),
             ..Default::default()
         };
         // SAFETY: valid attributes; unnamed, auto-reset, initially unsignalled event.

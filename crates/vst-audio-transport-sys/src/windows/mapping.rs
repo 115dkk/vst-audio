@@ -45,7 +45,7 @@ impl SharedRegion {
         }
         let attributes = SECURITY_ATTRIBUTES {
             nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-            bInheritHandle: true.into(),
+            bInheritHandle: false.into(),
             ..Default::default()
         };
         // SAFETY: unnamed paging-file mapping, valid attributes and bounded nonzero size.
