@@ -4,7 +4,8 @@
 //!
 //! This is a Rust port of EqualizerAPO-XT `runtime/ipc/StreamRing.{h,cpp}` at
 //! commit `1432f61cc437c99fde8e8e84e10e648fe516d4ce`. Copyright 2026 115dkk.
-//! It is ported to MIT with the copyright holder's permission (ADR 0021).
+//! It is distributed under MIT with the copyright holder's permission; `NOTICE`
+//! records the source revision and license provenance.
 //!
 //! The wire image is little-endian. Every value is accessed atomically. The
 //! mapping is split into a prefix of [`AtomicU32`] words and a 128-byte suffix

@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
-//! Control framing and deterministic host supervision from ADR 0021.
+//! Bounded control framing and deterministic host supervision for the isolated-worker
+//! boundary described in `docs/architecture.md`.
 
 use std::collections::VecDeque;
 use std::fmt;
