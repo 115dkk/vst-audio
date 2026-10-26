@@ -450,9 +450,12 @@ impl Window {
         self.scale.get() as f32
     }
     pub fn resize(&self, w: i32, h: i32) -> io::Result<()> {
-        self.dimensions.set((w, h));
-        if self.visible.get() {
-            self.draw()?;
+        let previous = self.dimensions.replace((w, h));
+        if self.visible.get()
+            && let Err(error) = self.draw()
+        {
+            self.dimensions.set(previous);
+            return Err(error);
         }
         Ok(())
     }

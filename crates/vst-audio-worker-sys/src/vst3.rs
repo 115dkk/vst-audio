@@ -1655,7 +1655,9 @@ impl Vst3Plugin {
                 self.closed_editor = true;
             }
             self.module.run_loop.poll();
-            if self.module.wayland.pump(&self.module.run_loop).is_err() {
+            if let Err(error) = self.module.wayland.pump(&self.module.run_loop) {
+                // Reset retires this connection, so its pump failure is logged only once.
+                eprintln!("VST3 Wayland pump failed on main thread: {error}");
                 if self
                     .editor
                     .as_ref()
@@ -1721,9 +1723,20 @@ impl Vst3Plugin {
                             .checked_sub(rect.top)
                             .filter(|v| (1..=8192).contains(v))
                     {
-                        let _ = window.resize(width, height);
-                        // SAFETY: constrained rectangle remains live during the UI callback.
-                        let _ = unsafe { editor.view.onSize(&mut rect) };
+                        // take_size consumes the request: log each failed operation once.
+                        let result = window
+                            .resize(width, height)
+                            .map_err(|error| PluginError(format!("window.resize: {error}")))
+                            .and_then(|()| {
+                                // SAFETY: constrained rectangle remains live during the UI callback.
+                                check(unsafe { editor.view.onSize(&mut rect) }, "view.onSize")
+                            });
+                        if let Err(error) = result {
+                            eprintln!("VST3 Wayland resize failed on main thread: {error}");
+                            // Zero is not a valid editor size. Invalidate the cache so
+                            // take_events re-reports the actual native size, even unchanged.
+                            self.editor_size = Some((0, 0));
+                        }
                     }
                 }
             }
