@@ -255,6 +255,13 @@ impl Vst2Plugin {
             ));
         }
         let parameter_count = fields.num_params as u32;
+        // A VST2 plugin can violate its entry-time parameter declaration at OPEN.
+        // Use the validated final count for callbacks too (audit #11 TD-09);
+        // parameter_added_at_open_emits_edit_after_start covers fixture mode 22.
+        shared
+            .callback
+            .parameter_count
+            .store(parameter_count, Ordering::Release);
         let inputs = fields.num_inputs as u16;
         let outputs = fields.num_outputs as u16;
         let mut input = std::ptr::null_mut::<Arrangement>();

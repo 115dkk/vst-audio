@@ -77,7 +77,11 @@ pub extern "C" fn VSTPluginMain(host: Callback) -> *mut AEffect {
         host,
         width: AtomicU32::new(1.0f32.to_bits()),
         mode: AtomicU32::new(
-            if std::env::var_os("VST_AUDIO_TEST_CONFIGURE_LATENCY").is_some() {
+            // Select mode 22 through currentEffectID so it is active before OPEN,
+            // without an extra environment variable in the native test runner.
+            if child == 22 {
+                22
+            } else if std::env::var_os("VST_AUDIO_TEST_CONFIGURE_LATENCY").is_some() {
                 16
             } else {
                 0
@@ -176,6 +180,12 @@ unsafe extern "C" fn dispatch(
         OPEN => {
             // SAFETY: OPEN is gated, setting the final advertised output count before buffer creation.
             unsafe { (*effect).num_outputs = 6 };
+            if mode.load(Ordering::Relaxed) == 22 {
+                // Audit #11 TD-09: the plugin violates the entry-time parameter
+                // declaration by adding ID 1 at OPEN; its edit comes later.
+                // SAFETY: OPEN excludes processing and concurrent header readers.
+                unsafe { (*effect).num_params = 2 };
+            }
             let names = [
                 c"sendVstEvents",
                 c"sendVstMidiEvent",
@@ -507,6 +517,14 @@ unsafe extern "C" fn process(
         let callback = unsafe { (*raw).host };
         // SAFETY: automate carries no borrowed payload.
         unsafe { callback(effect, MASTER_AUTOMATE, 0, 0, std::ptr::null_mut(), 0.5) };
+    }
+    if mode == 22 && !audio_automated.swap(true, Ordering::Relaxed) {
+        // Defer until processing: a callback inside OPEN precedes the host's
+        // post-OPEN header snapshot and would not exercise audit #11 TD-09.
+        // SAFETY: the live instance retains this immutable host callback until CLOSE.
+        let callback = unsafe { (*raw).host };
+        // SAFETY: ID 1 is in the post-OPEN declaration; automate has no pointer payload.
+        unsafe { callback(effect, MASTER_AUTOMATE, 1, 0, std::ptr::null_mut(), 0.75) };
     }
     if mode == 21 {
         // Audit #11 TD-06: a violating VST2 plugin sends only the common header,

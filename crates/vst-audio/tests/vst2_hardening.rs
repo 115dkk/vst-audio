@@ -121,6 +121,51 @@ fn short_midi_header_is_dropped_and_worker_keeps_processing() {
 
 #[test]
 #[ignore = "native fixtures required"]
+fn parameter_added_at_open_emits_edit_after_start() {
+    let (worker, plugin) = paths();
+    let mut descriptor = PluginDescriptor::new(plugin, PluginFormat::Vst2);
+    // Fixture mode 22 must be selected before OPEN, not by a later state restore.
+    descriptor.class_id = Some([b'V', b'S', b'T', b'2', 0, 0, 0, 22, 0, 0, 0, 0, 0, 0, 0, 0]);
+    let mut instance = Host::new(worker)
+        .spawn(&descriptor, &Configuration::default(), None)
+        .unwrap();
+    let mut audio = instance.take_audio().unwrap();
+    let input = [0.25f32; 128];
+    let mut samples = [[0.0f32; 128]; 6];
+    let mut outputs: Vec<_> = samples.iter_mut().map(|plane| &mut plane[..]).collect();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut edits = Vec::new();
+    let mut refreshes = 0;
+    loop {
+        audio.process(&[&input, &input], &mut outputs);
+        while let Some(event) = instance.try_next_event() {
+            match event {
+                HostEvent::ParameterEdited { id, phase, value } => edits.push((id, phase, value)),
+                HostEvent::ParametersChanged => refreshes += 1,
+                HostEvent::Failed { reason } | HostEvent::RequestFailed { reason, .. } => {
+                    panic!("{reason}")
+                }
+                _ => {}
+            }
+        }
+        if !edits.is_empty() || refreshes != 0 || Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        edits,
+        vec![(1, vst_audio_protocol::EditPhase::Perform, 0.75)],
+        "missing edit for parameter added at OPEN; coarse refreshes={refreshes}"
+    );
+    assert_eq!(
+        refreshes, 0,
+        "valid post-OPEN edit must not become a refresh"
+    );
+}
+
+#[test]
+#[ignore = "native fixtures required"]
 fn callbacks_time_latency_and_opaque_state() {
     let mut s = start(7);
     block(&s, 1);
