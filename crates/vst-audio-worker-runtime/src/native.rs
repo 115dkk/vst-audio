@@ -491,6 +491,15 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
     );
     let done = Arc::new(Event::open(args.done).map_err(error)?);
     let ready = Arc::new(Event::open(args.ready).map_err(error)?);
+    // The worker uses only its private duplicates. A helper the plugin starts must
+    // not inherit the originals either (audit #11 TD-03;
+    // plugin_helper_inherits_no_worker_descriptors).
+    for value in [args.control_in, args.control_out, args.parent, args.region] {
+        runtime::stop_inheritance(value).map_err(error)?;
+    }
+    for value in [args.work, args.done, args.ready] {
+        Event::stop_inheritance(value).map_err(error)?;
+    }
     if args.sandbox {
         let policy = vst_audio_transport_sys::sandbox::SandboxPolicy {
             network: args.sandbox_network,

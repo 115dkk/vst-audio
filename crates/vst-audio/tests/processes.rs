@@ -158,3 +158,78 @@ fn drop_removes_helper_after_worker_leader_exits() {
         "process-group regression subprocess failed"
     );
 }
+
+const INHERITANCE_TEST: &str = "plugin_helper_inherits_no_worker_descriptors";
+
+#[cfg(target_os = "linux")]
+fn open_descriptors(pid: u32) -> Vec<u32> {
+    let mut descriptors: Vec<u32> = std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .expect("read helper descriptors")
+        .map(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_str()
+                .unwrap()
+                .parse()
+                .unwrap()
+        })
+        .collect();
+    descriptors.sort_unstable();
+    descriptors
+}
+
+/// A plugin's helper process must not receive the worker's control pipe, shared
+/// mapping, events or parent handle (audit #11 TD-03).
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "native fixtures required"]
+fn plugin_helper_inherits_no_worker_descriptors() {
+    if let Some(path) = std::env::var_os("VST_AUDIO_TEST_SPAWN_HELPER") {
+        let worker = PathBuf::from(std::env::var_os("VST_AUDIO_WORKER").expect("worker required"));
+        let plugin =
+            PathBuf::from(std::env::var_os("VST_AUDIO_TEST_VST2").expect("fixture required"));
+        let instance = Host::new(worker)
+            .spawn(
+                &PluginDescriptor::new(plugin, PluginFormat::Vst2),
+                &Configuration::default(),
+                None,
+            )
+            .expect("load fixture through the isolated worker");
+        let path = Path::new(&path);
+        assert!(
+            wait_until(Duration::from_secs(3), || pids(path).is_some()),
+            "fixture did not publish worker/helper PIDs"
+        );
+        let (_, helper) = pids(path).unwrap();
+        // The helper's stdio is null; anything else came from the worker.
+        assert_eq!(
+            open_descriptors(helper),
+            [0, 1, 2],
+            "helper inherited worker descriptors"
+        );
+        drop(instance);
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("helper.pid");
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            INHERITANCE_TEST,
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("VST_AUDIO_TEST_SPAWN_HELPER", &path)
+        .status()
+        .expect("run isolated inheritance regression");
+    if let Some((leader, helper)) = pids(&path) {
+        for pid in [leader, helper] {
+            if exists(pid) {
+                kill(pid);
+            }
+        }
+    }
+    assert!(status.success(), "inheritance regression subprocess failed");
+}

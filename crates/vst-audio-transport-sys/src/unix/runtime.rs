@@ -44,6 +44,24 @@ pub fn duplicate_value(value: usize, _: bool) -> io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(duplicate) })
 }
 
+/// Marks an inherited descriptor close-on-exec without closing it: the number may
+/// be borrowed elsewhere, but a process the plugin starts no longer receives it
+/// (audit #11 TD-03).
+pub fn stop_inheritance(value: usize) -> io::Result<()> {
+    let fd = i32::try_from(value)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid descriptor"))?;
+    // SAFETY: fcntl validates the descriptor and only reads its flags.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: flag-only change on the validated descriptor; nothing is closed.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 pub fn inherited_file(value: usize) -> io::Result<File> {
     Ok(duplicate_value(value, false)?.into())
 }
@@ -908,6 +926,20 @@ mod tests {
             Some(libc::ECHILD)
         );
         eprintln!("Drop returned in {elapsed:?}; child reaped and sandbox removed");
+    }
+
+    #[test]
+    fn stop_inheritance_keeps_the_descriptor_open() {
+        let (read, _write) = pipe().unwrap();
+        let value = read.as_raw_fd();
+        // SAFETY: flag-only change on this test's live descriptor.
+        assert_eq!(unsafe { libc::fcntl(value, libc::F_SETFD, 0) }, 0);
+        stop_inheritance(value as usize).unwrap();
+        // SAFETY: flag-only query on the same live descriptor.
+        let flags = unsafe { libc::fcntl(value, libc::F_GETFD) };
+        assert_eq!(flags & libc::FD_CLOEXEC, libc::FD_CLOEXEC);
+        let error = stop_inheritance(i32::MAX as usize).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EBADF));
     }
 
     #[test]

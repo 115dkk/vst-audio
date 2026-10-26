@@ -51,6 +51,20 @@ pub fn duplicate_value(value: usize, inheritable: bool) -> windows::core::Result
     Ok(own(result))
 }
 
+/// Clears an inherited handle's inherit flag without closing it: the value may be
+/// borrowed elsewhere, but a process the plugin starts no longer receives it
+/// (audit #11 TD-03).
+pub fn stop_inheritance(value: usize) -> windows::core::Result<()> {
+    // SAFETY: Windows validates the handle; this changes only its inherit flag.
+    unsafe {
+        SetHandleInformation(
+            HANDLE(value as *mut _),
+            HANDLE_FLAG_INHERIT.0,
+            HANDLE_FLAGS(0),
+        )
+    }
+}
+
 pub fn parent_handle() -> windows::core::Result<OwnedHandle> {
     // SAFETY: obtains only the current process's pseudo handle.
     let current = unsafe { GetCurrentProcess() };
@@ -627,6 +641,20 @@ mod tests {
         // SAFETY: test callers retain the owning resource and flags is writable.
         unsafe { GetHandleInformation(HANDLE(value as *mut _), &mut flags) }.unwrap();
         assert_eq!(flags & HANDLE_FLAG_INHERIT.0, 0);
+    }
+
+    #[test]
+    fn stop_inheritance_keeps_the_handle_open() {
+        let event = crate::Event::create().unwrap();
+        let inheritable = duplicate_value(event.handle_value() as usize, true).unwrap();
+        let value = inheritable.as_raw_handle() as usize;
+        stop_inheritance(value).unwrap();
+        assert_not_inheritable(value);
+        let token = duplicate_value(event.handle_value() as usize, true).unwrap();
+        crate::Event::stop_inheritance(token.as_raw_handle() as u64).unwrap();
+        assert_not_inheritable(token.as_raw_handle() as usize);
+        // Still a live handle: it can be duplicated again.
+        duplicate_value(value, false).unwrap();
     }
 
     #[test]

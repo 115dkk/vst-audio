@@ -41,6 +41,11 @@ impl Event {
             peer: None,
         })
     }
+    /// Stops a process the plugin starts from inheriting the token's descriptors.
+    pub fn stop_inheritance(value: u64) -> io::Result<()> {
+        crate::runtime::stop_inheritance((value & 0xffff_ffff) as usize)?;
+        crate::runtime::stop_inheritance((value >> 32) as usize)
+    }
     pub fn with_peer(mut self, peer: OwnedFd) -> Self {
         self.peer = Some(peer);
         self

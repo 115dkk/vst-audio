@@ -27,6 +27,13 @@ impl Event {
         let handle = unsafe { OwnedHandle::from_raw_handle(handle.0) };
         Ok(Self { handle, peer: None })
     }
+    /// Stops a process the plugin starts from inheriting the token's handle.
+    pub fn stop_inheritance(value: u64) -> windows::core::Result<()> {
+        let value = usize::try_from(value).map_err(|_| {
+            windows::core::Error::from_hresult(windows::Win32::Foundation::E_INVALIDARG)
+        })?;
+        crate::runtime::stop_inheritance(value)
+    }
     pub fn open(value: u64) -> windows::core::Result<Self> {
         let value = usize::try_from(value).map_err(|_| {
             windows::core::Error::from_hresult(windows::Win32::Foundation::E_INVALIDARG)
