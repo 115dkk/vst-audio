@@ -78,6 +78,7 @@ struct Control {
     canvas: Option<crate::visual::Canvas>,
     next_child: usize,
     idle_once: bool,
+    rate: u32,
 }
 struct Audio {
     delay: [[f32; 64]; 6],
@@ -156,6 +157,7 @@ pub extern "C" fn VSTPluginMain(host: Callback) -> *mut AEffect {
             canvas: None,
             next_child: 0,
             idle_once: false,
+            rate: 0,
         }),
         audio: UnsafeCell::new(Audio {
             delay: [[0.0; 64]; 6],
@@ -259,7 +261,10 @@ unsafe extern "C" fn dispatch(
             unsafe { observe_time(effect, observation::OPEN_SAMPLE_RATE) };
             1
         }
+        // A 100 ms tail at the configured rate; automatic (0) before one arrives.
+        GET_TAIL_SAMPLES => (control.rate / 10) as isize,
         SET_SAMPLE_RATE => {
+            control.rate = option as u32;
             if mode.load(Ordering::Relaxed) == mode::CONFIGURE_LATENCY_CHANGE {
                 // SAFETY: configure excludes processing and header inspection.
                 unsafe { (*effect).initial_delay = 96 };

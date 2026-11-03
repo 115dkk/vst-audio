@@ -19,3 +19,10 @@ VST2 MIDI-list and time-record layouts were cross-checked/adapted from
 DISTRHO/DPF distrho/src/DistrhoPluginVST2.cpp at
 4238e1c7f0351bbe488d79f0899c540543ac7583. Copyright (C) 2012-2024
 Filipe Coelho. ISC; the complete notice is in LICENSE-ISC-DPF.
+
+The non-shell VST2 unique-ID class encoding, the relaxed VST3 legacy
+MIDI-output value check and the VST2 tail-length query were adapted from
+cyroz1's local patches to this crate in https://github.com/cyroz1/fl-studio-rust
+at 7f06c6011f6ad0d2e32e5b7d9ea5c9504cc067e5 and
+ca0e59b9b7775d8fdac850d6a985cb378bb3f087 (vendor/vst-audio-worker-sys).
+That repository declares MIT; the changes are by cyroz1.

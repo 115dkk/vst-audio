@@ -485,7 +485,11 @@ impl IEventListTrait for EventList {
             65535 => {
                 // SAFETY: legacy MIDI output tag selects its union member.
                 let n = unsafe { event.__field0.midiCCOut };
-                if !(0..16).contains(&n.channel) || n.value < 0 || n.value2 < 0 {
+                // Only the fields a message uses are checked: a negative int8
+                // becomes a data byte of 0x80 or more, which `valid` rejects
+                // below. CC, channel pressure and program change ignore value2,
+                // which a plugin may leave unset.
+                if !(0..16).contains(&n.channel) {
                     return self.reject(kInvalidArgument);
                 }
                 EventData::Midi(match n.controlNumber {
@@ -572,5 +576,42 @@ mod tests {
         list.collect(&mut output);
         assert_eq!(output.as_slice(), [AudioEvent::midi(17, 0, [0xa2, 60, 95])]);
         assert_eq!(output.dropped, 2);
+    }
+    #[test]
+    fn legacy_output_checks_only_the_values_a_message_uses() {
+        let list = EventList::new();
+        list.reset(128, 0, 1);
+        // SAFETY: SDK Event contains plain numbers/pointers with a valid zero representation.
+        let mut event: Event = unsafe { std::mem::zeroed() };
+        event.r#type = 65535;
+        let mut send = |control, value, value2| {
+            event.__field0.midiCCOut = LegacyMIDICCOutEvent {
+                controlNumber: control,
+                channel: 1,
+                value,
+                value2,
+            };
+            // SAFETY: retained audio-thread list and a live writable SDK event.
+            unsafe { list.addEvent(&mut event) }
+        };
+        // CC 7, channel pressure and program change carry an unset value2.
+        assert_eq!(send(7, 100, -1), kResultOk);
+        assert_eq!(send(128, 30, -128), kResultOk);
+        assert_eq!(send(130, 5, -1), kResultOk);
+        // A negative value that a message does use is still rejected.
+        assert_eq!(send(7, -1, 0), kInvalidArgument);
+        assert_eq!(send(129, 0, -1), kInvalidArgument);
+        assert_eq!(send(131, 60, -1), kInvalidArgument);
+        let mut output = EventBuffer::default();
+        list.collect(&mut output);
+        assert_eq!(
+            output.as_slice(),
+            [
+                AudioEvent::midi(0, 0, [0xb1, 7, 100]),
+                AudioEvent::midi(0, 0, [0xd1, 30, 0]),
+                AudioEvent::midi(0, 0, [0xc1, 5, 0]),
+            ]
+        );
+        assert_eq!(output.dropped, 3);
     }
 }

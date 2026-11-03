@@ -18,6 +18,25 @@ fn processor_is_unique_and_freezes_configuration() {
 
 #[test]
 #[ignore = "native fixtures required"]
+fn tail_samples_follow_the_configured_rate() {
+    let path = std::env::var_os("VST_AUDIO_TEST_VST2").unwrap();
+    let mut plugin = Vst2Plugin::load(Path::new(&path)).unwrap();
+    // The fixture leaves the tail automatic until a sample rate arrives.
+    assert_eq!(plugin.tail_samples(), None);
+    plugin.configure(44100, 128, 2, 6).unwrap();
+    plugin.set_state(&[1, 0]).unwrap();
+    plugin.activate();
+    assert_eq!(plugin.tail_samples(), Some(4410));
+    // The control gate also admits the query while a processor exists.
+    let mut processor = plugin.processor().unwrap();
+    let mut storage = [[0.0; 128]; 6];
+    let mut planes: Vec<_> = storage.iter_mut().map(|p| p.as_mut_slice()).collect();
+    assert!(processor.process(&mut planes, 128));
+    assert_eq!(plugin.tail_samples(), Some(4410));
+}
+
+#[test]
+#[ignore = "native fixtures required"]
 fn io_change_never_calls_old_buffers() {
     let path = std::env::var_os("VST_AUDIO_TEST_VST2").unwrap();
     let mut plugin = Vst2Plugin::load(Path::new(&path)).unwrap();
