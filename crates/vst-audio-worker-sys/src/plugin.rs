@@ -345,6 +345,19 @@ impl Vst2Plugin {
     pub fn info(&self) -> Info {
         self.info.clone()
     }
+    /// The plugin's reported tail: `Some(0)` for no tail, `Some(n)` for `n`
+    /// samples after the input ends, and `None` when it leaves the length
+    /// automatic or answers outside the VST2 definition.
+    ///
+    /// Many plugins derive the length from the sample rate and their current
+    /// parameters, so query after [`Self::configure`] and any state restore. A
+    /// call during processing waits for the block to finish, like every other
+    /// control call. This is a worker-side query; the protocol and the
+    /// application API do not carry it yet.
+    pub fn tail_samples(&self) -> Option<u32> {
+        let control = self.shared.control();
+        tail_from_reply(control.call(GET_TAIL_SAMPLES, 0, 0, std::ptr::null_mut(), 0.0))
+    }
     pub fn configure(
         &mut self,
         rate: u32,
@@ -1362,6 +1375,15 @@ fn decode_class(class: Option<[u8; 16]>) -> Result<Option<i32>, PluginError> {
         _ => Err(PluginError("invalid VST2 class ID".into())),
     }
 }
+/// Maps a [`GET_TAIL_SAMPLES`] reply: 1 means no tail, a larger `i32` is the
+/// length, and 0 (automatic), negatives and wider values are unknown.
+fn tail_from_reply(reply: isize) -> Option<u32> {
+    match i32::try_from(reply) {
+        Ok(1) => Some(0),
+        Ok(samples) if samples > 1 => u32::try_from(samples).ok(),
+        _ => None,
+    }
+}
 /// `b"VST2"` + the signed unique ID's big-endian bytes + eight zero bytes; the
 /// inverse of [`decode_class`] for a nonzero ID.
 fn encode_class(id: i32) -> [u8; 16] {
@@ -1539,5 +1561,17 @@ mod tests {
         assert!(decode_class(Some(encode_class(0))).is_err());
         assert_eq!(decode_class(Some([0; 16])).unwrap(), None);
         assert_eq!(decode_class(None).unwrap(), None);
+    }
+    #[test]
+    fn tail_replies_follow_the_vst2_definition() {
+        assert_eq!(tail_from_reply(0), None);
+        assert_eq!(tail_from_reply(1), Some(0));
+        assert_eq!(tail_from_reply(2), Some(2));
+        assert_eq!(tail_from_reply(48_000), Some(48_000));
+        assert_eq!(tail_from_reply(i32::MAX as isize), Some(i32::MAX as u32));
+        assert_eq!(tail_from_reply(-1), None);
+        assert_eq!(tail_from_reply(i32::MIN as isize), None);
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(tail_from_reply(i32::MAX as isize + 1), None);
     }
 }

@@ -39,6 +39,9 @@ pub const SET_CHUNK: i32 = 24;
 pub const SET_SPEAKER_ARRANGEMENT: i32 = 42;
 pub const GET_EFFECT_NAME: i32 = 45;
 pub const GET_VENDOR_STRING: i32 = 47;
+/// `VST_EFFECT_OPCODE_GETTAILSAMPLES`: 0 is automatic (unknown), 1 is no tail,
+/// any larger value is the tail in samples.
+pub const GET_TAIL_SAMPLES: i32 = 52;
 pub const GET_SPEAKER_ARRANGEMENT: i32 = 69;
 pub const START_PROCESS: i32 = 71;
 pub const STOP_PROCESS: i32 = 72;

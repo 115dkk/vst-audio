@@ -378,7 +378,12 @@ these new behaviors still require their native CI runs. Incompatible-count tests
 prove fault/rejected DSP; automatic replacement is provided by existing supervision,
 not a newly verified layout-recovery scenario in these tests.
 
-Plugin-formatted display strings, program listing/selection, tail length and
-native bypass remain outside this scope. Non-chunk state contains only the current program's values, not a complete
+Plugin-formatted display strings, program listing/selection and native bypass
+remain outside this scope. Tail length is queryable only in the process that
+loads the plugin: `Vst2Plugin::tail_samples` maps `effGetTailSize` (1 is no
+tail, 0 is automatic and reported as unknown) and the native fixture test
+`tail_samples_follow_the_configured_rate` covers it; the protocol, the
+application API and VST3 do not report a tail yet.
+Non-chunk state contains only the current program's values, not a complete
 bank; chunks are bounded to slightly under 64 MiB. OPEN gets the host default
 48 kHz because configuration arrives later; resume gets the configured rate.

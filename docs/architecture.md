@@ -212,8 +212,9 @@ worker. Safe application APIs must not expose in-process loaders.
 ## Formats
 
 The public model describes buses, f32/f64 precision, parameters and gestures,
-sample-offset events, transport context, opaque state, latency, tail and editor
-capabilities. VST2 indexes and VST3 parameter IDs retain their identity.
+sample-offset events, transport context, opaque state, latency and editor
+capabilities. Tail length is not part of it yet; only the VST2 worker layer can
+query it. VST2 indexes and VST3 parameter IDs retain their identity.
 Unsupported features return explicit results; capabilities do not pretend the
 formats have identical semantics. Bus activation is chosen by the application
 selector after the plugin declares its buses; without one, every bus is active.
