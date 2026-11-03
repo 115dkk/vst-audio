@@ -312,9 +312,13 @@ automate and endEdit callbacks cross the protocol as bounded, ordered parameter
 edit notifications; invalid or overflowed callbacks also produce `ParamsChanged`.
 
 Shell enumeration is bounded to 1024 entries. A child class ID is `b"VST2"` +
-its signed unique ID's four big-endian bytes + eight zero bytes. Non-shell class
-IDs remain all zero. Entry-time currentEffectID uses TLS even without an effect
-pointer; the returned child's unique ID must match. The effect canDo helper
+its signed unique ID's four big-endian bytes + eight zero bytes. A non-shell
+class uses the same encoding of its own unique ID, so a caller can match a
+unique ID saved by another host; a module whose unique ID is zero reports the
+all-zero class. Loading with the all-zero class or none still loads a non-shell
+module's only class. Entry-time currentEffectID uses TLS even without an effect
+pointer and answers the selected ID, as JUCE-based hosts do for any VST2 load;
+the loaded effect's unique ID after OPEN must match it. The effect canDo helper
 preserves yes/unknown/no, independently of category-based shell detection.
 
 A layout identical to the loaded declaration is retained without renegotiation

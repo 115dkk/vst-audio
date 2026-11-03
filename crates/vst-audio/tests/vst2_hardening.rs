@@ -353,6 +353,25 @@ fn shell_children() {
 }
 #[test]
 #[ignore = "native fixtures required"]
+fn non_shell_class_id_carries_the_unique_id() {
+    if std::env::var_os("VST_AUDIO_TEST_SHELL").is_some() {
+        return;
+    }
+    let (worker, plugin) = paths();
+    let classes = PluginProcess::scan(&worker, &plugin, PluginFormat::Vst2).unwrap();
+    assert_eq!(classes.len(), 1);
+    let mut expected = [0; 16];
+    expected[..4].copy_from_slice(b"VST2");
+    expected[4..8].copy_from_slice(b"SSTP");
+    assert_eq!(classes[0].id, expected);
+    // The scanned ID, the all-zero default and no selection all load the module.
+    for class in [Some(expected), Some([0; 16]), None] {
+        PluginProcess::start(&worker, &plugin, PluginFormat::Vst2, class, 48000, None)
+            .unwrap_or_else(|error| panic!("{class:?}: {error}"));
+    }
+}
+#[test]
+#[ignore = "native fixtures required"]
 fn shell_child_limit() {
     let Some(expected) = std::env::var("VST_AUDIO_TEST_SHELL_CHILDREN")
         .ok()

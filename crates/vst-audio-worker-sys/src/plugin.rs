@@ -1362,6 +1362,14 @@ fn decode_class(class: Option<[u8; 16]>) -> Result<Option<i32>, PluginError> {
         _ => Err(PluginError("invalid VST2 class ID".into())),
     }
 }
+/// `b"VST2"` + the signed unique ID's big-endian bytes + eight zero bytes; the
+/// inverse of [`decode_class`] for a nonzero ID.
+fn encode_class(id: i32) -> [u8; 16] {
+    let mut class = [0; 16];
+    class[..4].copy_from_slice(b"VST2");
+    class[4..8].copy_from_slice(&id.to_be_bytes());
+    class
+}
 /// The plugin's directory for the host directory query, or none when it cannot be
 /// expressed as the platform's narrow string. Never fails a load. macOS hosts
 /// traditionally answered with a legacy file-system record, so none is given.
@@ -1427,8 +1435,16 @@ impl Vst2Plugin {
         let category = calls.call(35, 0, 0, std::ptr::null_mut(), 0.0);
         let _shell_capability = self.can_do(c"shellCategory");
         if category != 10 {
+            // The ID shell children use, so a caller can match a saved unique ID
+            // and loading by it verifies the module still reports that ID after
+            // OPEN. A module without one keeps the all-zero default class.
+            let unique_id = calls.effect().unique_id;
             return Ok(vec![vst_audio_protocol::ClassInfo {
-                id: [0; 16],
+                id: if unique_id == 0 {
+                    [0; 16]
+                } else {
+                    encode_class(unique_id)
+                },
                 name: self.info.name.clone(),
                 vendor: self.info.vendor.clone(),
                 category: if category == 2 || calls.effect().flags & (1 << 8) != 0 {
@@ -1451,9 +1467,7 @@ impl Vst2Plugin {
                     "VST2 shell enumeration exceeded 1024 entries".into(),
                 ));
             }
-            let mut id = [0; 16];
-            id[..4].copy_from_slice(b"VST2");
-            id[4..8].copy_from_slice(&child.to_be_bytes());
+            let id = encode_class(child);
             if entries
                 .iter()
                 .any(|e: &vst_audio_protocol::ClassInfo| e.id == id)
@@ -1507,5 +1521,23 @@ impl Vst2Plugin {
         }
         refresh(&self.shared, &control, &mut self.info, self.parameter_count);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn class_ids_round_trip_signed_unique_ids() {
+        for id in [1, -1, i32::MIN, i32::MAX, i32::from_be_bytes(*b"SSTP")] {
+            let class = encode_class(id);
+            assert_eq!(&class[..4], b"VST2");
+            assert_eq!(class[8..], [0; 8]);
+            assert_eq!(decode_class(Some(class)).unwrap(), Some(id));
+        }
+        assert_eq!(encode_class(i32::from_be_bytes(*b"SSTP"))[4..8], *b"SSTP");
+        assert!(decode_class(Some(encode_class(0))).is_err());
+        assert_eq!(decode_class(Some([0; 16])).unwrap(), None);
+        assert_eq!(decode_class(None).unwrap(), None);
     }
 }
