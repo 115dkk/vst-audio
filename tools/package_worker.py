@@ -19,11 +19,14 @@ def run(*args, **options):
 
 def digest(path): return hashlib.sha256(path.read_bytes()).hexdigest()
 
-def dependency_notices(destination,target):
-    data=json.loads(subprocess.check_output(["cargo","metadata","--locked","--format-version","1","--filter-platform",target],cwd=ROOT,text=True))
+def dependency_notices(destination,target,manifest=None,root="vst-audio-worker"):
+    """Licence texts of `root` and everything it links, from `manifest` (the workspace by default)."""
+    command=["cargo","metadata","--locked","--format-version","1","--filter-platform",target]
+    if manifest: command+=["--manifest-path",str(manifest)]
+    data=json.loads(subprocess.check_output(command,cwd=ROOT,text=True))
     packages={p["id"]:p for p in data["packages"]}
     nodes={p["id"]:p for p in data["resolve"]["nodes"]}
-    queue=[next(p["id"] for p in packages.values() if p["name"]=="vst-audio-worker")]
+    queue=[next(p["id"] for p in packages.values() if p["name"]==root)]
     seen=set()
     while queue:
         identity=queue.pop()
@@ -37,6 +40,9 @@ def dependency_notices(destination,target):
         files=[p for p in source.iterdir() if p.is_file() and p.name.upper().startswith(("LICENSE","COPYING","NOTICE","COPYRIGHT"))]
         if package.get("license_file"):
             files.append(source/package["license_file"])
+        if not files and package["source"] is None:
+            # A path package of this repository (a binding crate) without its own copy.
+            files.append(ROOT/"LICENSE")
         folder=destination/f"{package['name']}-{package['version']}"
         folder.mkdir(parents=True)
         for path in set(files): shutil.copyfile(path,folder/path.name)

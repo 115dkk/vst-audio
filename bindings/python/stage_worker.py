@@ -20,15 +20,39 @@ def run(*args):
     subprocess.run(list(map(str, args)), cwd=ROOT, check=True)
 
 
-def stage(worker=None):
-    """Build or copy the native worker, returning its staged executable path."""
+def cargo_target():
+    return os.environ.get("CARGO_BUILD_TARGET") or re.search(
+        r"^host: (.+)$", subprocess.check_output(["rustc", "-vV"], cwd=ROOT, text=True), re.M
+    ).group(1)
+
+
+def stage_notices(destination, manifest=None, root="vst-audio-worker", inventory="dependencies.json"):
+    """Add the licence texts of `root`'s dependency graph to destination/licenses."""
+    import tempfile
+    # The shared notice collector creates fresh package directories. Generate in
+    # a new local staging directory, then merge into the notice tree; packages
+    # shared with an earlier graph carry the same texts.
+    with tempfile.TemporaryDirectory(prefix="notices-", dir=destination) as temporary:
+        scratch = Path(temporary)
+        notices = dependency_notices(scratch, cargo_target(), manifest, root)
+        shutil.copytree(scratch, destination / "licenses", dirs_exist_ok=True)
+    (destination / inventory).write_text(json.dumps(notices, indent=2), encoding="utf-8")
+
+
+def stage(worker=None, destination=None):
+    """Build or copy the native worker into destination (the Python package by default).
+
+    Staging into the Python package also adds the notices of the extension
+    module's own Rust dependencies, which it links statically.
+    """
+    extension = destination is None
     if worker is None:
         run("cargo", "build", "--locked", "--release", "-p", "vst-audio-worker")
         worker = target_directory() / "release" / (
             "vst-audio-worker.exe" if sys.platform == "win32" else "vst-audio-worker"
         )
     worker = Path(worker).resolve()
-    destination = PACKAGE / "_worker"
+    destination = Path(destination).resolve() if destination is not None else PACKAGE / "_worker"
     destination.mkdir(parents=True, exist_ok=True)
     if sys.platform == "darwin":
         app = destination / "VstAudioWorker.app"
@@ -69,25 +93,19 @@ def stage(worker=None):
     (destination / "LICENSE-BSD-3-Clause-VST2.txt").write_text(
         "\n".join(line.removeprefix("// ") for line in header.splitlines()), encoding="utf-8"
     )
-    target = os.environ.get("CARGO_BUILD_TARGET") or re.search(
-        r"^host: (.+)$", subprocess.check_output(["rustc", "-vV"], cwd=ROOT, text=True), re.M
-    ).group(1)
-    # The shared notice collector creates fresh package directories. Generate in
-    # a new local staging directory, then replace only the generated notice tree.
-    import tempfile
-    with tempfile.TemporaryDirectory(prefix="notices-", dir=destination) as temporary:
-        scratch = Path(temporary)
-        notices = dependency_notices(scratch, target)
-        shutil.copytree(scratch, destination / "licenses", dirs_exist_ok=True)
-    (destination / "dependencies.json").write_text(json.dumps(notices, indent=2), encoding="utf-8")
+    stage_notices(destination)
+    if extension:
+        stage_notices(destination, Path(__file__).resolve().parent / "Cargo.toml",
+                      "vst-audio-python", "dependencies-extension.json")
     return executable
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--worker", type=Path, help="Use an existing worker executable or macOS app bundle")
+    parser.add_argument("--destination", type=Path, help="Stage into this directory instead of the Python package")
     args = parser.parse_args()
-    print(stage(args.worker))
+    print(stage(args.worker, args.destination))
 
 
 if __name__ == "__main__":

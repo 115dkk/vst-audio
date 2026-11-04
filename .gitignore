@@ -14,4 +14,6 @@ __pycache__/
 /fuzz/coverage/
 /bindings/dotnet/**/bin/
 /bindings/dotnet/**/obj/
+/bindings/dotnet/VstAudio/runtimes/
+/bindings/dotnet/**/TestResults/
 /dist/
