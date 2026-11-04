@@ -119,4 +119,6 @@ protection rules; restrict the `pypi` and `nuget` environments to the `main`
 branch in the repository settings.
 
 A conda-forge package is planned after the first functional PyPI release. Its
-recipe goes to `conda-forge/staged-recipes` and builds from the PyPI sdist.
+recipe goes to `conda-forge/staged-recipes` and builds from the GitHub source
+archive of a `python-v<version>` tag, since the PyPI sdist does not contain the
+worker application (ADR 0006).
