@@ -17,6 +17,12 @@ name: Release
 #   github   the tag and the GitHub release with the worker archives of all
 #            four targets and SHA256SUMS.txt. While the major version is 0 it
 #            is a prerelease.
+#   pypi     the Python package through PyPI trusted publishing (environment
+#   nuget    pypi) and the NuGet package through NuGet trusted publishing
+#            (environment nuget, nuget.org profile in the NUGET_USER variable).
+#            Both run on every push to main and skip versions already
+#            published, because the packages carry their own versions (see
+#            docs/distribution.md) and change without a crate release.
 #
 # Every job checks out release_sha, the commit the gate decided on (the bump
 # commit when it bumped), so a push that lands meanwhile cannot slip in. The
@@ -185,3 +191,47 @@ jobs:
               --title "vst-audio $VERSION" --notes-file notes.md "${flags[@]}"
           fi
           gh release view "$TAG" --json assets,isPrerelease -q '{prerelease: .isPrerelease, assets: [.assets[].name]}'
+
+  pypi:
+    name: Publish to PyPI
+    needs: [gate, ci]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: bindings-python
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          packages-dir: dist
+          skip-existing: true
+
+  nuget:
+    name: Publish to NuGet
+    needs: [gate, ci]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: nuget
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: bindings-nuget
+          path: dist
+      - uses: NuGet/login@8d196754b4036150537f80ac539e15c2f1028841 # v1.2.0
+        id: login
+        with:
+          user: ${{ vars.NUGET_USER }}
+      - name: dotnet nuget push
+        env:
+          NUGET_API_KEY: ${{ steps.login.outputs.NUGET_API_KEY }}
+        run: |
+          dotnet nuget push "dist/*.nupkg" --api-key "$NUGET_API_KEY" \
+            --source https://api.nuget.org/v3/index.json --skip-duplicate

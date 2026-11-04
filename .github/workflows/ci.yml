@@ -92,6 +92,43 @@ jobs:
             target/package-check/summary.json
             target/package-check/*.log
           if-no-files-found: ignore
+  bindings:
+    # The PyPI and NuGet packages release.yml publishes. They only reserve the
+    # names until the bindings exist; see docs/distribution.md.
+    name: binding packages
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Python sdist and wheel
+        run: |
+          set -euo pipefail
+          cp LICENSE bindings/python/LICENSE
+          python3 -m venv "$RUNNER_TEMP/venv"
+          . "$RUNNER_TEMP/venv/bin/activate"
+          pip install --quiet build==1.6.1 twine==7.0.0
+          python -m build bindings/python --outdir dist/python
+          twine check --strict dist/python/*
+          pip install --quiet dist/python/*.whl
+          test "$(cd "$RUNNER_TEMP" && python -c 'import vst_audio; print(vst_audio.__version__)')" = 0.0.1
+          unzip -l dist/python/*.whl | grep -q 'licenses/LICENSE'
+      - name: NuGet package
+        run: |
+          set -euo pipefail
+          dotnet pack bindings/dotnet/VstAudio/VstAudio.csproj -c Release -o dist/nuget
+          unzip -l dist/nuget/VstAudio.0.0.1.nupkg | grep -q 'lib/netstandard2.0/VstAudio.dll'
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: bindings-python
+          path: dist/python/
+          if-no-files-found: error
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: bindings-nuget
+          path: dist/nuget/
+          if-no-files-found: error
   gui:
     name: GUI consumers (${{ matrix.os }})
     strategy:
