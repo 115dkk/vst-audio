@@ -14,7 +14,7 @@ use std::{
 };
 use vst_audio::{
     BlockEndpoint, Command, Configuration, HostEvent, Instance, PluginDescriptor, PluginFormat,
-    Rendered, RequestId, SampleFormat,
+    RequestId, SampleFormat,
 };
 
 create_exception!(vst_audio, VstAudioError, PyException);
@@ -348,30 +348,48 @@ impl Plugin {
         match self.sample_format {
             SampleFormat::F32 => {
                 let input = input_array::<f32>(audio, self.input_channels as usize, "float32")?;
+                let frames = input.ncols();
+                let channels = self.output_channels as usize;
+                let (length, mut output) = output_buffer::<f32>(channels, frames, tail)?;
                 let session = self.session()?;
                 let output = py.detach(move || {
-                    render(
-                        &mut session.blocks,
-                        &input,
-                        tail,
-                        timeout,
-                        BlockEndpoint::process_wait,
-                    )
+                    session
+                        .blocks
+                        .render(
+                            input.as_slice().expect("standard layout"),
+                            frames,
+                            tail,
+                            &mut output,
+                            timeout,
+                        )
+                        .map_err(render_error)?;
+                    Ok::<_, PyErr>(output)
                 })?;
+                let output = Array2::from_shape_vec((channels, length), output)
+                    .expect("validated output shape");
                 Ok(output.into_pyarray(py).into_any())
             }
             SampleFormat::F64 => {
                 let input = input_array::<f64>(audio, self.input_channels as usize, "float64")?;
+                let frames = input.ncols();
+                let channels = self.output_channels as usize;
+                let (length, mut output) = output_buffer::<f64>(channels, frames, tail)?;
                 let session = self.session()?;
                 let output = py.detach(move || {
-                    render(
-                        &mut session.blocks,
-                        &input,
-                        tail,
-                        timeout,
-                        BlockEndpoint::process_wait_f64,
-                    )
+                    session
+                        .blocks
+                        .render_f64(
+                            input.as_slice().expect("standard layout"),
+                            frames,
+                            tail,
+                            &mut output,
+                            timeout,
+                        )
+                        .map_err(render_error)?;
+                    Ok::<_, PyErr>(output)
                 })?;
+                let output = Array2::from_shape_vec((channels, length), output)
+                    .expect("validated output shape");
                 Ok(output.into_pyarray(py).into_any())
             }
         }
@@ -497,75 +515,19 @@ fn input_array<T: numpy::Element + Copy>(
     Ok(view.as_standard_layout().into_owned())
 }
 
-type ProcessBlock<T> =
-    fn(&mut BlockEndpoint, &[T], &mut [T], Duration) -> Result<Rendered, vst_audio::RenderError>;
-
-fn render<T: numpy::Element + Copy + Default>(
-    blocks: &mut BlockEndpoint,
-    input: &Array2<T>,
+fn output_buffer<T: Default + Clone>(
+    channels: usize,
+    frames: usize,
     tail: usize,
-    timeout: Duration,
-    process: ProcessBlock<T>,
-) -> PyResult<Array2<T>> {
-    let geometry = blocks.geometry();
-    let quantum = geometry.max_frames as usize;
-    let frames = input.ncols();
+) -> PyResult<(usize, Vec<T>)> {
     let length = frames
         .checked_add(tail)
         .ok_or_else(|| PyValueError::new_err("render length overflow"))?;
-    let channels = geometry.output_channels as usize;
-    if length
+    let samples = length
         .checked_mul(channels)
         .filter(|n| *n <= isize::MAX as usize / std::mem::size_of::<T>())
-        .is_none()
-    {
-        return Err(PyValueError::new_err("render array is too large"));
-    }
-    let mut result = Array2::from_elem((channels, length), T::default());
-    if length == 0 {
-        return Ok(result);
-    }
-    let mut source = vec![T::default(); geometry.input_channels as usize * quantum];
-    let mut target = vec![T::default(); channels * quantum];
-    let mut position = 0usize;
-    let mut latency = blocks.latency_frames();
-    loop {
-        source.fill(T::default());
-        if position < frames {
-            let count = quantum.min(frames - position);
-            for channel in 0..input.nrows() {
-                for frame in 0..count {
-                    source[channel * quantum + frame] = input[(channel, position + frame)];
-                }
-            }
-        }
-        let status = process(blocks, &source, &mut target, timeout).map_err(render_error)?;
-        // Priming has no delivered samples. It still occupies pipeline time;
-        // counting this virtual prefix avoids trimming pipeline latency twice.
-        if position == 0 {
-            latency = blocks.latency_frames();
-        }
-        let end = length
-            .checked_add(latency)
-            .ok_or_else(|| PyValueError::new_err("render length overflow"))?;
-        if status == Rendered::Delivered {
-            let begin = position.max(latency);
-            let stop = position.saturating_add(quantum).min(end);
-            for channel in 0..channels {
-                for frame in begin..stop {
-                    result[(channel, frame - latency)] =
-                        target[channel * quantum + frame - position];
-                }
-            }
-        }
-        position = position
-            .checked_add(quantum)
-            .ok_or_else(|| PyValueError::new_err("render position overflow"))?;
-        if position >= end {
-            break;
-        }
-    }
-    Ok(result)
+        .ok_or_else(|| PyValueError::new_err("render array is too large"))?;
+    Ok((length, vec![T::default(); samples]))
 }
 
 #[pymodule]

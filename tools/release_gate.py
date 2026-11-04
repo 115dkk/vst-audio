@@ -28,7 +28,7 @@ anything under ``tests``, ``benches`` or ``fuzz``, plus ``SHIP_ALWAYS``.
 
 A bump rewrites the workspace version, the ``=<version>`` pins of the
 workspace dependencies and the workspace packages in every Cargo.lock
-(the root one, the GUI examples, fuzz and the Python bindings), so
+(the root one, the GUI examples, fuzz and the bindings), so
 ``--locked`` keeps working.
 """
 from __future__ import annotations
@@ -78,6 +78,7 @@ LOCKS = (
     Path("examples/gui/Cargo.lock"),
     Path("fuzz/Cargo.lock"),
     Path("bindings/python/Cargo.lock"),
+    Path("bindings/ffi/Cargo.lock"),
 )
 MEMBER_GLOBS = ("crates/*/Cargo.toml", "apps/*/Cargo.toml")
 

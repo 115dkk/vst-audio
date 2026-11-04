@@ -71,12 +71,22 @@ Python 3.13 and 3.14 on one abi3 wheel).
 
 ## .NET
 
-A C ABI crate, `vst-audio-ffi-sys`, exports opaque handles, status codes and a
-thread-local last-error message; every unsafe operation states its preconditions
-as in the other `-sys` crates. The C# package targets `netstandard2.0` and
-`net8.0`, wraps handles in `SafeHandle`, and ships the native library and worker
-under `runtimes/<rid>/native/`. The same C ABI can later serve C, C++ and other
-languages.
+A C ABI crate, `vst-audio-ffi-sys` in `bindings/ffi`, exports opaque handles,
+status codes and a thread-local last-error message; every unsafe operation
+states its preconditions as in the other `-sys` crates. Offline rendering with
+latency compensation lives in the crate as `BlockEndpoint::render` and
+`render_f64`, so the Python and .NET bindings share one implementation.
+
+The C# package targets `net8.0`, wraps handles in `SafeHandle`, and ships the
+native library and worker under `runtimes/<rid>/native/` for `win-x64`,
+`linux-x64`, `osx-arm64` and `osx-x64`. The Linux natives are built in the same
+`manylinux_2_28` container as the Python wheel. NuGet does not keep Unix file
+modes, so the package marks its bundled worker executable before the first
+start. The same C ABI can later serve C, C++ and other languages.
+
+`netstandard2.0` was planned and dropped: .NET Framework and Unity do not select
+NuGet `runtimes/` assets, so the package could not be tested there, and
+`net8.0` gives `NativeLibrary`, `LibraryImport` and `File.SetUnixFileMode`.
 
 ## Alternatives rejected
 

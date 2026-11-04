@@ -209,8 +209,11 @@ adapter reports `(depth + 1) * quantum + plugin latency`. See
 calls for lossless offline rendering. They may sleep until the exact due block
 completes, stop on timeout, worker shutdown or recovery, and never run on an
 audio thread. A caller submits `depth` additional blocks, usually silence, to
-receive the pipeline's final `depth` outputs. The existing `process` calls remain
-non-waiting and realtime-safe.
+receive the pipeline's final `depth` outputs. `render` and `render_f64` perform
+that block loop for a planar buffer, append a requested silent tail and remove
+both pipeline and reported plugin latency from the result. They allocate two
+block buffers per call and are likewise control-thread-only. The existing
+`process` calls remain non-waiting and realtime-safe.
 
 Native pointer/lifetime operations are audited in sys crates. For loading a
 plugin, crash isolation does not make unknown native code memory-safe inside the
