@@ -92,38 +92,79 @@ jobs:
             target/package-check/summary.json
             target/package-check/*.log
           if-no-files-found: ignore
-  bindings:
-    # The PyPI and NuGet packages release.yml publishes. They only reserve the
-    # names until the bindings exist; see docs/distribution.md.
-    name: binding packages
+  python:
+    # The PyPI wheels release.yml publishes (ADR 0006). Each bundles the release
+    # worker; the Linux wheel and its worker are built in the manylinux_2_28
+    # container. The wheel is then installed into a fresh venv and tested with
+    # the native fixtures, including its bundled worker.
+    name: Python wheel (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2025, ubuntu-24.04, macos-15, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Toolchain
+        shell: bash
+        run: |
+          rustup toolchain install
+          rustc -vV
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          workspaces: |
+            .
+            bindings/python
+      - name: Wheel (Linux, manylinux_2_28 container)
+        if: runner.os == 'Linux'
+        run: |
+          docker run --rm -u "$(id -u):$(id -g)" -v "$PWD:/io" -w /io             quay.io/pypa/manylinux_2_28_x86_64@sha256:7e41b1c7fd64dfc69703a1124b43c404382973ee06ec5d764b85c34d2221fded             bash bindings/python/build_manylinux.sh
+      - name: Wheel (Windows, macOS)
+        if: runner.os != 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m venv "$RUNNER_TEMP/build"
+          if [ "$RUNNER_OS" = Windows ]; then . "$RUNNER_TEMP/build/Scripts/activate"; else . "$RUNNER_TEMP/build/bin/activate"; fi
+          pip install --quiet maturin==1.16.0
+          python bindings/python/stage_worker.py
+          cd bindings/python
+          maturin build --locked --release --out ../../dist/python
+      - name: Check metadata and test the wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          python=python3; bin="$RUNNER_TEMP/twine/bin"
+          if [ "$RUNNER_OS" = Windows ]; then python=python; bin="$RUNNER_TEMP/twine/Scripts"; fi
+          "$python" -m venv "$RUNNER_TEMP/twine"
+          "$bin/python" -m pip install --quiet twine==7.0.0
+          "$bin/python" -m twine check --strict dist/python/*.whl
+          "$python" bindings/python/run_tests.py --wheel dist/python/*.whl
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: bindings-python-${{ matrix.os }}
+          path: dist/python/
+          if-no-files-found: error
+  nuget:
+    # The NuGet package release.yml publishes. It only reserves the name until
+    # the .NET bindings exist; see docs/distribution.md.
+    name: NuGet package
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ inputs.ref }}
-      - name: Python sdist and wheel
-        run: |
-          set -euo pipefail
-          cp LICENSE bindings/python/LICENSE
-          python3 -m venv "$RUNNER_TEMP/venv"
-          . "$RUNNER_TEMP/venv/bin/activate"
-          pip install --quiet build==1.6.1 twine==7.0.0
-          python -m build bindings/python --outdir dist/python
-          twine check --strict dist/python/*
-          pip install --quiet dist/python/*.whl
-          test "$(cd "$RUNNER_TEMP" && python -c 'import vst_audio; print(vst_audio.__version__)')" = 0.0.1
-          unzip -l dist/python/*.whl | grep -q 'licenses/LICENSE'
       - name: NuGet package
         run: |
           set -euo pipefail
           dotnet pack bindings/dotnet/VstAudio/VstAudio.csproj -c Release -o dist/nuget
           unzip -l dist/nuget/VstAudio.0.0.1.nupkg | grep -q 'lib/netstandard2.0/VstAudio.dll'
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: bindings-python
-          path: dist/python/
-          if-no-files-found: error
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: bindings-nuget

@@ -87,6 +87,14 @@ class Gate(unittest.TestCase):
         self.assertIn('name = "vst-audio-gui-example"\nversion = "0.1.0"', lock)
         self.assertIn('name = "vst3"\nversion = "0.1.0"', lock)
 
+    def test_locks_pin_the_workspace_version(self):
+        # A lock the bump does not rewrite breaks every --locked build after it.
+        root = Path(__file__).resolve().parents[1]
+        version = g.workspace_version((root / "Cargo.toml").read_text(encoding="utf-8"))
+        for lock in g.LOCKS:
+            text = (root / lock).read_text(encoding="utf-8")
+            self.assertIn(f'name = "vst-audio-ring"\nversion = "{version}"\n', text, lock)
+
     def test_failed_tag_fetch_exits(self):
         failed = subprocess.CompletedProcess([], 1, "", "network unavailable")
         with mock.patch.object(g, "_run", return_value=failed) as run, \

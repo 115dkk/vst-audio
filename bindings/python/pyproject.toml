@@ -1,23 +1,28 @@
 [build-system]
-requires = ["setuptools>=77"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=1.16,<2"]
+build-backend = "maturin"
 
 [project]
 name = "vst-audio"
-version = "0.0.1"
-description = "Reserved name for the Python bindings of vst-audio, an isolated-process VST2/VST3 plugin host"
+version = "0.1.0"
+description = "Isolated-process VST2/VST3 plugin hosting and offline rendering"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.9"
+dependencies = ["numpy>=1.21"]
 authors = [{ name = "115dkk" }]
 classifiers = [
-    "Development Status :: 1 - Planning",
+    "Development Status :: 3 - Alpha",
     "Topic :: Multimedia :: Sound/Audio",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
 ]
 
 [project.urls]
 Repository = "https://github.com/115dkk/vst-audio"
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.maturin]
+python-source = "python"
+module-name = "vst_audio._native"
+include = [{ path = "vst_audio/_worker/**/*", format = "wheel" }]
