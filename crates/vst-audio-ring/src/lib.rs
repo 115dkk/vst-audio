@@ -1396,6 +1396,18 @@ impl Pipeline {
         };
     }
 
+    fn due_entry(&self, app_block: u64, generation: u64) -> Option<usize> {
+        let wanted = app_block.checked_sub(u64::from(self.depth))?;
+        self.entries.iter().position(|entry| {
+            entry.valid && entry.app_block == wanted && entry.generation == generation
+        })
+    }
+
+    pub(crate) fn due_sequence(&self, app_block: u64, generation: u64) -> Option<u32> {
+        self.due_entry(app_block, generation)
+            .map(|index| self.entries[index].sequence)
+    }
+
     /// Returns the sequence for `app_block - depth` only when that exact block
     /// was published, completed, and belongs to the current generation.
     pub fn output_sequence(
@@ -1404,18 +1416,10 @@ impl Pipeline {
         generation: u64,
         completed: u32,
     ) -> Option<u32> {
-        let wanted = app_block.checked_sub(u64::from(self.depth))?;
-        let found = self.entries.iter_mut().find(|entry| {
-            entry.valid && entry.app_block == wanted && entry.generation == generation
-        })?;
-        if sequence_at_least(completed, found.sequence) {
-            found.valid = false;
-            Some(found.sequence)
-        } else {
-            // Once its output instant passes, a late result must never be used.
-            found.valid = false;
-            None
-        }
+        let index = self.due_entry(app_block, generation)?;
+        let sequence = self.entries[index].sequence;
+        self.entries[index].valid = false;
+        sequence_at_least(completed, sequence).then_some(sequence)
     }
 
     pub fn clear(&mut self) {

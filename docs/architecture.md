@@ -205,6 +205,13 @@ control I/O. `BlockEndpoint` reports `depth * quantum + plugin latency`; the
 adapter reports `(depth + 1) * quantum + plugin latency`. See
 [ADR 0004](adr/0004-block-endpoint.md).
 
+`BlockEndpoint::process_wait` and `process_wait_f64` are separate non-realtime
+calls for lossless offline rendering. They may sleep until the exact due block
+completes, stop on timeout, worker shutdown or recovery, and never run on an
+audio thread. A caller submits `depth` additional blocks, usually silence, to
+receive the pipeline's final `depth` outputs. The existing `process` calls remain
+non-waiting and realtime-safe.
+
 Native pointer/lifetime operations are audited in sys crates. For loading a
 plugin, crash isolation does not make unknown native code memory-safe inside the
 worker. Safe application APIs must not expose in-process loaders.
