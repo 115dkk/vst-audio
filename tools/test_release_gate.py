@@ -48,6 +48,9 @@ class Gate(unittest.TestCase):
         self.assertFalse(g.ships("crates/vst-audio-test-window/src/lib.rs"))
         self.assertFalse(g.ships("docs/roadmap.md"))
         self.assertFalse(g.ships(".github/workflows/ci.yml"))
+        for path in ("bindings/python/Cargo.toml", "bindings/python/Cargo.lock",
+                     "bindings/python/LICENSE", "bindings/python/src/lib.rs"):
+            self.assertFalse(g.ships(path), path)
 
     def test_decide(self):
         self.assertEqual(g.decide("0.1.0", set(), [], []), ("release", "0.1.0"))

@@ -58,6 +58,9 @@ SHIP = (
 SHIP_ALWAYS = ("README.md",)
 NOT_SHIPPED = (
     "*.md",
+    # The language bindings have their own versions and release jobs (ADR 0006);
+    # their Cargo.toml, Cargo.lock and LICENSE match the root file names above.
+    "bindings/*",
     "crates/vst-audio-testplugin/*",
     "crates/vst-audio-test-advanced/*",
     "crates/vst-audio-test-window/*",
