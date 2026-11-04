@@ -1,0 +1,19 @@
+<Project>
+  <!-- The SDK normally flattens native assets. Preserve the package-relative
+       paths for both build and publish, including app bundles and notices. -->
+  <PropertyGroup>
+    <_VstAudioPackageRoot>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)..'))</_VstAudioPackageRoot>
+  </PropertyGroup>
+  <Target Name="VstAudioPreserveNativeLayout" AfterTargets="ResolvePackageAssets">
+    <ItemGroup>
+      <NativeCopyLocalItems Condition="'%(NativeCopyLocalItems.NuGetPackageId)' == 'VstAudio'">
+        <DestinationSubPath>$([MSBuild]::MakeRelative('$(_VstAudioPackageRoot)', '%(NativeCopyLocalItems.Identity)'))</DestinationSubPath>
+        <DestinationSubDirectory>$([MSBuild]::MakeRelative('$(_VstAudioPackageRoot)', '%(NativeCopyLocalItems.RootDir)%(NativeCopyLocalItems.Directory)'))/</DestinationSubDirectory>
+      </NativeCopyLocalItems>
+      <RuntimeTargetsCopyLocalItems Condition="'%(RuntimeTargetsCopyLocalItems.NuGetPackageId)' == 'VstAudio'">
+        <DestinationSubPath>$([MSBuild]::MakeRelative('$(_VstAudioPackageRoot)', '%(RuntimeTargetsCopyLocalItems.Identity)'))</DestinationSubPath>
+        <DestinationSubDirectory>$([MSBuild]::MakeRelative('$(_VstAudioPackageRoot)', '%(RuntimeTargetsCopyLocalItems.RootDir)%(RuntimeTargetsCopyLocalItems.Directory)'))/</DestinationSubDirectory>
+      </RuntimeTargetsCopyLocalItems>
+    </ItemGroup>
+  </Target>
+</Project>

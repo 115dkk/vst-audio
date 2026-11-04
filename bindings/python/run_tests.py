@@ -37,7 +37,7 @@ def main():
         wheels = HERE / "target/test-wheels"
         run(python, "-m", "maturin", "build", "--locked", "--release", "--interpreter", python,
             "--out", wheels)
-        wheel = max(wheels.glob("vst_audio-0.1.0-*.whl"), key=lambda path: path.stat().st_mtime_ns)
+        wheel = max(wheels.glob("vst_audio-*.whl"), key=lambda path: path.stat().st_mtime_ns)
     run(python, "-m", "pip", "install", "--no-deps", wheel.resolve())
     advanced_vst2, advanced_vst3 = advanced_paths()
     env = dict(os.environ, VST_AUDIO_WORKER=str(worker),

@@ -93,27 +93,54 @@ worker archives of all four targets. Pull requests and other branches run
 
 ## Python and .NET packages
 
-The Python bindings (PyPI `vst-audio`, import name `vst_audio`) are implemented
-in `bindings/python` as described in ADR 0006; the .NET bindings (NuGet
-`VstAudio`) are planned, and `bindings/dotnet` holds a 0.0.1 placeholder that
-reserves the name. These packages carry their own versions, independent of the
-crate version, and are outside the release gate's shipped files, so changing
-them never releases the crates. `bindings/python/Cargo.lock` is one of the locks
-the gate rewrites on a crate version bump.
+The Python bindings (PyPI `vst-audio`, import name `vst_audio`) and .NET bindings
+(NuGet `VstAudio` 0.1.0, targeting `net8.0`) are implemented under `bindings/`
+as described in ADR 0006. These packages carry their own versions, independent
+of the crate version, and are outside the release gate's shipped files, so
+changing them never releases the crates. The Python and C ABI binding crates
+have independent Cargo locks that the gate rewrites on a crate version bump.
 
 Each wheel bundles the release worker of its platform under `vst_audio/_worker`
-with its dependency licence notices; `bindings/python/stage_worker.py` stages
-it. There is no sdist on PyPI, since a source build would not contain the
+with the licence notices of the worker's and the extension module's Rust
+dependencies (`dependencies.json`, `dependencies-extension.json`);
+`bindings/python/stage_worker.py` stages them. There is no sdist on PyPI, since a source build would not contain the
 worker. `ci.yml` builds one abi3 wheel per native target (the Linux one with
 `bindings/python/build_manylinux.sh` in the pinned `manylinux_2_28` container,
 which `auditwheel` checks), runs `twine check`, and installs it into a fresh
 venv where `bindings/python/run_tests.py --wheel` runs the pytest suite against
 the native VST2 and VST3 fixtures and the bundled worker. Locally,
 `python bindings/python/run_tests.py` (Python 3.11 or newer) builds and tests a
-wheel in one step. `ci.yml` also packs the NuGet placeholder. On every push to
-`main`, the `pypi` and `nuget` jobs of `release.yml` publish them through
-trusted publishing and skip versions that are already published. A NuGet
-version cannot be deleted, only unlisted.
+wheel in one step. On every push to `main`, the `pypi` and `nuget` jobs of
+`release.yml` publish through trusted publishing and skip versions that are
+already published. A NuGet version cannot be deleted, only unlisted.
+
+The NuGet package contains `lib/net8.0/VstAudio.dll` and its XML API documentation,
+plus the C ABI library, matching worker and the licence notices of both
+(`dependencies.json`, `dependencies-ffi.json`) under
+`runtimes/<rid>/native/` for `win-x64`, `linux-x64`, `osx-arm64` and `osx-x64`.
+The macOS helper remains an intact `VstAudioWorker.app` bundle. Packaged
+`buildTransitive/VstAudio.targets` preserves these paths in build and publish
+outputs instead of allowing the SDK to flatten native subdirectories. On Unix,
+`Host()` adds worker execute bits corresponding to its existing read bits before
+first use; explicit and environment-selected workers are not chmodded.
+
+`python bindings/dotnet/stage_native.py` builds the release C ABI crate and
+stages it with the worker using `bindings/python/stage_worker.py`'s optional
+`--destination`. It honours `CARGO_TARGET_DIR` and `CARGO_BUILD_TARGET`.
+`bindings/dotnet/build_manylinux.sh` stages `linux-x64` inside the same
+`manylinux_2_28` container as Python. In `ci.yml`, the `dotnet-native` jobs
+stage each runtime identifier on its own runner, `dotnet-pack` merges the four
+`runtimes/` trees into one package and checks that every library and worker is
+in it, and the `dotnet-test` jobs install that package on all four targets and
+run the C ABI tests (`bindings/ffi/run_tests.py`) and the C# tests.
+
+`python bindings/dotnet/run_tests.py` builds native fixtures, stages natives,
+packs into `target/dotnet-pack`, then runs xUnit tests against that nupkg with a
+fresh package cache under `target/dotnet-packages`. Pass `--package-dir DIR` to
+test an already packed package instead. Tests exercise VST2/VST3 scanning,
+exact Float32/Float64 rendering, parameters, state, errors, disposal and bundled
+worker lookup; without fixture environment variables, native cases are skipped
+with instructions for running the fixture builder.
 
 Trusted publisher registrations:
 

@@ -1,0 +1,27 @@
+[package]
+name = "vst-audio-ffi-sys"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+publish = false
+license = "MIT"
+
+[lib]
+name = "vst_audio_ffi"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+vst-audio = { path = "../../crates/vst-audio" }
+
+[workspace]
+
+[lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"
+missing_safety_doc = "deny"
+dbg_macro = "deny"

@@ -52,7 +52,9 @@ uses `Configuration::slots` (2, 4, 8 or 16) for the ring capacity and wraps its
 modulo-2^32 sequence numbers continuously. `BlockLane` is the standalone
 ring-crate client; block misses are reported for caller fallback. Non-realtime
 block callers can use `process_wait` for lossless, timeout-bounded offline
-rendering and submit `depth` more blocks to drain the pipeline. The audio
+rendering and submit `depth` more blocks to drain the pipeline. `render` and
+`render_f64` run that loop for a complete planar buffer, add an optional silent
+tail and return audio aligned to the input after removing reported latency. The audio
 endpoint returns processed or explicit fallback output and reports
 `(ceil(max_callback_frames / quantum) + 1) * quantum` plus plugin latency; the
 default remains two quanta plus plugin latency. Recovered workers swap at audio

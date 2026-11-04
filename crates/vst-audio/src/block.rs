@@ -284,6 +284,122 @@ impl BlockEndpoint {
         }
     }
 
+    /// Non-realtime. Renders `frames` frames of planar `input` (`input_channels`
+    /// planes of `frames` samples) followed by `tail` frames of silence, and
+    /// writes `output_channels` planes of `frames + tail` samples to `output`,
+    /// aligned with the input: the pipeline and plugin latency
+    /// ([`Self::latency_frames`]) is removed. Each block waits up to `timeout`
+    /// (see [`Self::process_wait`]).
+    pub fn render(
+        &mut self,
+        input: &[f32],
+        frames: usize,
+        tail: usize,
+        output: &mut [f32],
+        timeout: Duration,
+    ) -> Result<(), RenderError> {
+        self.render_impl(input, frames, tail, output, timeout)
+    }
+
+    /// The f64 counterpart of [`Self::render`]. F64 geometries only.
+    pub fn render_f64(
+        &mut self,
+        input: &[f64],
+        frames: usize,
+        tail: usize,
+        output: &mut [f64],
+        timeout: Duration,
+    ) -> Result<(), RenderError> {
+        self.render_impl(input, frames, tail, output, timeout)
+    }
+
+    fn render_impl<T: RenderSample>(
+        &mut self,
+        input: &[T],
+        frames: usize,
+        tail: usize,
+        output: &mut [T],
+        timeout: Duration,
+    ) -> Result<(), RenderError> {
+        let geometry = self.geometry();
+        let quantum = geometry.max_frames as usize;
+        let input_channels = geometry.input_channels as usize;
+        let output_channels = geometry.output_channels as usize;
+        let length = frames.checked_add(tail).ok_or(RenderError::InvalidBuffer)?;
+        let input_len = input_channels
+            .checked_mul(frames)
+            .ok_or(RenderError::InvalidBuffer)?;
+        let output_len = output_channels
+            .checked_mul(length)
+            .ok_or(RenderError::InvalidBuffer)?;
+        let source_len = input_channels
+            .checked_mul(quantum)
+            .filter(|len| allocation_fits::<T>(*len))
+            .ok_or(RenderError::InvalidBuffer)?;
+        let target_len = output_channels
+            .checked_mul(quantum)
+            .filter(|len| allocation_fits::<T>(*len))
+            .ok_or(RenderError::InvalidBuffer)?;
+        if geometry.sample_format != T::FORMAT
+            || input.len() != input_len
+            || output.len() != output_len
+            || !allocation_fits::<T>(input_len)
+            || !allocation_fits::<T>(output_len)
+        {
+            return Err(RenderError::InvalidBuffer);
+        }
+        if length == 0 {
+            return Ok(());
+        }
+
+        let mut source = vec![T::default(); source_len];
+        let mut target = vec![T::default(); target_len];
+        let mut position = 0usize;
+        let mut latency = self.latency_frames();
+        loop {
+            source.fill(T::default());
+            if position < frames {
+                let count = quantum.min(frames - position);
+                for channel in 0..input_channels {
+                    let input_start = channel * frames + position;
+                    let source_start = channel * quantum;
+                    source[source_start..source_start + count]
+                        .copy_from_slice(&input[input_start..input_start + count]);
+                }
+            }
+
+            let status = T::process_wait(self, &source, &mut target, timeout)?;
+            // Priming has no delivered samples. It still occupies pipeline time;
+            // counting this virtual prefix avoids trimming pipeline latency twice.
+            if position == 0 {
+                latency = self.latency_frames();
+            }
+            let end = length
+                .checked_add(latency)
+                .ok_or(RenderError::InvalidBuffer)?;
+            if status == Rendered::Delivered {
+                let begin = position.max(latency);
+                let stop = position.saturating_add(quantum).min(end);
+                if begin < stop {
+                    let count = stop - begin;
+                    for channel in 0..output_channels {
+                        let target_start = channel * quantum + begin - position;
+                        let output_start = channel * length + begin - latency;
+                        output[output_start..output_start + count]
+                            .copy_from_slice(&target[target_start..target_start + count]);
+                    }
+                }
+            }
+            position = position
+                .checked_add(quantum)
+                .ok_or(RenderError::InvalidBuffer)?;
+            if position >= end {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     /// Slot-level access for events and transport (`AudioEndpoint` uses this).
     pub fn process_slots<W, R>(&mut self, write: W, read: R) -> BlockStatus
     where
@@ -405,5 +521,46 @@ impl BlockEndpoint {
             .applied_generation
             .store(self.active.generation, Ordering::Release);
         true
+    }
+}
+
+fn allocation_fits<T>(len: usize) -> bool {
+    len <= isize::MAX as usize / std::mem::size_of::<T>()
+}
+
+trait RenderSample: Copy + Default {
+    const FORMAT: SampleFormat;
+
+    fn process_wait(
+        blocks: &mut BlockEndpoint,
+        input: &[Self],
+        output: &mut [Self],
+        timeout: Duration,
+    ) -> Result<Rendered, RenderError>;
+}
+
+impl RenderSample for f32 {
+    const FORMAT: SampleFormat = SampleFormat::F32;
+
+    fn process_wait(
+        blocks: &mut BlockEndpoint,
+        input: &[Self],
+        output: &mut [Self],
+        timeout: Duration,
+    ) -> Result<Rendered, RenderError> {
+        blocks.process_wait(input, output, timeout)
+    }
+}
+
+impl RenderSample for f64 {
+    const FORMAT: SampleFormat = SampleFormat::F64;
+
+    fn process_wait(
+        blocks: &mut BlockEndpoint,
+        input: &[Self],
+        output: &mut [Self],
+        timeout: Duration,
+    ) -> Result<Rendered, RenderError> {
+        blocks.process_wait_f64(input, output, timeout)
     }
 }
