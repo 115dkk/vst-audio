@@ -1,5 +1,8 @@
 use crate::{api::Shared, audio::PreparedAudio};
-use std::sync::{Arc, atomic::Ordering};
+use std::{
+    sync::{Arc, atomic::Ordering},
+    time::{Duration, Instant},
+};
 use vst_audio_protocol::{Capabilities, ProcessingSetup};
 use vst_audio_ring::{BlockError, Geometry, SampleFormat, SlotReader, SlotWriter};
 
@@ -20,6 +23,30 @@ impl BlockStatus {
     }
 }
 
+/// The result of one non-realtime block call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Rendered {
+    /// Block `k - depth` was written to the output.
+    Delivered,
+    /// The pipeline is still priming and the output was left untouched.
+    Priming,
+}
+
+/// Why a non-realtime block call could not continue losslessly.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum RenderError {
+    #[error("invalid audio buffer")]
+    InvalidBuffer,
+    #[error("worker is not running")]
+    NotRunning,
+    #[error("worker recovered during render")]
+    Recovered,
+    #[error("render timed out")]
+    TimedOut,
+    #[error("completed block was lost")]
+    Lost,
+}
+
 /// The realtime handle for block-synchronous callers: each call submits one
 /// quantum (block k) and returns block k - depth. Missed blocks are reported,
 /// never concealed. Recovery generations are adopted at the start of a call;
@@ -31,6 +58,7 @@ pub struct BlockEndpoint {
     next: rtrb::Consumer<PreparedAudio>,
     retired: rtrb::Producer<PreparedAudio>,
     depth: u32,
+    render_generation: Option<u64>,
     _not_sync: std::marker::PhantomData<std::cell::Cell<()>>,
 }
 
@@ -49,6 +77,7 @@ impl BlockEndpoint {
             next,
             retired,
             depth,
+            render_generation: None,
             _not_sync: std::marker::PhantomData,
         })
     }
@@ -81,6 +110,7 @@ impl BlockEndpoint {
     pub fn restart(&mut self, depth: u32) -> Result<(), BlockError> {
         self.active.lane.restart(depth)?;
         self.depth = depth;
+        self.render_generation = None;
         Ok(())
     }
 
@@ -158,6 +188,102 @@ impl BlockEndpoint {
         )
     }
 
+    /// Lossless non-realtime f32 processing. This call may sleep while waiting
+    /// for the due block; never call it on an audio thread. The first `depth`
+    /// calls return [`Rendered::Priming`] without changing `output`. Submit
+    /// `depth` more blocks (for example, silent blocks) to obtain the final
+    /// `depth` rendered blocks.
+    pub fn process_wait(
+        &mut self,
+        input: &[f32],
+        output: &mut [f32],
+        timeout: Duration,
+    ) -> Result<Rendered, RenderError> {
+        let started = Instant::now();
+        let geometry = self.active.geometry;
+        if geometry.sample_format != SampleFormat::F32
+            || input.len() != geometry.input_channels as usize * geometry.max_frames as usize
+            || output.len() != geometry.output_channels as usize * geometry.max_frames as usize
+        {
+            return Err(RenderError::InvalidBuffer);
+        }
+        self.wait_for_due(started, timeout)?;
+        let priming = self.active.lane.next_block() < u64::from(self.depth);
+        let status = self.process_ready(
+            |slot| {
+                for (plane, samples) in input.chunks_exact(geometry.max_frames as usize).enumerate()
+                {
+                    let _ = slot.write_plane(plane, samples);
+                }
+                for plane in geometry.input_channels as usize..geometry.planes() {
+                    let _ = slot.clear_plane(plane);
+                }
+            },
+            |slot| {
+                for (plane, samples) in output
+                    .chunks_exact_mut(geometry.max_frames as usize)
+                    .enumerate()
+                {
+                    let _ = slot.read_plane(plane, samples);
+                }
+            },
+        );
+        match (status, priming) {
+            (BlockStatus::Delivered, _) => Ok(Rendered::Delivered),
+            (BlockStatus::Missed, true) => Ok(Rendered::Priming),
+            (BlockStatus::Missed, false) => Err(RenderError::Lost),
+            (BlockStatus::InvalidBuffer, _) => Err(RenderError::InvalidBuffer),
+        }
+    }
+
+    /// Lossless non-realtime f64 processing. This call may sleep while waiting
+    /// for the due block; never call it on an audio thread. The first `depth`
+    /// calls return [`Rendered::Priming`] without changing `output`. Submit
+    /// `depth` more blocks (for example, silent blocks) to obtain the final
+    /// `depth` rendered blocks.
+    pub fn process_wait_f64(
+        &mut self,
+        input: &[f64],
+        output: &mut [f64],
+        timeout: Duration,
+    ) -> Result<Rendered, RenderError> {
+        let started = Instant::now();
+        let geometry = self.active.geometry;
+        if geometry.sample_format != SampleFormat::F64
+            || input.len() != geometry.input_channels as usize * geometry.max_frames as usize
+            || output.len() != geometry.output_channels as usize * geometry.max_frames as usize
+        {
+            return Err(RenderError::InvalidBuffer);
+        }
+        self.wait_for_due(started, timeout)?;
+        let priming = self.active.lane.next_block() < u64::from(self.depth);
+        let status = self.process_ready(
+            |slot| {
+                for (plane, samples) in input.chunks_exact(geometry.max_frames as usize).enumerate()
+                {
+                    let _ = slot.write_plane_f64(plane, samples);
+                }
+                for plane in geometry.input_channels as usize..geometry.planes() {
+                    let _ = slot.clear_plane(plane);
+                }
+            },
+            |slot| {
+                for (plane, samples) in output
+                    .chunks_exact_mut(geometry.max_frames as usize)
+                    .enumerate()
+                {
+                    let _ = slot.read_plane_f64(plane, samples);
+                }
+            },
+        );
+        match (status, priming) {
+            (BlockStatus::Delivered, _) => Ok(Rendered::Delivered),
+            (BlockStatus::Missed, true) => Ok(Rendered::Priming),
+            (BlockStatus::Missed, false) => Err(RenderError::Lost),
+            (BlockStatus::InvalidBuffer, _) => Err(RenderError::InvalidBuffer),
+        }
+    }
+
     /// Slot-level access for events and transport (`AudioEndpoint` uses this).
     pub fn process_slots<W, R>(&mut self, write: W, read: R) -> BlockStatus
     where
@@ -182,6 +308,40 @@ impl BlockEndpoint {
         R: FnOnce(SlotReader<'_>),
     {
         self.process_ready_with_publication(write, read)
+    }
+
+    fn wait_for_due(&mut self, started: Instant, timeout: Duration) -> Result<(), RenderError> {
+        loop {
+            self.check_render_generation()?;
+            if self.active.lane.due_completed() != Some(false) {
+                return Ok(());
+            }
+            if started.elapsed() >= timeout {
+                return Err(RenderError::TimedOut);
+            }
+            std::thread::sleep(Duration::from_micros(100));
+        }
+    }
+
+    fn check_render_generation(&mut self) -> Result<(), RenderError> {
+        if self.adopt() {
+            return Err(RenderError::Recovered);
+        }
+        let generation = self.active.generation;
+        match self.render_generation {
+            Some(expected) if expected != generation => return Err(RenderError::Recovered),
+            None => self.render_generation = Some(generation),
+            Some(_) => {}
+        }
+        if !self.gate_open() {
+            let published = self.shared.generation.load(Ordering::Acquire);
+            return Err(if self.render_generation != Some(published) {
+                RenderError::Recovered
+            } else {
+                RenderError::NotRunning
+            });
+        }
+        Ok(())
     }
 
     fn gate_open(&self) -> bool {

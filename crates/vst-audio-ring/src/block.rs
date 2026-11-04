@@ -131,6 +131,18 @@ impl<M: RegionMemory, S: Signal> BlockLane<M, S> {
         self.block = self.block.wrapping_add(1);
     }
 
+    /// Reports whether the block due on the next [`Self::process`] call has
+    /// completed. Returns `None` during priming or when that block was never
+    /// published. This query does not consume the result, allocate, lock or wait.
+    pub fn due_completed(&self) -> Option<bool> {
+        let view = self.memory.region();
+        let sequence = self.pipeline.due_sequence(self.block, self.generation)?;
+        Some(crate::sequence_at_least(
+            self.publisher.completed(view, self.lane),
+            sequence,
+        ))
+    }
+
     /// Submits block `k`: lends block `k - depth`'s slot to `read` when the
     /// consumer completed exactly that block of this generation in time, then
     /// lets `write` fill block `k`'s slot, publishes it and signals `work`.
@@ -287,6 +299,33 @@ mod tests {
         });
         consumer.complete(0, sequence);
         Some(seen)
+    }
+
+    #[test]
+    fn due_completion_is_non_consuming_and_distinguishes_unpublished_blocks() {
+        let (mut lane, _) = setup(4, 1);
+        assert_eq!(lane.due_completed(), None);
+
+        let mut output = vec![-1.0; 8];
+        let exchange = lane.process_planes(&[1.0; 4], &mut output).unwrap();
+        assert!(exchange.published);
+        assert!(!exchange.delivered);
+        assert_eq!(lane.due_completed(), Some(false));
+        assert_eq!(lane.due_completed(), Some(false));
+
+        consume(&lane);
+        assert_eq!(lane.due_completed(), Some(true));
+        assert_eq!(lane.due_completed(), Some(true));
+        assert!(
+            lane.process_planes(&[2.0; 4], &mut output)
+                .unwrap()
+                .delivered
+        );
+        assert_eq!(output[0], 11.0);
+
+        lane.restart(1).unwrap();
+        lane.skip();
+        assert_eq!(lane.due_completed(), None);
     }
 
     #[test]

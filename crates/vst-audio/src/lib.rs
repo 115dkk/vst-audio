@@ -31,7 +31,7 @@ pub use vst_audio_ring::{
 };
 
 mod block;
-pub use block::{BlockEndpoint, BlockStatus};
+pub use block::{BlockEndpoint, BlockStatus, RenderError, Rendered};
 
 mod audio;
 pub use audio::{AudioEndpoint, AudioStatus, ProcessReport};

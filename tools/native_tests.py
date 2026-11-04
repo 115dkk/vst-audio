@@ -14,6 +14,8 @@ advanced_vst2,advanced_vst3=advanced_paths()
 env = dict(os.environ, VST_AUDIO_WORKER=str(worker),
            VST_AUDIO_ADVANCED_VST2=str(advanced_vst2), VST_AUDIO_ADVANCED_VST3=str(advanced_vst3),
            VST_AUDIO_TEST_VST2=str(fixture), VST_AUDIO_TEST_VST3=str(vst3))
+run("cargo", "test", "--locked", "-p", "vst-audio", "--test", "offline",
+    "--", "--ignored", "--nocapture", "--test-threads=1", env=env)
 run("cargo", "test", "--locked", "-p", "vst-audio", "--test", "native",
     "--", "--ignored", "--test-threads=1", "--skip", "third_party_vst3", env=env)
 run("cargo", "test", "--locked", "-p", "vst-audio", "--test", "processes",
