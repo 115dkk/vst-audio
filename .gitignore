@@ -12,9 +12,6 @@ __pycache__/
 /fuzz/corpus/
 /fuzz/artifacts/
 /fuzz/coverage/
-/bindings/python/LICENSE
-/bindings/python/build/
-/bindings/python/src/*.egg-info/
 /bindings/dotnet/**/bin/
 /bindings/dotnet/**/obj/
 /dist/

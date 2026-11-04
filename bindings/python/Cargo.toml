@@ -1,0 +1,20 @@
+[package]
+name = "vst-audio-python"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+[lib]
+name = "_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+vst-audio = { path = "../../crates/vst-audio" }
+pyo3 = { version = "=0.30.1", features = ["extension-module", "abi3-py39"] }
+numpy = "=0.30.0"
+
+[workspace]
+
+[lints.rust]
+unsafe_code = "forbid"

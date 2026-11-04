@@ -1,0 +1,10 @@
+/target/
+/python/vst_audio/_worker/
+/python/vst_audio/__pycache__/
+/python/vst_audio/*.pyd
+/python/vst_audio/*.so
+/__pycache__/
+/tests/__pycache__/
+/.pytest_cache/
+/dist/
+!/LICENSE

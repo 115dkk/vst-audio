@@ -93,17 +93,27 @@ worker archives of all four targets. Pull requests and other branches run
 
 ## Python and .NET packages
 
-The Python bindings (PyPI `vst-audio`, import name `vst_audio`) and the .NET
-bindings (NuGet `VstAudio`) are planned, not implemented. `bindings/python` and
-`bindings/dotnet` currently hold version 0.0.1 placeholders that reserve the
-names and contain no plugin hosting. These packages carry their own versions,
-independent of the crate version, and are outside the release gate's shipped
-files, so changing them never releases the crates.
+The Python bindings (PyPI `vst-audio`, import name `vst_audio`) are implemented
+in `bindings/python` as described in ADR 0006; the .NET bindings (NuGet
+`VstAudio`) are planned, and `bindings/dotnet` holds a 0.0.1 placeholder that
+reserves the name. These packages carry their own versions, independent of the
+crate version, and are outside the release gate's shipped files, so changing
+them never releases the crates. `bindings/python/Cargo.lock` is one of the locks
+the gate rewrites on a crate version bump.
 
-`ci.yml` builds both (sdist, wheel, `twine check`, an import test, `dotnet
-pack`) and uploads them. On every push to `main`, the `pypi` and `nuget` jobs of
-`release.yml` publish them through trusted publishing and skip versions that
-are already published. A NuGet version cannot be deleted, only unlisted.
+Each wheel bundles the release worker of its platform under `vst_audio/_worker`
+with its dependency licence notices; `bindings/python/stage_worker.py` stages
+it. There is no sdist on PyPI, since a source build would not contain the
+worker. `ci.yml` builds one abi3 wheel per native target (the Linux one with
+`bindings/python/build_manylinux.sh` in the pinned `manylinux_2_28` container,
+which `auditwheel` checks), runs `twine check`, and installs it into a fresh
+venv where `bindings/python/run_tests.py --wheel` runs the pytest suite against
+the native VST2 and VST3 fixtures and the bundled worker. Locally,
+`python bindings/python/run_tests.py` (Python 3.11 or newer) builds and tests a
+wheel in one step. `ci.yml` also packs the NuGet placeholder. On every push to
+`main`, the `pypi` and `nuget` jobs of `release.yml` publish them through
+trusted publishing and skip versions that are already published. A NuGet
+version cannot be deleted, only unlisted.
 
 Trusted publisher registrations:
 
