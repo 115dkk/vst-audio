@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <PackageId>VstAudio</PackageId>
+    <Version>0.0.1</Version>
+    <Authors>115dkk</Authors>
+    <Description>Reserved name for the .NET bindings of vst-audio, an isolated-process VST2/VST3 plugin host. This release contains no plugin hosting.</Description>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/115dkk/vst-audio</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/115dkk/vst-audio</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageTags>audio;plugin;host;vst3</PackageTags>
+    <Deterministic>true</Deterministic>
+    <ContinuousIntegrationBuild Condition="'$(GITHUB_ACTIONS)' == 'true'">true</ContinuousIntegrationBuild>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+</Project>

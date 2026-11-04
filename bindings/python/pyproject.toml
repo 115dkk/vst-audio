@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vst-audio"
+version = "0.0.1"
+description = "Reserved name for the Python bindings of vst-audio, an isolated-process VST2/VST3 plugin host"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.9"
+authors = [{ name = "115dkk" }]
+classifiers = [
+    "Development Status :: 1 - Planning",
+    "Topic :: Multimedia :: Sound/Audio",
+]
+
+[project.urls]
+Repository = "https://github.com/115dkk/vst-audio"
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -90,3 +90,33 @@ crates published through crates.io trusted publishing (no registry token is
 stored in the repository) and the tag and GitHub release created with the
 worker archives of all four targets. Pull requests and other branches run
 `ci.yml` alone and never publish.
+
+## Python and .NET packages
+
+The Python bindings (PyPI `vst-audio`, import name `vst_audio`) and the .NET
+bindings (NuGet `VstAudio`) are planned, not implemented. `bindings/python` and
+`bindings/dotnet` currently hold version 0.0.1 placeholders that reserve the
+names and contain no plugin hosting. These packages carry their own versions,
+independent of the crate version, and are outside the release gate's shipped
+files, so changing them never releases the crates.
+
+`ci.yml` builds both (sdist, wheel, `twine check`, an import test, `dotnet
+pack`) and uploads them. On every push to `main`, the `pypi` and `nuget` jobs of
+`release.yml` publish them through trusted publishing and skip versions that
+are already published. A NuGet version cannot be deleted, only unlisted.
+
+Trusted publisher registrations:
+
+| Registry | Owner | Repository | Workflow | Environment | Other |
+|---|---|---|---|---|---|
+| crates.io | `115dkk` | `vst-audio` | `release.yml` | none | |
+| PyPI | `115dkk` | `vst-audio` | `release.yml` | `pypi` | project `vst-audio` |
+| NuGet | `115dkk` | `vst-audio` | `release.yml` | `nuget` | package glob `VstAudio*` |
+
+The `nuget` job reads the nuget.org profile name from the repository variable
+`NUGET_USER`. GitHub creates a missing environment on first use without
+protection rules; restrict the `pypi` and `nuget` environments to the `main`
+branch in the repository settings.
+
+A conda-forge package is planned after the first functional PyPI release. Its
+recipe goes to `conda-forge/staged-recipes` and builds from the PyPI sdist.
