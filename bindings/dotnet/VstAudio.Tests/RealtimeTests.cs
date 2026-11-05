@@ -104,8 +104,18 @@ public sealed class RealtimeTests
         }
         int delivered = 0, missed = 0;
         long before = GC.GetAllocatedBytesForCurrentThread();
-        for (int index = 0; index < 20_000; index++)
+        // Each cycle is a tight burst that outruns the worker (Missed), then depth + 4
+        // calls 3 ms apart. A block submitted while the ring is full is never
+        // published and stays lost (ADR 0004), so one pause after a burst brings no
+        // delivery back; the spaced calls publish blocks the worker finishes before
+        // they are due, so they deliver. A tight loop alone saw only Missed on a fast
+        // runner.
+        int spaced = blocks.Depth + 4;
+        int cycle = 50 + spaced;
+        for (int index = 0; index < 100 * cycle; index++)
         {
+            if (index % cycle >= 50)
+                Thread.Sleep(3);
             if (blocks.Process(input, target) == BlockStatus.Delivered) delivered++;
             else missed++;
         }
