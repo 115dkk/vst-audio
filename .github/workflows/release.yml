@@ -22,7 +22,10 @@ name: Release
 #            (environment nuget, nuget.org profile in the NUGET_USER variable).
 #            Both run on every push to main and skip versions already
 #            published, because the packages carry their own versions (see
-#            docs/distribution.md) and change without a crate release.
+#            docs/distribution.md) and change without a crate release. A
+#            version a job uploads is tagged python-v<version> or
+#            dotnet-v<version>; the pypi job then uploads the
+#            conda-forge/staged-recipes submission built from that tag.
 #
 # Every job checks out release_sha, the commit the gate decided on (the bump
 # commit when it bumped), so a push that lands meanwhile cannot slip in. The
@@ -199,9 +202,18 @@ jobs:
     timeout-minutes: 15
     environment: pypi
     permissions:
-      contents: read
+      contents: write # the python-v tag
       id-token: write
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ needs.gate.outputs.release_sha }}
+      - name: Version and registry state before the upload
+        id: state
+        run: |
+          set -euo pipefail
+          echo "version=$(python3 tools/binding_release.py version python)" >> "$GITHUB_OUTPUT"
+          echo "published=$(python3 tools/binding_release.py published python)" >> "$GITHUB_OUTPUT"
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: bindings-python-*
@@ -211,6 +223,39 @@ jobs:
         with:
           packages-dir: dist
           skip-existing: true
+      - name: Tag the release commit
+        id: tag
+        env:
+          TAG: python-v${{ steps.state.outputs.version }}
+          PUBLISHED: ${{ steps.state.outputs.published }}
+          RELEASE_SHA: ${{ needs.gate.outputs.release_sha }}
+        # A version this run uploaded gets its tag. A version the registry had
+        # before (published from an older commit) never does, except on a
+        # re-run of this run, whose first attempt may have uploaded it and
+        # failed before tagging. An existing tag is never moved.
+        run: |
+          set -euo pipefail
+          remote=$(git ls-remote --tags origin "refs/tags/$TAG" | cut -f1)
+          if [ -n "$remote" ]; then
+            echo "$TAG already exists at $remote"
+            echo "tagged=$([ "$remote" = "$RELEASE_SHA" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          elif [ "$PUBLISHED" = false ] || [ "$GITHUB_RUN_ATTEMPT" != 1 ]; then
+            git tag "$TAG" "$RELEASE_SHA"
+            git push origin "refs/tags/$TAG"
+            echo "tagged=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "the registry had this version before this run; no tag"
+            echo "tagged=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: conda-forge submission
+        if: steps.tag.outputs.tagged == 'true'
+        run: python3 tools/binding_release.py staged-recipe --out "$RUNNER_TEMP/staged-recipes"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: steps.tag.outputs.tagged == 'true'
+        with:
+          name: conda-staged-recipe
+          path: ${{ runner.temp }}/staged-recipes/
+          if-no-files-found: error
 
   nuget:
     name: Publish to NuGet
@@ -219,9 +264,18 @@ jobs:
     timeout-minutes: 15
     environment: nuget
     permissions:
-      contents: read
+      contents: write # the dotnet-v tag
       id-token: write
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ needs.gate.outputs.release_sha }}
+      - name: Version and registry state before the upload
+        id: state
+        run: |
+          set -euo pipefail
+          echo "version=$(python3 tools/binding_release.py version dotnet)" >> "$GITHUB_OUTPUT"
+          echo "published=$(python3 tools/binding_release.py published dotnet)" >> "$GITHUB_OUTPUT"
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: bindings-nuget
@@ -236,3 +290,27 @@ jobs:
         run: |
           dotnet nuget push "dist/*.nupkg" --api-key "$NUGET_API_KEY" \
             --source https://api.nuget.org/v3/index.json --skip-duplicate
+      - name: Tag the release commit
+        id: tag
+        env:
+          TAG: dotnet-v${{ steps.state.outputs.version }}
+          PUBLISHED: ${{ steps.state.outputs.published }}
+          RELEASE_SHA: ${{ needs.gate.outputs.release_sha }}
+        # A version this run uploaded gets its tag. A version the registry had
+        # before (published from an older commit) never does, except on a
+        # re-run of this run, whose first attempt may have uploaded it and
+        # failed before tagging. An existing tag is never moved.
+        run: |
+          set -euo pipefail
+          remote=$(git ls-remote --tags origin "refs/tags/$TAG" | cut -f1)
+          if [ -n "$remote" ]; then
+            echo "$TAG already exists at $remote"
+            echo "tagged=$([ "$remote" = "$RELEASE_SHA" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          elif [ "$PUBLISHED" = false ] || [ "$GITHUB_RUN_ATTEMPT" != 1 ]; then
+            git tag "$TAG" "$RELEASE_SHA"
+            git push origin "refs/tags/$TAG"
+            echo "tagged=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "the registry had this version before this run; no tag"
+            echo "tagged=false" >> "$GITHUB_OUTPUT"
+          fi

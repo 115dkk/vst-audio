@@ -4,7 +4,7 @@ Windows only (Python 3.11+). Each app loads the native fixtures with the
 package's bundled worker, opens and closes the worker-owned editor and renders
 a test tone while its UI thread keeps running, then writes a JSON summary.
 
-``--package-dir DIR`` uses an existing packed VstAudio 0.1.0, such as the
+``--package-dir DIR`` uses an existing packed VstAudio package, such as the
 multi-platform package CI builds; without it the package is packed from this
 checkout for the current platform first.
 """
@@ -21,7 +21,10 @@ ROOT = HERE.parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT / "bindings/python"))
 sys.path.insert(0, str(ROOT / "bindings/dotnet"))
+from binding_release import dotnet_version
 from fixtures import prepare
+
+VERSION = dotnet_version()
 
 APPS = {"WpfHost": "wpf", "WinUIHost": "winui"}
 TIMEOUT = 120
@@ -51,7 +54,7 @@ def check(summary, toolkit, output):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--package-dir", type=Path, help="directory holding VstAudio.0.1.0.nupkg")
+    parser.add_argument("--package-dir", type=Path, help="directory holding the packed VstAudio package")
     parser.add_argument("--app", action="append", choices=list(APPS), help="run only this app")
     args = parser.parse_args()
     if sys.platform != "win32":
@@ -65,8 +68,8 @@ def main():
         run("dotnet", "pack", ROOT / "bindings/dotnet/VstAudio/VstAudio.csproj",
             "--configuration", "Release", "--output", package_dir)
     package_dir = package_dir.resolve()
-    if not (package_dir / "VstAudio.0.1.0.nupkg").is_file():
-        raise FileNotFoundError(f"VstAudio.0.1.0.nupkg missing in {package_dir}")
+    if not (package_dir / f"VstAudio.{VERSION}.nupkg").is_file():
+        raise FileNotFoundError(f"VstAudio.{VERSION}.nupkg missing in {package_dir}")
 
     env = dict(os.environ)
     env.pop("VST_AUDIO_WORKER", None)
@@ -82,8 +85,8 @@ def main():
         run("dotnet", "build", HERE / app / f"{app}.csproj", "--configuration", "Release",
             f"-p:VstAudioPackageDir={package_dir}", f"-p:RestorePackagesPath={packages}",
             "--output", output)
-        # VstAudio 0.1.0 is on nuget.org too; make sure restore took the package under test.
-        metadata = json.loads((packages / "vstaudio/0.1.0/.nupkg.metadata").read_text(encoding="utf-8"))
+        # Earlier VstAudio versions are on nuget.org; make sure restore took the package under test.
+        metadata = json.loads((packages / f"vstaudio/{VERSION.lower()}/.nupkg.metadata").read_text(encoding="utf-8"))
         if Path(metadata["source"]).resolve() != package_dir:
             raise SystemExit(f"{app} restored VstAudio from {metadata['source']}, not {package_dir}")
         for name, plugin in (("vst2", vst2), ("vst3", vst3)):

@@ -1,6 +1,6 @@
 context:
   # Keep this in sync with bindings/python/pyproject.toml.
-  version: "0.1.1"
+  version: "0.1.2"
 
 package:
   name: vst-audio

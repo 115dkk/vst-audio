@@ -7,7 +7,7 @@ The package includes the native C ABI library and matching worker.
 ## Install
 
 ```sh
-dotnet add package VstAudio --version 0.1.0
+dotnet add package VstAudio --version 0.2.0
 ```
 
 ```csharp
@@ -27,12 +27,14 @@ float[][] output = plugin.Process(input, tail: 193);
 
 ## Supported operations
 
-Version 0.1.0 exposes scanning (including sandboxed scanning), class selection,
+Version 0.2.0 exposes scanning (including sandboxed scanning), class selection,
 synchronous loading, offline Float32/Float64 rendering, parameter queries and
 updates, state save/restore, and worker editor open/close. Float64 requires
 native plugin support. Processing accepts jagged channel arrays or flat planar
 spans; input and output spans must not overlap. For instruments with no inputs,
-use the span overload to specify the number of frames.
+use the span overload to specify the number of frames. 0.2.0 adds the experimental
+realtime block path below and moves to the MIT OR Apache-2.0 licence; its native
+library speaks C ABI version 2, so 0.1.0 natives and 0.2.0 managed code do not mix.
 
 Calls block the caller and are serialized per instance; in a GUI, run them with
 `await Task.Run(...)` so the UI thread stays free, as the

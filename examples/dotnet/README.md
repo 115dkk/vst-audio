@@ -46,7 +46,7 @@ dotnet pack bindings/dotnet/VstAudio/VstAudio.csproj -c Release -o target/dotnet
 dotnet build examples/dotnet/WpfHost -c Release
 dotnet build examples/dotnet/WinUIHost -c Release
 
-# A directory holding VstAudio.0.1.0.nupkg, such as the multi-platform package from CI
+# A directory holding the packed VstAudio package, such as the multi-platform one from CI
 dotnet build examples/dotnet/WinUIHost -c Release -p:VstAudioPackageDir=<directory>
 
 # The published package from nuget.org alone
@@ -54,7 +54,7 @@ dotnet build examples/dotnet/WinUIHost -c Release -p:VstAudioPackageDir=
 ```
 
 Each restore extracts packages into a new folder under `target/dotnet-packages/`,
-so a repacked VstAudio 0.1.0 is never replaced by an older copy of the same
+so a repacked VstAudio is never replaced by an older copy of the same
 version from the NuGet cache. Pass `-p:RestorePackagesPath=<directory>` to reuse
 a folder instead; the WinUI restore extracts about 1.2 GB of Windows App SDK
 packages.

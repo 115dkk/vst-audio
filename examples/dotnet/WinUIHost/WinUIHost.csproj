@@ -1,4 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
+  <!-- The version the repository's package is built at; a copy of this example
+       outside the repository can replace $(VstAudioVersion) with a literal. -->
+  <Import Project="../../../bindings/dotnet/Version.props" />
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
     <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
@@ -20,7 +23,7 @@
     <IsPackable>false</IsPackable>
     <Deterministic>true</Deterministic>
     <ContinuousIntegrationBuild Condition="'$(GITHUB_ACTIONS)' == 'true'">true</ContinuousIntegrationBuild>
-    <!-- VstAudio comes from nuget.org or from a locally packed VstAudio.0.1.0.nupkg. -->
+    <!-- VstAudio comes from nuget.org or from a locally packed package. -->
     <VstAudioPackageDir Condition="'$(VstAudioPackageDir)' == ''">$(MSBuildThisFileDirectory)../../../target/dotnet-pack</VstAudioPackageDir>
     <RestoreAdditionalProjectSources>$(VstAudioPackageDir)</RestoreAdditionalProjectSources>
     <RestorePackagesPath Condition="'$(RestorePackagesPath)' == ''">$(MSBuildThisFileDirectory)../../../target/dotnet-packages/$([System.Guid]::NewGuid())</RestorePackagesPath>
@@ -34,6 +37,6 @@
   <ItemGroup>
     <PackageReference Include="Microsoft.WindowsAppSDK" Version="2.6.5" />
     <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.26100.4654" />
-    <PackageReference Include="VstAudio" Version="0.1.0" />
+    <PackageReference Include="VstAudio" Version="$(VstAudioVersion)" />
   </ItemGroup>
 </Project>
