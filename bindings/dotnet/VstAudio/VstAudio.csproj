@@ -1,9 +1,11 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
+  <Import Project="../Version.props" />
+
   <PropertyGroup>
     <TargetFramework>net8.0</TargetFramework>
     <PackageId>VstAudio</PackageId>
-    <Version>0.1.0</Version>
+    <Version>$(VstAudioVersion)</Version>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>

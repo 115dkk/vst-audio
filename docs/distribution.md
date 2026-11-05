@@ -94,7 +94,7 @@ worker archives of all four targets. Pull requests and other branches run
 ## Python and .NET packages
 
 The Python bindings (PyPI `vst-audio`, import name `vst_audio`) and .NET bindings
-(NuGet `VstAudio` 0.1.0, targeting `net8.0`) are implemented under `bindings/`
+(NuGet `VstAudio`, targeting `net8.0`) are implemented under `bindings/`
 as described in ADR 0006. These packages carry their own versions, independent
 of the crate version, and are outside the release gate's shipped files, so
 changing them never releases the crates. The Python and C ABI binding crates
@@ -113,6 +113,16 @@ the native VST2 and VST3 fixtures and the bundled worker. Locally,
 wheel in one step. On every push to `main`, the `pypi` and `nuget` jobs of
 `release.yml` publish through trusted publishing and skip versions that are
 already published. A NuGet version cannot be deleted, only unlisted.
+
+To release a binding, raise its version (`bindings/python/pyproject.toml` and
+the conda recipe's `context.version`, which a tool test keeps equal, or
+`bindings/dotnet/Version.props`, which the package, its tests, the GUI examples
+and the runners read). When the publish job finds the version missing from the
+registry before uploading it, it tags the release commit `python-v<version>` or
+`dotnet-v<version>` after the upload (`tools/binding_release.py`). The `pypi`
+job then hashes that tag's GitHub archive and uploads `conda-staged-recipe`:
+`recipes/vst-audio/` with the recipe pointed at the archive, `build.py` and
+`variants.yaml`, ready for a pull request to `conda-forge/staged-recipes`.
 
 The NuGet package contains `lib/net8.0/VstAudio.dll` and its XML API documentation,
 plus the C ABI library, matching worker and the licence notices of both

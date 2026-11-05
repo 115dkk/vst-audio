@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass, replace
+import faulthandler
 import json
 import math
 from pathlib import Path
@@ -36,6 +37,9 @@ BLOCK_SIZE = 256
 # but still arriving. tools and CI give the process a longer outer timeout.
 SMOKE_DEADLINE = 45.0
 HEARTBEAT_MS = 50
+# After its summary, a smoke run must leave the event loop and exit this fast;
+# otherwise every thread's stack goes to stderr and the process exits with 1.
+EXIT_DEADLINE = 20.0
 MAX_EXTRA_RENDERS = 200
 
 
@@ -296,6 +300,7 @@ class Controller:
             self._watchdog.cancel()
         self._summary["exit"] = code
         print(json.dumps(self._summary), flush=True)
+        faulthandler.dump_traceback_later(EXIT_DEADLINE, exit=True)
         self._view.finish(code)
 
     def _update(self, **changes: Any) -> None:
