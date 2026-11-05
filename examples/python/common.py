@@ -162,7 +162,9 @@ class Controller:
             try:
                 result = work()
             except Exception as error:  # every binding error is reported, never hidden
-                self._post(lambda: self._fail(label, error))
+                # Python unbinds ``error`` when the except block ends, before the
+                # GUI thread runs the callable, so the default argument keeps it.
+                self._post(lambda failure=error: self._fail(label, failure))
             else:
                 self._post(lambda: done(result))
         self._jobs.put(job)
