@@ -331,6 +331,91 @@ jobs:
           path: test-results/
           if-no-files-found: warn
 
+  python-gui:
+    # The Python GUI consumers (examples/python) against the wheel the python
+    # job built, with that wheel's bundled worker: CustomTkinter, PyQt6,
+    # PySide6, wxPython, pywebview and, on Linux only, PyGObject with GTK 4.
+    # On Linux the system Python supplies Tk, PyGObject and wxPython, which
+    # have no usable PyPI wheels there.
+    name: Python GUI consumers (${{ matrix.os }})
+    needs: python
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2025, ubuntu-24.04, macos-15, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.ref }}
+      - shell: bash
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        if: runner.os != 'Linux'
+        with:
+          python-version: "3.13"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: bindings-python-${{ matrix.os }}
+          path: dist/python
+      - name: Linux toolkits
+        if: runner.os == 'Linux'
+        # Tk, GTK 4, WebKitGTK and wxPython for the system Python, the xcb
+        # libraries Qt's platform plugin loads, and the display and session
+        # bus for the GUI step.
+        run: |
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update -qq
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends xvfb xauth dbus-daemon python3-venv python3-tk python3-gi python3-gi-cairo gir1.2-gtk-4.0 gir1.2-gtk-3.0 gir1.2-webkit2-4.1 python3-wxgtk4.0 libxcb-cursor0 libxkbcommon-x11-0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libegl1 libgl1 libglib2.0-bin
+      - name: GUI consumers (Windows, macOS)
+        if: runner.os != 'Linux'
+        shell: bash
+        run: python examples/python/run_tests.py --wheel dist/python/*.whl
+      - name: GUI consumers (Linux)
+        if: runner.os == 'Linux'
+        # The same private session bus as the Rust GUI job (see
+        # tools/gui-session-bus.conf): GTK, wxGTK and WebKitGTK would otherwise
+        # wait for the runner's desktop portal.
+        run: xvfb-run -a -s "-screen 0 1280x800x24" dbus-run-session --config-file=tools/gui-session-bus.conf -- /usr/bin/python3 examples/python/run_tests.py --wheel dist/python/*.whl
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: python-gui-${{ matrix.os }}
+          path: test-results/
+          if-no-files-found: warn
+  dotnet-gui:
+    # The WPF and WinUI 3 consumers (examples/dotnet) against the packed NuGet
+    # package, with its bundled worker. Both toolkits exist only on Windows.
+    name: .NET GUI consumers (windows-2025)
+    needs: dotnet-pack
+    runs-on: windows-2025
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.ref }}
+      - shell: bash
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: bindings-nuget
+          path: dist/nuget
+      - name: WPF and WinUI 3
+        run: python examples/dotnet/run_tests.py --package-dir dist/nuget
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: dotnet-gui
+          path: test-results/
+          if-no-files-found: warn
+
   # A host-architecture test process drives a worker and fixtures built for
   # another architecture: 32-bit plugins on 64-bit Windows (WoW64) and Linux
   # (multilib), x86-64 plugins on Apple Silicon (Rosetta) and on ARM64 Windows

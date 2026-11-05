@@ -17,3 +17,5 @@ __pycache__/
 /bindings/dotnet/VstAudio/runtimes/
 /bindings/dotnet/**/TestResults/
 /dist/
+/examples/dotnet/**/bin/
+/examples/dotnet/**/obj/

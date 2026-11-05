@@ -1,0 +1,9 @@
+# GUI toolkits the consumer examples run under in CI. vst-audio itself comes
+# from the wheel under test. On Linux, Tk, GTK 4 (PyGObject) and wxPython come
+# from the distribution's packages, because wxPython has no Linux wheel on PyPI
+# and PyGObject needs the system's GObject introspection data.
+customtkinter==6.0.0
+PyQt6==6.12.0
+PySide6-Essentials==6.12.0
+wxPython==4.3.2; sys_platform != "linux"
+pywebview==6.2.1

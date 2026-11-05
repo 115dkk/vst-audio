@@ -4,8 +4,9 @@ A GUI-independent Rust library for hosting VST2 and VST3 plugins
 in separate processes on Windows, macOS and Linux.
 
 Required CI executes native Windows x64, Linux x64, macOS ARM64 and macOS Intel
-tests, four unrelated Rust GUI consumers (egui, iced, Slint and Tauri), and
-independently built open-source plugins.
+tests, four unrelated Rust GUI consumers (egui, iced, Slint and Tauri), the
+Python package under six Python GUI toolkits, the .NET package under WPF and
+WinUI 3, and independently built open-source plugins.
 
 The contract is one worker per plugin instance, safe application-side
 Rust APIs, bounded audio IPC and worker-owned native editor windows. Any Rust GUI
@@ -80,6 +81,9 @@ editor without a GUI framework.
 
 The independent [egui, iced, Slint and Tauri consumers](https://github.com/115dkk/vst-audio/tree/main/examples/gui) demonstrate the same
 editor IPC contract. They are built and exercised separately in CI.
+The [Python consumers](https://github.com/115dkk/vst-audio/tree/main/examples/python) (CustomTkinter, PyQt6, PySide6,
+wxPython, PyGObject/GTK 4 and pywebview) and the [.NET consumers](https://github.com/115dkk/vst-audio/tree/main/examples/dotnet)
+(WPF and WinUI 3) do the same through the published bindings.
 
 ## License
 
