@@ -30,6 +30,7 @@ public sealed class Session
     // The test runner gives the process a longer outer timeout.
     public static readonly TimeSpan SmokeDeadline = TimeSpan.FromSeconds(45);
     private static readonly TimeSpan ShutdownTimeout = TimeSpan.FromSeconds(15);
+    private const int MaxExtraRenders = 200;
     private static readonly JsonSerializerOptions SummaryJson = new()
     {
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
@@ -43,6 +44,10 @@ public sealed class Session
     private bool closed; // guarded by gate
     private Task? loading; // guarded by gate
     private int heartbeats;
+    // UI thread only: VstAudio calls started and not yet resumed, and the timer ticks the UI thread
+    // handled while one was in flight. A busy tick shows the UI loop ran during the blocking call.
+    private int inFlight;
+    private int busyHeartbeats;
     private string configuration = "";
 
     /// <param name="toolkit">"wpf" or "winui", written to the smoke summary.</param>
@@ -59,16 +64,16 @@ public sealed class Session
 
     public SessionState State { get; private set; }
 
-    private bool Closed
-    {
-        get { lock (gate) return closed; }
-    }
-
     /// <summary>Raised on the UI thread after every change of <see cref="State"/>.</summary>
     public event Action<SessionState>? Changed;
 
-    /// <summary>Call from a UI timer every <see cref="HeartbeatInterval"/>.</summary>
-    public void Heartbeat() => Interlocked.Increment(ref heartbeats);
+    /// <summary>Call on the UI thread from a UI timer every <see cref="HeartbeatInterval"/>.</summary>
+    public void Heartbeat()
+    {
+        heartbeats++;
+        if (inFlight > 0)
+            busyHeartbeats++;
+    }
 
     /// <summary>Starts the worker and loads the plugin. Call once, after the window exists.</summary>
     /// <returns>False after reporting a failure.</returns>
@@ -83,9 +88,11 @@ public sealed class Session
             loading = work;
         }
         Loaded loaded;
+        inFlight++;
         try { loaded = await work; }
         catch (OperationCanceledException) when (Closed) { return false; }
         catch (Exception error) { Fail("load", error); return false; }
+        finally { inFlight--; }
         summary.Worker = loaded.Worker;
         summary.Inputs = loaded.Inputs;
         summary.Outputs = loaded.Outputs;
@@ -106,6 +113,7 @@ public sealed class Session
             return false;
         try { await Task.Run(() => current.OpenEditor()); }
         catch (Exception error) { Fail("open editor", error); return false; }
+        finally { inFlight--; }
         Update(State with { Status = "Editor open in the worker process", Ready = true });
         return true;
     }
@@ -118,6 +126,7 @@ public sealed class Session
             return false;
         try { await Task.Run(() => current.CloseEditor()); }
         catch (Exception error) { Fail("close editor", error); return false; }
+        finally { inFlight--; }
         Update(State with { Status = "Editor closed", Ready = true });
         return true;
     }
@@ -131,6 +140,7 @@ public sealed class Session
         Rendered rendered;
         try { rendered = await Task.Run(() => Render(current)); }
         catch (Exception error) { Fail("render", error); return false; }
+        finally { inFlight--; }
         summary.Peaks = rendered.Peaks;
         string peaks = string.Join(", ", rendered.Peaks.Select(peak => peak.ToString("F3", CultureInfo.InvariantCulture)));
         string last = string.Create(CultureInfo.InvariantCulture,
@@ -253,10 +263,17 @@ public sealed class Session
     {
         if (!await LoadAsync() || !await OpenEditorAsync() || !await CloseEditorAsync() || !await RenderAsync())
             return false;
-        if (Volatile.Read(ref heartbeats) == 0)
+        // A fast machine can finish every call between two ticks. Render again until a tick lands while a
+        // call is in flight; a blocked UI thread never gets one and runs into the smoke deadline instead.
+        for (int extra = 0; busyHeartbeats == 0; extra++)
         {
-            Fail("smoke", new InvalidOperationException("the UI timer never ran while the plugin was busy"));
-            return false;
+            if (extra == MaxExtraRenders)
+            {
+                Fail("smoke", new InvalidOperationException("the UI timer never ran while the plugin was busy"));
+                return false;
+            }
+            if (!await RenderAsync())
+                return false;
         }
         if (summary.Inputs > 0 && !(summary.Peaks ?? []).Any(peak => peak > 0))
         {
@@ -264,6 +281,11 @@ public sealed class Session
             return false;
         }
         return true;
+    }
+
+    private bool Closed
+    {
+        get { lock (gate) return closed; }
     }
 
     private Plugin? Begin(string status)
@@ -274,6 +296,7 @@ public sealed class Session
         if (!State.Ready || current is null)
             return null;
         Update(State with { Status = status, Ready = false });
+        inFlight++;
         return current;
     }
 
@@ -297,7 +320,8 @@ public sealed class Session
 
     private int WriteSummary(int code)
     {
-        summary.Heartbeats = Volatile.Read(ref heartbeats);
+        summary.Heartbeats = heartbeats;
+        summary.BusyHeartbeats = busyHeartbeats;
         summary.Exit = code;
         if (Options.Summary is { } path)
         {
@@ -337,6 +361,7 @@ public sealed class Session
         public int? Outputs { get; set; }
         public int? Latency { get; set; }
         public int Heartbeats { get; set; }
+        public int BusyHeartbeats { get; set; }
         public double[]? Peaks { get; set; }
         public int Exit { get; set; }
         public string? Error { get; set; }

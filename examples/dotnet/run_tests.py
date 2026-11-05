@@ -39,7 +39,7 @@ def check(summary, toolkit, output):
         summary.get("toolkit") != toolkit and f"toolkit {summary.get('toolkit')!r}",
         (summary.get("inputs"), summary.get("outputs")) != (2, 6)
         and f"fixture reported {summary.get('inputs')} in, {summary.get('outputs')} out",
-        not summary.get("heartbeats") and "the UI timer never ran during the work",
+        not summary.get("busyHeartbeats") and "the UI timer never ran while a call was in flight",
         not (len(summary.get("peaks", [])) == 6 and min(summary["peaks"]) > 0)
         and f"render peaks {summary.get('peaks')}",
         # The package's own worker from the app's output, not one from the build tree.
@@ -82,6 +82,10 @@ def main():
         run("dotnet", "build", HERE / app / f"{app}.csproj", "--configuration", "Release",
             f"-p:VstAudioPackageDir={package_dir}", f"-p:RestorePackagesPath={packages}",
             "--output", output)
+        # VstAudio 0.1.0 is on nuget.org too; make sure restore took the package under test.
+        metadata = json.loads((packages / "vstaudio/0.1.0/.nupkg.metadata").read_text(encoding="utf-8"))
+        if Path(metadata["source"]).resolve() != package_dir:
+            raise SystemExit(f"{app} restored VstAudio from {metadata['source']}, not {package_dir}")
         for name, plugin in (("vst2", vst2), ("vst3", vst3)):
             summary_path = results / f"dotnet-{toolkit}-{name}.json"
             summary_path.unlink(missing_ok=True)
