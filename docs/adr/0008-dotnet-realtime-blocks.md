@@ -23,14 +23,21 @@ collector". That test now exists, and its answer is split.
 `bindings/ffi/tests/no_alloc.rs` runs 2,000 realtime calls, Delivered and
 Missed, under `assert_no_alloc`. `bindings/dotnet/VstAudio.Tests/RealtimeTests.cs`
 runs in the `dotnet-test` CI job on all four targets and prints one JSON line
-per measurement. The first measurements, Linux x64 with .NET 8, three runs:
+per measurement. The first CI run (.NET 8, hosted runners, commit `fc0560f`):
 
-| Test | Result |
-|---|---|
-| 20,000 calls as fast as possible | 0 bytes allocated on the calling thread |
-| Worker hung inside its process call | every call Missed; slowest 0.037 to 0.040 ms |
-| Blocking compacting gen2 GC from another thread, ~200 MB live | audio thread's longest gap 72.8, 78.2, 88.4 ms; longest GC pause 72.6, 78.1, 88.3 ms |
-| `SustainedLowLatency`, short-lived garbage from another thread | longest gap 8.4 to 9.4 ms (baseline without load 1.6 to 5.0 ms); 0 bytes allocated |
+| Target | Allocated (20,000 calls) | Slowest call, hung worker | Longest blocking GC pause → audio gap | `SustainedLowLatency` longest gap |
+|---|---|---|---|---|
+| Linux x64 | 0 B | 0.030 ms | 41.9 → 42.1 ms | 8.4 ms |
+| Windows x64 | 0 B | 0.017 ms | 41.1 → 41.2 ms | 59.0 ms |
+| macOS arm64 | 0 B | 0.078 ms | 81.2 → 81.8 ms | 7.8 ms |
+| macOS x86_64 | 0 B | 0.127 ms | 158.9 → 159.0 ms | 43.2 ms |
+
+The blocking collections are forced, compacting gen2 collections of about
+200 MB of live objects on another thread; the `SustainedLowLatency` column has
+only short-lived garbage on another thread and no forced collection. Every
+hung-worker call returned Missed. Hosted runners are noisy (the macOS x86_64
+baseline loop alone saw a 107 ms gap), so the numbers are evidence of the
+mechanism, not latency figures.
 
 ## Decision
 
