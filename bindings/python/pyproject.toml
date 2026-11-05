@@ -7,8 +7,8 @@ name = "vst-audio"
 version = "0.1.1"
 description = "Isolated-process VST2/VST3 plugin hosting and offline rendering"
 readme = "README.md"
-license = "MIT"
-license-files = ["LICENSE"]
+license = "MIT OR Apache-2.0"
+license-files = ["LICENSE-MIT", "LICENSE-APACHE"]
 requires-python = ">=3.9"
 dependencies = ["numpy>=1.21"]
 authors = [{ name = "115dkk" }]

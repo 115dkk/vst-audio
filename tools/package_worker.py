@@ -42,7 +42,7 @@ def dependency_notices(destination,target,manifest=None,root="vst-audio-worker")
             files.append(source/package["license_file"])
         if not files and package["source"] is None:
             # A path package of this repository (a binding crate) without its own copy.
-            files.append(ROOT/"LICENSE")
+            files += [ROOT/"LICENSE-MIT",ROOT/"LICENSE-APACHE"]
         folder=destination/f"{package['name']}-{package['version']}"
         folder.mkdir(parents=True)
         for path in set(files): shutil.copyfile(path,folder/path.name)
@@ -92,7 +92,7 @@ def main():
             worker=bundle/binary.name
         shutil.copyfile(binary,worker)
         if sys.platform!="win32": worker.chmod(0o755)
-        for document in ["LICENSE","NOTICE"]: shutil.copyfile(ROOT/document,bundle/document)
+        for document in ["LICENSE-MIT","LICENSE-APACHE","NOTICE"]: shutil.copyfile(ROOT/document,bundle/document)
         # Preserve the clean-room ABI's complete binary redistribution notice.
         license_lines=(ROOT/"crates/vst-audio-worker-sys/src/vst2.rs").read_text().split("\n\n#!",1)[0]
         (bundle/"LICENSE-BSD-3-Clause-VST2.txt").write_text("\n".join(line.removeprefix("// ") for line in license_lines.splitlines()))

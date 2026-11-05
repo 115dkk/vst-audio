@@ -69,5 +69,8 @@ changes permissions on explicit paths or paths from the environment variable.
 The application must have permission to update the bundled file mode on first
 use (or the distributor must set its execute permissions before deployment).
 
+Licensed under MIT OR Apache-2.0, at your option. The bundled worker's
+notices, including its BSD-3-Clause and ISC parts, ship with the package.
+
 VST is a registered trademark of Steinberg Media Technologies GmbH.
 This project is independent of Steinberg and is not endorsed by it.

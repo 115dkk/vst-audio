@@ -81,5 +81,16 @@ editor without a GUI framework.
 The independent [egui, iced, Slint and Tauri consumers](https://github.com/115dkk/vst-audio/tree/main/examples/gui) demonstrate the same
 editor IPC contract. They are built and exercised separately in CI.
 
+## License
+
+Licensed under either of the [Apache License, Version 2.0](https://github.com/115dkk/vst-audio/blob/main/LICENSE-APACHE)
+or the [MIT license](https://github.com/115dkk/vst-audio/blob/main/LICENSE-MIT), at your option. Parts with
+their own licenses (the BSD-3-Clause VST2 ABI, the ISC DPF layouts) are listed in
+[NOTICE](https://github.com/115dkk/vst-audio/blob/main/NOTICE). Releases up to 0.11.0 were MIT only.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
+dual licensed as above, without any additional terms or conditions.
+
 VST is a registered trademark of Steinberg Media Technologies GmbH.
 This project is independent of Steinberg and is not endorsed by it.

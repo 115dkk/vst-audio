@@ -39,7 +39,7 @@ try:
     shutil.copyfile(ROOT / "rust-toolchain.toml", scratch / "rust-toolchain.toml")
     source = scratch / "source"
     source.mkdir()
-    for name in ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "README.md", "LICENSE", "NOTICE"]:
+    for name in ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "README.md", "LICENSE-MIT", "LICENSE-APACHE", "NOTICE"]:
         shutil.copyfile(ROOT / name, source / name)
     for directory in ["crates", "apps"]:
         shutil.copytree(ROOT / directory, source / directory)
@@ -58,8 +58,9 @@ try:
         with tarfile.open(archive, "r:gz") as contents:
             contents.extractall(vendor, filter="data")
         package_root = vendor / f"{name}-{version}"
-        if not (package_root / "LICENSE").is_file():
-            raise RuntimeError(f"{name} package omitted its license")
+        for text in ("LICENSE-MIT", "LICENSE-APACHE"):
+            if not (package_root / text).is_file():
+                raise RuntimeError(f"{name} package omitted {text}")
         patches.append((name, package_root))
         shutil.copyfile(archive, artifact / archive.name)
 

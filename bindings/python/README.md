@@ -114,5 +114,8 @@ advanced fixtures verify f64 synthesis silence and a nonzero f64 VST3 effect.
 Linux and macOS execution, editor interaction, Python 3.9 and multi-page native
 parameter enumeration still need platform or fixture coverage.
 
+Licensed under MIT OR Apache-2.0, at your option. The bundled worker's
+notices, including its BSD-3-Clause and ISC parts, ship with the package.
+
 VST is a registered trademark of Steinberg Media Technologies GmbH.
 This project is independent of Steinberg and is not endorsed by it.
