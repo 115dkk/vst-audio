@@ -35,8 +35,7 @@ class Window:
                       margin_bottom=16, margin_start=16, margin_end=16)
         self._name = Gtk.Label(xalign=0)
         self._status = Gtk.Label(xalign=0, wrap=True)
-        self._details = Gtk.Label(xalign=0, wrap=True, wrap_mode=Pango.WrapMode.WORD_CHAR,
-                                  selectable=True)
+        self._details = Gtk.Label(xalign=0, wrap=True, wrap_mode=Pango.WrapMode.WORD_CHAR)
         for label in (self._name, self._status, self._details):
             box.append(label)
         row = Gtk.Box(spacing=8)

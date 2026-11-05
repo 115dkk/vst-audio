@@ -33,13 +33,12 @@ def main(toolkit: str, QtCore: ModuleType, QtWidgets: ModuleType, Signal: Any) -
             self.controller = common.Controller(toolkit, options, self, self._poster.posted.emit)
             self.widget = QtWidgets.QWidget()
             self.widget.setWindowTitle(f"vst-audio · {toolkit}")
-            self.widget.setMinimumWidth(520)
+            self.widget.resize(520, 200)
             self._name = QtWidgets.QLabel()
             self._status = QtWidgets.QLabel()
+            # No word wrap: the window grows to the layout's minimum size, which
+            # does not follow a wrapped label's height.
             self._details = QtWidgets.QLabel()
-            self._details.setWordWrap(True)
-            self._details.setTextInteractionFlags(
-                QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
             layout = QtWidgets.QVBoxLayout(self.widget)
             layout.setContentsMargins(16, 16, 16, 16)
             layout.setSpacing(12)

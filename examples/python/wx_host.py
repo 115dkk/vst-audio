@@ -20,7 +20,7 @@ class Window:
         self._name = wx.StaticText(panel)
         self._status = wx.StaticText(panel)
         self._details = wx.StaticText(panel)
-        sizer = wx.BoxSizer(wx.VERTICAL)
+        self._sizer = sizer = wx.BoxSizer(wx.VERTICAL)
         for label in (self._name, self._status, self._details):
             sizer.Add(label, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 16)
         row = wx.BoxSizer(wx.HORIZONTAL)
@@ -50,7 +50,12 @@ class Window:
         self._details.SetLabel(state.details)
         for button in self._buttons:
             button.Enable(state.ready)
-        self.frame.Layout()
+        # A frame does not follow its content: grow it when the text needs room.
+        width, height = self.frame.GetClientSize()
+        needed = self._sizer.GetMinSize()
+        if needed.width > width or needed.height > height:
+            self.frame.SetClientSize(max(width, needed.width), max(height, needed.height))
+        self._sizer.Layout()
 
     def finish(self, code: int) -> None:
         self.code = code
