@@ -25,7 +25,7 @@ from this repository. Required CI executes the implementation on Windows x64, Li
 | Stress | Variable callbacks and four repeated crashes per format, with 400 numeric healthy-peer callbacks and latest-checkpoint preservation |
 | Independent plugins | DPF MIDI Through/Latency, Steinberg ADelay and mda DX10; MIDI values/offsets, actual DSP, rejected/accepted layouts and repeatability. On Windows, 3 Band EQ and MVerb output is compared with EQ APO XT's engine in both directions |
 | Extended checks | Coverage-guided control/ring fuzzing plus AddressSanitizer and leak checks on native workers and public fixtures |
-| Delivery | Seven crate archives consumed outside the checkout; optimized worker ZIPs extracted and executed; manifests, checksums and dependency licenses |
+| Delivery | Seven crate archives consumed outside the checkout; optimized worker ZIPs extracted and executed; manifests, checksums and dependency licenses. The conda-forge recipe is built natively on all four targets and its package passes the Python suite against the native fixtures, with a glibc 2.28 floor on Linux |
 | Toolchain | Rust 1.99.0 minimum, tested directly; nightly is used only by the extended test lane |
 
 `RecoveryPolicy::Watch` exposes the low-level 0.5/2/8-second restart schedule to

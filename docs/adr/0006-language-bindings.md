@@ -22,8 +22,9 @@ add no hosting behaviour of their own.
   working.
 - A binding release is tagged `python-v<version>` or `dotnet-v<version>`. The
   crate gate's `v<version>` tags never collide with them. conda-forge builds
-  from the GitHub source archive of a `python-v` tag, because the PyPI sdist
-  holds the extension's dependencies but not the worker application.
+  from the GitHub source archive of a `python-v` tag: PyPI carries wheels
+  only, and a source build needs the worker application, which the binding's
+  crate does not contain (see the distribution guide).
 - Supported targets are those of the crates: Windows x64, Linux x64 and macOS
   arm64 and x86_64. Linux wheels are `manylinux_2_28`, and the extension and
   the worker are built in the same `quay.io/pypa/manylinux_2_28_x86_64`
@@ -62,7 +63,7 @@ neither allocates nor waits for the garbage collector.
 
 ## Python
 
-PyO3 with maturin, `abi3-py39`, one wheel per target plus an sdist. The crate
+PyO3 with maturin, `abi3-py39`, one wheel per target and no sdist. The crate
 root has `#![forbid(unsafe_code)]` like the other safe crates; PyO3 0.30's
 macro output compiles under it, and slow calls release the interpreter with
 `Python::detach`. Buffers cross as NumPy arrays of shape `(channels, frames)`
