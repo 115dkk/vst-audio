@@ -73,6 +73,18 @@ tests:
         assert worker.is_file(), worker
         assert worker.is_relative_to(site_packages), (worker, site_packages)
         subprocess.run([worker, "--help"], check=True)
+
+        # Start the worker for real: it must reach plugin loading and report
+        # the missing file, not die while initialising (exit 101 shows up as
+        # kind "disconnected").
+        import tempfile
+        with tempfile.TemporaryDirectory() as folder:
+            try:
+                vst_audio.Host().load(Path(folder) / "missing.vst3")
+            except vst_audio.StartError as error:
+                assert error.kind in {"start", "io"}, (error.kind, error)
+            else:
+                raise AssertionError("loading a missing plugin succeeded")
   - if: is_abi3
     then:
       script:

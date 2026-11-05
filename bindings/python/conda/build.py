@@ -16,8 +16,33 @@ def run(*command: os.PathLike[str] | str, cwd: Path = ROOT, env: dict[str, str] 
     subprocess.run(list(map(str, command)), cwd=cwd, env=env, check=True)
 
 
+def keep_runtime_frameworks(env: dict[str, str]) -> None:
+    """Drop -dead_strip_dylibs from conda-forge's macOS link flags.
+
+    The worker reaches AppKit only through the Objective-C runtime (objc2 looks
+    NSApplication up by name), so the linker sees no AppKit symbol and that
+    flag removes the framework: the worker then panics at start with "class
+    NSApplication could not be found".
+    """
+    for name, value in list(env.items()):
+        if "dead_strip_dylibs" not in value:
+            continue
+        separator = "\x1f" if name == "CARGO_ENCODED_RUSTFLAGS" else " "
+        kept: list[str] = []
+        for token in value.split(separator):
+            if "dead_strip_dylibs" in token:
+                if kept and kept[-1] == "-C":
+                    kept.pop()  # "-C link-arg=-Wl,-dead_strip_dylibs"
+                continue
+            kept.append(token)
+        env[name] = separator.join(kept)
+        print(f"build.py: removed -dead_strip_dylibs from {name}", flush=True)
+
+
 def main() -> None:
     env = dict(os.environ)
+    if sys.platform == "darwin":
+        keep_runtime_frameworks(env)
     # Keep all Cargo products in rattler-build's disposable work tree rather
     # than a checkout-adjacent or shared Cargo target directory.
     env["CARGO_TARGET_DIR"] = str(ROOT / "target" / "conda")
