@@ -32,6 +32,13 @@ without a network or a build step. It calls Python for the three actions and
 for its heartbeat, so a passing run also shows that the page script and the
 JavaScript bridge work.
 
+pywebview runs each call from the page on its own non-daemon thread and hands
+the result back with `evaluate_js`. On macOS that call waits without a timeout
+for the main loop, so a call in flight when the window closes would keep the
+process alive; `webview_host.py` exits without such threads after its own
+cleanup and says so on stderr. Every smoke run must exit within 20 s of its
+summary; otherwise it dumps every thread's stack and fails.
+
 ## Installing the toolkits
 
 `requirements.txt` pins the versions that are tested. Install them next to the

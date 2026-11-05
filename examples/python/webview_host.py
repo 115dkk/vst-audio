@@ -1,6 +1,7 @@
 """pywebview consumer: the vst-audio binding behind an HTML page and its JS bridge."""
 import dataclasses
 import json
+import os
 from pathlib import Path
 import queue
 import sys
@@ -84,6 +85,8 @@ class Window:
         webview.start()  # the backend comes from PYWEBVIEW_GUI or the platform default
         self.controller.shutdown()
         self._posted.put(None)
+        self._dispatcher.join(5)
+        _leave_stranded_bridge_calls(self.code)
         return self.code
 
     def _on_loaded(self) -> None:
@@ -100,6 +103,27 @@ class Window:
                 function()
             except Exception:  # report like a GUI toolkit does, and keep serving
                 traceback.print_exc()
+
+
+def _leave_stranded_bridge_calls(code: int) -> None:
+    """Exit without the JS bridge threads a closed page can strand.
+
+    pywebview runs each call from the page on a new non-daemon thread, which
+    hands the result back with ``evaluate_js``. On Cocoa that call waits,
+    without a timeout, for the main loop to run the script; once the window is
+    gone it never does, and Python's exit would wait for the thread forever. A
+    heartbeat in flight when the window closes is enough.
+    """
+    stranded = [thread for thread in threading.enumerate()
+                if thread is not threading.main_thread() and not thread.daemon]
+    for thread in stranded:
+        thread.join(1)
+    stranded = [thread for thread in stranded if thread.is_alive()]
+    if stranded:
+        print(f"{TOOLKIT}: leaving {len(stranded)} pywebview bridge thread(s) that wait "
+              "for the closed page", file=sys.stderr, flush=True)
+        sys.stdout.flush()
+        os._exit(code)
 
 
 def _wake_cocoa_loop() -> None:
