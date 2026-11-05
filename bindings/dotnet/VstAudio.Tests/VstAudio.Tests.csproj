@@ -8,6 +8,7 @@
     <IsTestProject>true</IsTestProject>
     <Deterministic>true</Deterministic>
     <ContinuousIntegrationBuild Condition="'$(GITHUB_ACTIONS)' == 'true'">true</ContinuousIntegrationBuild>
+    <NoWarn>$(NoWarn);VSTA0001</NoWarn>
     <VstAudioPackageDir Condition="'$(VstAudioPackageDir)' == ''">$(MSBuildThisFileDirectory)../../../target/dotnet-pack</VstAudioPackageDir>
     <RestoreAdditionalProjectSources>$(VstAudioPackageDir)</RestoreAdditionalProjectSources>
     <RestorePackagesPath Condition="'$(RestorePackagesPath)' == ''">$(MSBuildThisFileDirectory)../../../target/dotnet-packages/$([System.Guid]::NewGuid())</RestorePackagesPath>

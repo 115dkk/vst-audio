@@ -43,8 +43,20 @@ Rendering fails with an exception on a missed deadline, lost worker or recovery;
 it never substitutes silence for missing results. Dispose is idempotent and can
 run on any thread. A plugin remains usable after its host has been disposed.
 
-This is the control/offline API in ADR 0006, not a realtime callback API.
-Event polling, explicit recovery commands, channel-layout selection and
+## Experimental realtime block path
+
+Set `LoadOptions.Realtime = true`, then call `Plugin.TakeBlockProcessor()` once.
+The returned experimental `BlockProcessor` accepts flat planar spans containing
+exactly `channels * Quantum` samples and returns `Delivered`, `Missed`, or
+`InvalidBuffer` without waiting for a late worker. Taking it disables the plugin's
+offline `Process` methods. This API is marked `VSTA0001` (ADR 0008). The
+package's tests show that a call allocates nothing and never waits for the
+worker, but also that a managed audio thread stops for every blocking garbage
+collection in the process. Keep blocking collections out of the process while
+audio plays, or call the C ABI's `vsta_blocks_process_f32` from a native audio
+thread.
+
+The control/offline API follows ADR 0006. Event polling, explicit recovery commands, channel-layout selection and
 cross-architecture worker registration are not exposed by this .NET release.
 .NET Framework and Unity are not supported.
 

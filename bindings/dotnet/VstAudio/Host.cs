@@ -76,7 +76,8 @@ public sealed class Host : IDisposable
             fixed (byte* classId = options.ClassId.GetValueOrDefault().Span)
             {
                 Native.Check(Native.HostLoad(handle, pointer, (nuint)bytes.Length, (int?)format ?? 0, classId,
-                    (uint)options.SampleRate, (uint)options.BlockSize, (int)options.SampleFormat, timeout, out nint result));
+                    (uint)options.SampleRate, (uint)options.BlockSize, (int)options.SampleFormat, timeout, out nint result,
+                    RealtimeValue(options)));
                 var pluginHandle = new PluginHandle(result);
                 try { return new Plugin(pluginHandle); }
                 catch { pluginHandle.Dispose(); throw; }
@@ -89,6 +90,10 @@ public sealed class Host : IDisposable
     {
         lock (gate) handle.Dispose();
     }
+
+#pragma warning disable VSTA0001 // The load boundary forwards the explicitly selected experimental option to ABI v2.
+    private static byte RealtimeValue(LoadOptions options) => options.Realtime ? (byte)1 : (byte)0;
+#pragma warning restore VSTA0001
 
     private void ThrowIfDisposed() => ObjectDisposedException.ThrowIf(handle.IsClosed, this);
 }

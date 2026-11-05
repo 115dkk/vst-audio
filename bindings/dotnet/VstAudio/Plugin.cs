@@ -7,6 +7,7 @@ public sealed class Plugin : IDisposable
     private readonly object gate = new();
     private readonly PluginHandle handle;
     private readonly Native.InstanceInfo configuration;
+    private bool blocksTaken;
 
     internal Plugin(PluginHandle handle)
     {
@@ -50,6 +51,7 @@ public sealed class Plugin : IDisposable
         lock (gate)
         {
             ThrowIfDisposed();
+            ThrowIfBlocksTaken();
             var info = configuration;
             ValidateFormat(info, SampleFormat.Float32);
             float[] planar = Flatten(input, info, tail, out int frames, out int outputLength);
@@ -69,6 +71,7 @@ public sealed class Plugin : IDisposable
         lock (gate)
         {
             ThrowIfDisposed();
+            ThrowIfBlocksTaken();
             var info = configuration;
             ValidateFormat(info, SampleFormat.Float64);
             double[] planar = Flatten(input, info, tail, out int frames, out int outputLength);
@@ -89,6 +92,7 @@ public sealed class Plugin : IDisposable
         lock (gate)
         {
             ThrowIfDisposed();
+            ThrowIfBlocksTaken();
             ValidateBuffers(input, frames, tail, output, configuration, SampleFormat.Float32);
             uint milliseconds = Native.Milliseconds(timeout);
             fixed (float* source = input)
@@ -108,11 +112,37 @@ public sealed class Plugin : IDisposable
         lock (gate)
         {
             ThrowIfDisposed();
+            ThrowIfBlocksTaken();
             ValidateBuffers(input, frames, tail, output, configuration, SampleFormat.Float64);
             uint milliseconds = Native.Milliseconds(timeout);
             fixed (double* source = input)
             fixed (double* destination = output)
                 Native.Check(Native.ProcessF64(handle, source, (nuint)input.Length, (nuint)frames, (nuint)tail, destination, (nuint)output.Length, milliseconds));
+        }
+    }
+
+    /// <summary>Transfers the only experimental realtime block endpoint from this plugin.</summary>
+    /// <remarks>After this succeeds, all offline <c>Process</c> overloads throw <see cref="InvalidOperationException"/>.</remarks>
+    [System.Diagnostics.CodeAnalysis.Experimental("VSTA0001")]
+    public BlockProcessor TakeBlockProcessor()
+    {
+        lock (gate)
+        {
+            ThrowIfDisposed();
+            if (blocksTaken) throw new InvalidOperationException("The block processor has already been taken.");
+            Native.Check(Native.TakeBlocks(handle, out nint result));
+            var blockHandle = new BlockHandle(result);
+            try
+            {
+                var processor = new BlockProcessor(blockHandle);
+                blocksTaken = true;
+                return processor;
+            }
+            catch
+            {
+                blockHandle.Dispose();
+                throw;
+            }
         }
     }
 
@@ -198,6 +228,11 @@ public sealed class Plugin : IDisposable
     }
 
     private void ThrowIfDisposed() => ObjectDisposedException.ThrowIf(handle.IsClosed, this);
+
+    private void ThrowIfBlocksTaken()
+    {
+        if (blocksTaken) throw new InvalidOperationException("The realtime block processor owns this plugin's audio endpoint.");
+    }
 
     private static void ValidateFormat(Native.InstanceInfo info, SampleFormat format)
     {

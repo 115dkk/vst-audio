@@ -21,7 +21,9 @@ def run(*args, env=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--package-dir", type=Path, help="Test an existing packed VstAudio 0.1.0")
-    package_dir = parser.parse_args().package_dir
+    parser.add_argument("--filter", help="Forward a test filter to dotnet test")
+    arguments = parser.parse_args()
+    package_dir = arguments.package_dir
     worker, vst2, vst3 = prepare()
     if package_dir is None:
         stage_native()
@@ -38,8 +40,11 @@ def main():
                VST_AUDIO_ADVANCED_VST3=str(advanced_vst3.resolve()))
     # A unique packages path forces restore to read this exact repacked 0.1.0.
     packages = ROOT / "target/dotnet-packages" / uuid.uuid4().hex
-    run("dotnet", "test", HERE / "VstAudio.Tests", f"-p:VstAudioPackageDir={package_dir}",
-        f"-p:RestorePackagesPath={packages}", "--logger", "console;verbosity=normal", env=env)
+    command = ["dotnet", "test", HERE / "VstAudio.Tests", f"-p:VstAudioPackageDir={package_dir}",
+               f"-p:RestorePackagesPath={packages}", "--logger", "console;verbosity=normal"]
+    if arguments.filter:
+        command.extend(["--filter", arguments.filter])
+    run(*command, env=env)
     # VstAudio 0.1.0 is on nuget.org too; the tests must have run against the package under test.
     metadata = json.loads((packages / "vstaudio/0.1.0/.nupkg.metadata").read_text(encoding="utf-8"))
     if Path(metadata["source"]).resolve() != package_dir:

@@ -163,6 +163,7 @@ fn exercise_fixture(path_variable: &str, format: i32) {
                 0,
                 TIMEOUT_MS,
                 &mut plugin,
+                0,
             )
         },
         VSTA_OK,
@@ -209,6 +210,102 @@ fn exercise_fixture(path_variable: &str, format: i32) {
     );
     assert_eq!(output, expected(&input));
 
+    let mut blocks = ptr::null_mut();
+    assert_eq!(
+        // SAFETY: The plugin is live and exclusively accessed, and output is writable.
+        unsafe { vsta_plugin_take_blocks(plugin, &mut blocks) },
+        VSTA_OK
+    );
+    assert!(!blocks.is_null());
+    let mut blocks_info = VstaBlocksInfo {
+        input_channels: 0,
+        output_channels: 0,
+        quantum: 0,
+        depth: 0,
+        sample_format: -1,
+        plugin_latency: 0,
+        total_latency: 0,
+    };
+    assert_eq!(
+        // SAFETY: The block handle is live and exclusive, and output is writable.
+        unsafe { vsta_blocks_info(blocks, &mut blocks_info) },
+        VSTA_OK
+    );
+    assert_eq!(
+        (blocks_info.input_channels, blocks_info.output_channels),
+        (2, 6)
+    );
+    assert_eq!((blocks_info.quantum, blocks_info.depth), (128, 1));
+    assert_eq!(blocks_info.sample_format, 0);
+    assert_eq!(blocks_info.plugin_latency, 64);
+    assert_eq!(blocks_info.total_latency, 192);
+    let mut twice = ptr::null_mut();
+    assert_eq!(
+        // SAFETY: The plugin remains live and exclusive, and output is writable.
+        unsafe { vsta_plugin_take_blocks(plugin, &mut twice) },
+        VSTA_FAILED
+    );
+    assert!(twice.is_null());
+    assert_eq!(
+        // SAFETY: Null input with nonzero length is deliberately invalid; other storage is live.
+        unsafe {
+            vsta_blocks_process_f32(blocks, ptr::null(), 2 * 128, output.as_mut_ptr(), 6 * 128)
+        },
+        VSTA_BLOCK_INVALID_BUFFER
+    );
+    let block_input = [0.0f32; 2 * 128];
+    let mut block_output = [0.0f32; 6 * 128];
+    assert_eq!(
+        // SAFETY: Buffers are live and disjoint, but the wrong length is deliberately supplied.
+        unsafe {
+            vsta_blocks_process_f32(
+                blocks,
+                block_input.as_ptr(),
+                block_input.len() - 1,
+                block_output.as_mut_ptr(),
+                block_output.len(),
+            )
+        },
+        VSTA_BLOCK_INVALID_BUFFER
+    );
+    let block_input_f64 = [0.0f64; 2 * 128];
+    let mut block_output_f64 = [0.0f64; 6 * 128];
+    assert_eq!(
+        // SAFETY: Buffers are live and disjoint; the f32 endpoint rejects f64.
+        unsafe {
+            vsta_blocks_process_f64(
+                blocks,
+                block_input_f64.as_ptr(),
+                block_input_f64.len(),
+                block_output_f64.as_mut_ptr(),
+                block_output_f64.len(),
+            )
+        },
+        VSTA_BLOCK_INVALID_BUFFER
+    );
+    let mut after_take = [0.0f32; 6];
+    assert_eq!(
+        // SAFETY: Plugin and buffers are live and disjoint.
+        unsafe {
+            vsta_plugin_process_f32(
+                plugin,
+                block_input.as_ptr(),
+                2,
+                1,
+                0,
+                after_take.as_mut_ptr(),
+                after_take.len(),
+                TIMEOUT_MS,
+            )
+        },
+        VSTA_RENDER
+    );
+    assert_eq!(last_error(true), "realtime_owned");
+    // SAFETY: Processing has ended and this live block handle is freed exactly once.
+    unsafe { vsta_blocks_free(blocks) };
+    // SAFETY: Null free is explicitly a no-op.
+    unsafe { vsta_blocks_free(ptr::null_mut()) };
+
     let input_f64 = [0.0; 2];
     let mut output_f64 = [0.0; 6];
     assert_eq!(
@@ -227,7 +324,7 @@ fn exercise_fixture(path_variable: &str, format: i32) {
         },
         VSTA_RENDER
     );
-    assert_eq!(last_error(true), "invalid_buffer");
+    assert_eq!(last_error(true), "realtime_owned");
 
     let mut parameters = ptr::null_mut();
     assert_eq!(
@@ -325,7 +422,7 @@ fn vst3_abi_round_trip() {
 #[ignore = "native worker and fixture paths required"]
 #[allow(unsafe_code)]
 fn invalid_arguments_start_error_and_short_copy() {
-    assert_eq!(vsta_abi_version(), 1);
+    assert_eq!(vsta_abi_version(), 2);
     assert_eq!(
         // SAFETY: The ABI explicitly accepts null pointers and reports an invalid argument.
         unsafe { vsta_plugin_info(ptr::null(), ptr::null_mut()) },
@@ -358,6 +455,7 @@ fn invalid_arguments_start_error_and_short_copy() {
                 0,
                 TIMEOUT_MS,
                 &mut plugin,
+                0,
             )
         },
         VSTA_START

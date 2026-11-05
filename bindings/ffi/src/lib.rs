@@ -11,7 +11,7 @@ use std::{
     ptr,
     time::Duration,
 };
-use vst_audio::{ClassInfo, Parameter, SampleFormat};
+use vst_audio::{BlockEndpoint, BlockStatus, ClassInfo, Parameter, SampleFormat};
 
 pub const VSTA_OK: i32 = 0;
 pub const VSTA_INVALID_ARGUMENT: i32 = 1;
@@ -20,6 +20,10 @@ pub const VSTA_RENDER: i32 = 3;
 pub const VSTA_REQUEST_TIMEOUT: i32 = 4;
 pub const VSTA_FAILED: i32 = 5;
 pub const VSTA_PANIC: i32 = 6;
+
+pub const VSTA_BLOCK_DELIVERED: i32 = 0;
+pub const VSTA_BLOCK_MISSED: i32 = 1;
+pub const VSTA_BLOCK_INVALID_BUFFER: i32 = 2;
 
 #[derive(Debug)]
 struct LastError {
@@ -39,6 +43,9 @@ pub struct VstaHost(HostHandle);
 
 #[derive(Debug)]
 pub struct VstaPlugin(Plugin);
+
+#[derive(Debug)]
+pub struct VstaBlocks(BlockEndpoint);
 
 #[derive(Debug)]
 pub struct VstaClassList(Vec<ClassInfo>);
@@ -74,6 +81,18 @@ pub struct VstaPluginInfo {
 
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
+pub struct VstaBlocksInfo {
+    pub input_channels: u32,
+    pub output_channels: u32,
+    pub quantum: u32,
+    pub depth: u32,
+    pub sample_format: i32,
+    pub plugin_latency: u32,
+    pub total_latency: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
 pub struct VstaParameter {
     pub id: u32,
     pub name: *const u8,
@@ -103,7 +122,7 @@ fn error_status(error: &Error) -> i32 {
     match error {
         Error::InvalidArgument(_) => VSTA_INVALID_ARGUMENT,
         Error::Start(_) => VSTA_START,
-        Error::Render(_) => VSTA_RENDER,
+        Error::Render(_) | Error::RealtimeOwned => VSTA_RENDER,
         Error::RequestTimeout => VSTA_REQUEST_TIMEOUT,
         Error::Failed(_) => VSTA_FAILED,
     }
@@ -267,7 +286,7 @@ unsafe fn last_error_copy(buffer: *mut u8, capacity: usize, kind: bool) -> usize
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub extern "C" fn vsta_abi_version() -> u32 {
-    match catch_unwind(|| 1) {
+    match catch_unwind(|| 2) {
         Ok(version) => version,
         Err(payload) => report_panic(payload) as u32,
     }
@@ -449,6 +468,7 @@ pub unsafe extern "C" fn vsta_host_load(
     sample_format: i32,
     timeout_ms: u32,
     out: *mut *mut VstaPlugin,
+    realtime: u8,
 ) -> i32 {
     status_call(|| {
         // SAFETY: The function's safety contract covers these pointers.
@@ -467,6 +487,7 @@ pub unsafe extern "C" fn vsta_host_load(
             block_size,
             sample_format,
             duration(timeout_ms),
+            realtime != 0,
         )?;
         *out = Box::into_raw(Box::new(VstaPlugin(plugin)));
         Ok(())
@@ -515,6 +536,200 @@ pub unsafe extern "C" fn vsta_plugin_info(
         };
         Ok(())
     })
+}
+
+/// Transfers the plugin's only block endpoint to a new handle.
+///
+/// # Safety
+/// `plugin` must be live and exclusively accessible, and `out` must be exclusively
+/// writable. The returned handle must be freed exactly once.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vsta_plugin_take_blocks(
+    plugin: *mut VstaPlugin,
+    out: *mut *mut VstaBlocks,
+) -> i32 {
+    status_call(|| {
+        // SAFETY: The function contract grants exclusive access to the plugin.
+        let plugin = unsafe { exclusive(plugin, "plugin")? };
+        // SAFETY: The function contract grants exclusive access to the output slot.
+        let out = unsafe { exclusive(out, "out")? };
+        *out = Box::into_raw(Box::new(VstaBlocks(plugin.0.take_blocks()?)));
+        Ok(())
+    })
+}
+
+/// Reads the current block geometry and latency. `blocks` may be used by only one
+/// thread at a time because the endpoint is not `Sync`.
+///
+/// # Safety
+/// `blocks` must be live and exclusively accessible, and `out` must be exclusively
+/// writable. Neither handle nor output storage may be freed during the call.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vsta_blocks_info(
+    blocks: *mut VstaBlocks,
+    out: *mut VstaBlocksInfo,
+) -> i32 {
+    status_call(|| {
+        // SAFETY: The function contract grants exclusive endpoint access.
+        let blocks = unsafe { exclusive(blocks, "blocks")? };
+        // SAFETY: The function contract grants exclusive output access.
+        let out = unsafe { exclusive(out, "out")? };
+        let geometry = blocks.0.geometry();
+        *out = VstaBlocksInfo {
+            input_channels: geometry.input_channels,
+            output_channels: geometry.output_channels,
+            quantum: geometry.max_frames,
+            depth: blocks.0.depth(),
+            sample_format: sample_format_value(geometry.sample_format),
+            plugin_latency: blocks.0.plugin_latency_frames(),
+            total_latency: blocks.0.latency_frames(),
+        };
+        Ok(())
+    })
+}
+
+fn block_status(status: BlockStatus) -> i32 {
+    match status {
+        BlockStatus::Delivered => VSTA_BLOCK_DELIVERED,
+        BlockStatus::Missed => VSTA_BLOCK_MISSED,
+        BlockStatus::InvalidBuffer => VSTA_BLOCK_INVALID_BUFFER,
+    }
+}
+
+#[allow(unsafe_code)]
+unsafe fn realtime_slices<'a, T>(
+    input: *const T,
+    input_len: usize,
+    output: *mut T,
+    output_len: usize,
+) -> Option<(&'a [T], &'a mut [T])> {
+    let size = std::mem::size_of::<T>();
+    let input_bytes = input_len.checked_mul(size)?;
+    let output_bytes = output_len.checked_mul(size)?;
+    if input_bytes > isize::MAX as usize
+        || output_bytes > isize::MAX as usize
+        || (input_len != 0 && (input.is_null() || !input.is_aligned()))
+        || (output_len != 0 && (output.is_null() || !output.is_aligned()))
+    {
+        return None;
+    }
+    let input_start = input as usize;
+    let input_end = input_start.checked_add(input_bytes)?;
+    let output_start = output as usize;
+    let output_end = output_start.checked_add(output_bytes)?;
+    if input_bytes != 0 && output_bytes != 0 && input_start < output_end && output_start < input_end
+    {
+        return None;
+    }
+    let input_pointer = if input_len == 0 {
+        std::ptr::NonNull::<T>::dangling().as_ptr()
+    } else {
+        input
+    };
+    let output_pointer = if output_len == 0 {
+        std::ptr::NonNull::<T>::dangling().as_ptr()
+    } else {
+        output
+    };
+    // SAFETY: The caller promises initialized readable storage, and the checks above
+    // establish alignment, representable lengths, and disjointness from the output.
+    let input = unsafe { std::slice::from_raw_parts(input_pointer, input_len) };
+    // SAFETY: The caller promises exclusively writable storage, and the checks above
+    // establish alignment, representable lengths, and disjointness from the input.
+    let output = unsafe { std::slice::from_raw_parts_mut(output_pointer, output_len) };
+    Some((input, output))
+}
+
+/// Submits one f32 block without waiting. Normal results do not touch last-error
+/// state. `blocks` may be used by only one thread at a time; free must not race this
+/// call.
+///
+/// # Safety
+/// `blocks` must be a live, exclusively accessible handle. `input` and `output`
+/// must provide their declared readable and writable samples and must not overlap.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vsta_blocks_process_f32(
+    blocks: *mut VstaBlocks,
+    input: *const f32,
+    input_len: usize,
+    output: *mut f32,
+    output_len: usize,
+) -> i32 {
+    match catch_unwind(AssertUnwindSafe(|| {
+        if blocks.is_null() || !blocks.is_aligned() {
+            return VSTA_BLOCK_INVALID_BUFFER;
+        }
+        // SAFETY: The function contract grants exclusive access to this live handle.
+        let blocks = unsafe { &mut *blocks };
+        // SAFETY: The function contract provides the declared disjoint buffers.
+        let Some((input, output)) =
+            (unsafe { realtime_slices(input, input_len, output, output_len) })
+        else {
+            return VSTA_BLOCK_INVALID_BUFFER;
+        };
+        block_status(blocks.0.process(input, output))
+    })) {
+        Ok(status) => status,
+        Err(payload) => report_panic(payload),
+    }
+}
+
+/// Submits one f64 block without waiting. Normal results do not touch last-error
+/// state. `blocks` may be used by only one thread at a time; free must not race this
+/// call.
+///
+/// # Safety
+/// `blocks` must be a live, exclusively accessible handle. `input` and `output`
+/// must provide their declared readable and writable samples and must not overlap.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vsta_blocks_process_f64(
+    blocks: *mut VstaBlocks,
+    input: *const f64,
+    input_len: usize,
+    output: *mut f64,
+    output_len: usize,
+) -> i32 {
+    match catch_unwind(AssertUnwindSafe(|| {
+        if blocks.is_null() || !blocks.is_aligned() {
+            return VSTA_BLOCK_INVALID_BUFFER;
+        }
+        // SAFETY: The function contract grants exclusive access to this live handle.
+        let blocks = unsafe { &mut *blocks };
+        // SAFETY: The function contract provides the declared disjoint buffers.
+        let Some((input, output)) =
+            (unsafe { realtime_slices(input, input_len, output, output_len) })
+        else {
+            return VSTA_BLOCK_INVALID_BUFFER;
+        };
+        block_status(blocks.0.process_f64(input, output))
+    })) {
+        Ok(status) => status,
+        Err(payload) => report_panic(payload),
+    }
+}
+
+/// Frees a block endpoint. A null pointer is a no-op. `blocks` must be used by one
+/// thread at a time, and this call must not race processing.
+///
+/// # Safety
+/// A non-null `blocks` must be a live handle returned by
+/// [`vsta_plugin_take_blocks`] and must not be used again after this call.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vsta_blocks_free(blocks: *mut VstaBlocks) {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        if !blocks.is_null() {
+            // SAFETY: The function contract gives this call sole ownership of the box.
+            unsafe { drop(Box::from_raw(blocks)) };
+        }
+    }));
+    if let Err(payload) = result {
+        report_panic(payload);
+    }
 }
 
 /// # Safety

@@ -59,7 +59,7 @@ package uses it.
 The realtime variable-callback path (`AudioEndpoint`) is not exposed to Python:
 a callback that holds the GIL cannot meet the realtime contract. .NET may expose
 `BlockEndpoint.process` over spans later, once a test shows a callback that
-neither allocates nor waits for the garbage collector.
+neither allocates nor waits for the garbage collector. ADR 0008 records that test and its result.
 
 ## Python
 

@@ -78,7 +78,7 @@ internal static unsafe partial class Native
     [LibraryImport(Library, EntryPoint = "vsta_host_scan")]
     internal static partial int HostScan(HostHandle host, byte* path, nuint length, int format, byte sandboxed, out nint list);
     [LibraryImport(Library, EntryPoint = "vsta_host_load")]
-    internal static partial int HostLoad(HostHandle host, byte* path, nuint length, int format, byte* classId, uint sampleRate, uint blockSize, int sampleFormat, uint timeout, out nint plugin);
+    internal static partial int HostLoad(HostHandle host, byte* path, nuint length, int format, byte* classId, uint sampleRate, uint blockSize, int sampleFormat, uint timeout, out nint plugin, byte realtime);
     [LibraryImport(Library, EntryPoint = "vsta_class_list_free")]
     internal static partial void ClassListFree(nint list);
     [LibraryImport(Library, EntryPoint = "vsta_class_list_len")]
@@ -93,6 +93,16 @@ internal static unsafe partial class Native
     internal static partial int ProcessF32(PluginHandle plugin, float* input, nuint inputLength, nuint frames, nuint tail, float* output, nuint outputLength, uint timeout);
     [LibraryImport(Library, EntryPoint = "vsta_plugin_process_f64")]
     internal static partial int ProcessF64(PluginHandle plugin, double* input, nuint inputLength, nuint frames, nuint tail, double* output, nuint outputLength, uint timeout);
+    [LibraryImport(Library, EntryPoint = "vsta_plugin_take_blocks")]
+    internal static partial int TakeBlocks(PluginHandle plugin, out nint blocks);
+    [LibraryImport(Library, EntryPoint = "vsta_blocks_free")]
+    internal static partial void BlocksFree(nint blocks);
+    [LibraryImport(Library, EntryPoint = "vsta_blocks_info")]
+    internal static partial int BlocksInfo(BlockHandle blocks, out BlockInfo info);
+    [LibraryImport(Library, EntryPoint = "vsta_blocks_process_f32")]
+    internal static partial int BlocksProcessF32(BlockHandle blocks, float* input, nuint inputLength, float* output, nuint outputLength);
+    [LibraryImport(Library, EntryPoint = "vsta_blocks_process_f64")]
+    internal static partial int BlocksProcessF64(BlockHandle blocks, double* input, nuint inputLength, double* output, nuint outputLength);
     [LibraryImport(Library, EntryPoint = "vsta_plugin_parameters")]
     internal static partial int Parameters(PluginHandle plugin, uint timeout, out nint list);
     [LibraryImport(Library, EntryPoint = "vsta_parameter_list_free")]
@@ -139,6 +149,15 @@ internal static unsafe partial class Native
     }
 
     [StructLayout(LayoutKind.Sequential)]
+    internal struct BlockInfo
+    {
+        internal uint InputChannels, OutputChannels, Quantum, Depth;
+        internal int SampleFormat;
+        internal uint PluginLatency;
+        internal nuint TotalLatency;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
     internal struct ParameterInfo
     {
         internal uint Id;
@@ -163,6 +182,12 @@ internal sealed class PluginHandle : SafeHandleZeroOrMinusOneIsInvalid
 {
     internal PluginHandle(nint value) : base(true) => SetHandle(value);
     protected override bool ReleaseHandle() { Native.PluginFree(handle); return true; }
+}
+
+internal sealed class BlockHandle : SafeHandleZeroOrMinusOneIsInvalid
+{
+    internal BlockHandle(nint value) : base(true) => SetHandle(value);
+    protected override bool ReleaseHandle() { Native.BlocksFree(handle); return true; }
 }
 
 internal sealed class ClassListHandle : SafeHandleZeroOrMinusOneIsInvalid
