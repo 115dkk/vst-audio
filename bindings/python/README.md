@@ -64,6 +64,17 @@ The endpoint refreshes this value at block boundaries. Latency is sampled at the
 first block of each render; plugins that change latency during a render are not
 supported for sample-accurate alignment. Use a plugin only on its creating thread.
 
+## GUI applications
+
+Every call blocks until the worker answers, and a plugin belongs to the thread
+that created it. In a GUI, give one background thread the `Host` and the
+`Plugin`, send it requests through a queue, and hand results back with the
+toolkit's own mechanism (`after` polling in tkinter, a queued signal in Qt,
+`wx.CallAfter`, `GLib.idle_add`). Slow calls release the GIL, so the event loop
+keeps running meanwhile. The [GUI examples](https://github.com/115dkk/vst-audio/tree/main/examples/python)
+do this for CustomTkinter, PyQt6, PySide6, wxPython, PyGObject (GTK 4) and
+pywebview; CI runs each one's load, editor and render sequence.
+
 ## Errors
 
 All hosting errors derive from `VstAudioError`:
@@ -111,8 +122,11 @@ that installed wheel. It verifies bundled-worker resolution as well as the
 environment override. The Matrix fixtures verify exact f32 matrix output and
 64-frame latency compensation. Their f64 rejection is intentional; separate
 advanced fixtures verify f64 synthesis silence and a nonzero f64 VST3 effect.
-Linux and macOS execution, editor interaction, Python 3.9 and multi-page native
-parameter enumeration still need platform or fixture coverage.
+Editor open and close run in the GUI examples' CI. Python 3.9 and multi-page
+native parameter enumeration still need platform or fixture coverage.
+
+Licensed under MIT OR Apache-2.0, at your option. The bundled worker's
+notices, including its BSD-3-Clause and ISC parts, ship with the package.
 
 VST is a registered trademark of Steinberg Media Technologies GmbH.
 This project is independent of Steinberg and is not endorsed by it.

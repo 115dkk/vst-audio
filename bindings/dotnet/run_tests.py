@@ -1,5 +1,6 @@
 """Build fixtures and test the packed NuGet package in a fresh cache (Python 3.11+)."""
 import argparse
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -39,6 +40,10 @@ def main():
     packages = ROOT / "target/dotnet-packages" / uuid.uuid4().hex
     run("dotnet", "test", HERE / "VstAudio.Tests", f"-p:VstAudioPackageDir={package_dir}",
         f"-p:RestorePackagesPath={packages}", "--logger", "console;verbosity=normal", env=env)
+    # VstAudio 0.1.0 is on nuget.org too; the tests must have run against the package under test.
+    metadata = json.loads((packages / "vstaudio/0.1.0/.nupkg.metadata").read_text(encoding="utf-8"))
+    if Path(metadata["source"]).resolve() != package_dir:
+        raise SystemExit(f"restored VstAudio from {metadata['source']}, not {package_dir}")
 
 
 if __name__ == "__main__":

@@ -11,7 +11,7 @@
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <Authors>115dkk</Authors>
     <Description>Isolated-process VST2/VST3 plugin hosting and offline audio processing over vst-audio's C ABI.</Description>
-    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageLicenseExpression>MIT OR Apache-2.0</PackageLicenseExpression>
     <PackageProjectUrl>https://github.com/115dkk/vst-audio</PackageProjectUrl>
     <RepositoryUrl>https://github.com/115dkk/vst-audio</RepositoryUrl>
     <RepositoryType>git</RepositoryType>

@@ -1,0 +1,26 @@
+<Window x:Class="WpfHost.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="VstAudio WPF example"
+        Width="640" Height="360" MinWidth="420" MinHeight="260"
+        WindowStartupLocation="CenterScreen">
+    <Grid Margin="16">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <TextBlock x:Name="PluginText" FontSize="16" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
+        <TextBlock x:Name="StatusText" Grid.Row="1" Margin="0,8,0,0" TextWrapping="Wrap" />
+        <TextBox x:Name="DetailsText" Grid.Row="2" Margin="0,8,0,0" IsReadOnly="True" TextWrapping="Wrap"
+                 VerticalScrollBarVisibility="Auto" />
+
+        <StackPanel Grid.Row="3" Margin="0,12,0,0" Orientation="Horizontal">
+            <Button x:Name="OpenEditorButton" Content="Open editor" Padding="12,4" Click="OnOpenEditor" />
+            <Button x:Name="CloseEditorButton" Content="Close editor" Padding="12,4" Margin="8,0,0,0" Click="OnCloseEditor" />
+            <Button x:Name="RenderButton" Content="Render test tone" Padding="12,4" Margin="8,0,0,0" Click="OnRender" />
+        </StackPanel>
+    </Grid>
+</Window>

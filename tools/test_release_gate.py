@@ -49,7 +49,8 @@ class Gate(unittest.TestCase):
         self.assertFalse(g.ships("docs/roadmap.md"))
         self.assertFalse(g.ships(".github/workflows/ci.yml"))
         for path in ("bindings/python/Cargo.toml", "bindings/python/Cargo.lock",
-                     "bindings/python/LICENSE", "bindings/python/src/lib.rs"):
+                     "bindings/python/LICENSE-MIT", "bindings/python/LICENSE-APACHE",
+                     "bindings/python/src/lib.rs"):
             self.assertFalse(g.ships(path), path)
 
     def test_decide(self):

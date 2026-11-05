@@ -3,10 +3,14 @@ vst-audio source provenance
 Initial extraction: https://github.com/115dkk/spatial-audio-softdriver
 Commit: b6d4df9172584f3566cd266b1748ec24671cb224
 Original paths: crates/streamring, crates/plughost-proto, crates/plughost-sys, crates/plughost, crates/plughost-testplugin, apps/ssr-plughost
-Copyright (c) 2026 115dkk. MIT (see LICENSE).
+Copyright (c) 2026 115dkk. Licensed under the MIT license (LICENSE-MIT) or
+the Apache License, Version 2.0 (LICENSE-APACHE), at your option, except
+where a file or a note below names another license. Until 0.11.0 the
+project was MIT only.
 
 The shared audio ring is derived from the author's EqualizerAPO-XT StreamRing
-at 1432f61cc437c99fde8e8e84e10e648fe516d4ce with permission to distribute under MIT.
+at 1432f61cc437c99fde8e8e84e10e648fe516d4ce; its author permits distributing it
+under MIT OR Apache-2.0.
 The VST2 ABI is translated from Xaymar/vst2sdk at
 339d4f31590bf77c0d0d248e09a380ac6285e069, BSD-3-Clause. The complete
 copyright and license notice is preserved in crates/vst-audio-worker-sys/src/vst2.rs.
@@ -25,4 +29,6 @@ MIDI-output value check and the VST2 tail-length query were adapted from
 cyroz1's local patches to this crate in https://github.com/cyroz1/fl-studio-rust
 at 7f06c6011f6ad0d2e32e5b7d9ea5c9504cc067e5 and
 ca0e59b9b7775d8fdac850d6a985cb378bb3f087 (vendor/vst-audio-worker-sys).
-That repository declares MIT; the changes are by cyroz1.
+That repository declares MIT (Cargo.toml, without a separate license file); the
+changes are by cyroz1. MIT permits sublicensing, so the adapted parts are
+offered under this project's terms; this paragraph keeps their attribution.

@@ -21,7 +21,8 @@ macOS development environment from P1.
 
 Test layers: codec/state/ring unit and property tests; native test plugins;
 crash/hang injection at every lifecycle phase; actual floating editor lifecycle;
-four independent GUI consumers; package consumer outside the checkout;
+independent Rust, Python and .NET GUI consumers; package consumer outside the
+checkout;
 sanitizers/fuzz/stress as extended jobs.
 
 Fixtures must be built for the runner architecture. A missing fixture or display
@@ -40,7 +41,9 @@ artifact. Only trusted release jobs receive signing credentials.
   crash/hang containment are implemented and required on all four targets.
 - P4: instruments, MIDI/SysEx, f64, multi-bus/sidechain configuration, variable
   callbacks, transport and sample-offset automation have native semantic tests.
-- P5: egui, iced, Slint and Tauri consume the same public API. Native editor
+- P5: egui, iced, Slint and Tauri consume the same public API; CustomTkinter,
+  PyQt6, PySide6, wxPython, PyGObject/GTK 4 and pywebview consume the Python
+  package, and WPF and WinUI 3 the .NET package. Native editor
   visibility, focus requests, constrained size/scale negotiation and pixel
   capture are tested.
 - P6: recovered endpoints move at audio boundaries; stress verifies repeated

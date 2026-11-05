@@ -34,7 +34,9 @@ native plugin support. Processing accepts jagged channel arrays or flat planar
 spans; input and output spans must not overlap. For instruments with no inputs,
 use the span overload to specify the number of frames.
 
-Calls block the caller and are serialized per instance. Control and per-block
+Calls block the caller and are serialized per instance; in a GUI, run them with
+`await Task.Run(...)` so the UI thread stays free, as the
+[WPF and WinUI 3 examples](https://github.com/115dkk/vst-audio/tree/main/examples/dotnet) do. Control and per-block
 render deadlines default to 10 seconds; loading defaults to 30 seconds. Negative
 timeouts are rejected; values above `uint.MaxValue` milliseconds are clamped.
 Rendering fails with an exception on a missed deadline, lost worker or recovery;
@@ -68,6 +70,9 @@ on a bundled worker, because NuGet does not preserve file modes. It never
 changes permissions on explicit paths or paths from the environment variable.
 The application must have permission to update the bundled file mode on first
 use (or the distributor must set its execute permissions before deployment).
+
+Licensed under MIT OR Apache-2.0, at your option. The bundled worker's
+notices, including its BSD-3-Clause and ISC parts, ship with the package.
 
 VST is a registered trademark of Steinberg Media Technologies GmbH.
 This project is independent of Steinberg and is not endorsed by it.

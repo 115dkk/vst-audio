@@ -87,7 +87,7 @@ def stage(worker=None, destination=None):
         copy_fresh(worker, executable)
         if sys.platform != "win32":
             executable.chmod(0o755)
-    for document in ("LICENSE", "NOTICE", "LICENSE-ISC-DPF"):
+    for document in ("LICENSE-MIT", "LICENSE-APACHE", "NOTICE", "LICENSE-ISC-DPF"):
         shutil.copyfile(ROOT / document, destination / document)
     header = (ROOT / "crates/vst-audio-worker-sys/src/vst2.rs").read_text().split("\n\n#!", 1)[0]
     (destination / "LICENSE-BSD-3-Clause-VST2.txt").write_text(
