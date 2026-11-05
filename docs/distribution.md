@@ -155,7 +155,35 @@ The `nuget` job reads the nuget.org profile name from the repository variable
 protection rules; restrict the `pypi` and `nuget` environments to the `main`
 branch in the repository settings.
 
-A conda-forge package is planned after the first functional PyPI release. Its
-recipe goes to `conda-forge/staged-recipes` and builds from the GitHub source
-archive of a `python-v<version>` tag, since the PyPI sdist does not contain the
-worker application (ADR 0006).
+### conda-forge
+
+The conda-forge recipe lives in `bindings/python/conda` in the rattler-build
+format (`recipe.yaml`, `build.py`), and CI builds it from the checkout. It is
+submitted to `conda-forge/staged-recipes` after a `python-v<version>` release
+whose archive contains it; that copy replaces the `path` source with the tag's
+GitHub archive URL and sha256, since PyPI has no sdist (ADR 0006).
+
+- Build: `build.py` runs `stage_worker.py` with the build environment's Python
+  (3.11 or newer), which builds the locked release worker and stages it with
+  its notices; the host Python then installs the abi3 extension with
+  `maturin --locked`, and `cargo-bundle-licenses` writes the dependency
+  licences of the worker and of the extension into the package's licence files.
+- One package per platform serves every Python from conda-forge's
+  `python_min` (`python-abi3`), and the recipe test runs `abi3audit`.
+- glibc: `variants.yaml` raises the Linux floor to 2.28, the floor of the PyPI
+  wheel. Built against conda-forge's default 2.17 sysroot, the worker does not
+  link: it uses `memfd_create` (glibc 2.27) and `statx` (2.28).
+- Licence: `(MIT OR Apache-2.0) AND BSD-3-Clause AND ISC`, with `LICENSE-MIT`,
+  `LICENSE-APACHE`, `LICENSE-ISC-DPF`, the generated BSD-3-Clause VST2 notice
+  and the two dependency licence files.
+- The recipe's own tests import the package, run `pip check`, start the
+  bundled worker (`--help`) and run `abi3audit`. conda-forge has no display and
+  no fixtures, so numeric and editor checks stay in this repository's CI.
+- conda-forge cross-compiles `osx-arm64` and does not run its tests there. The
+  `conda` job in `ci.yml` therefore builds the recipe natively on all four
+  targets with conda-forge's rattler-build, installs the package into a fresh
+  environment and runs `bindings/python/conda/run_tests.py`: the pytest suite
+  against the native fixtures with the bundled worker, failing on any skipped
+  test, plus the glibc ceiling on Linux and the worker bundle's signature on
+  macOS. `ci-pinning.yaml` stands in for conda-forge's global pinning in that
+  job and is not submitted.

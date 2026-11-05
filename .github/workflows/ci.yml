@@ -371,7 +371,7 @@ jobs:
       - name: GUI consumers (Windows, macOS)
         if: runner.os != 'Linux'
         shell: bash
-        run: python examples/python/run_tests.py --wheel dist/python/*.whl
+        run: python examples/python/run_tests.py --wheel dist/python/*.whl --venv "$RUNNER_TEMP/python-gui-venv"
       - name: GUI consumers (Linux)
         if: runner.os == 'Linux'
         # The same private session bus as the Rust GUI job (see
@@ -379,12 +379,66 @@ jobs:
         # wait for the runner's desktop portal. -noreset: wx.App opens and
         # closes a test connection first; as the server's only client it would
         # reset Xvfb, and GTK's connection right after it would be refused.
-        run: xvfb-run -a -s "-screen 0 1280x800x24 -noreset" dbus-run-session --config-file=tools/gui-session-bus.conf -- /usr/bin/python3 examples/python/run_tests.py --wheel dist/python/*.whl
+        run: xvfb-run -a -s "-screen 0 1280x800x24 -noreset" dbus-run-session --config-file=tools/gui-session-bus.conf -- /usr/bin/python3 examples/python/run_tests.py --wheel dist/python/*.whl --venv "$RUNNER_TEMP/python-gui-venv"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
           name: python-gui-${{ matrix.os }}
           path: test-results/
+          if-no-files-found: warn
+  conda:
+    # The conda-forge recipe in bindings/python/conda, built natively on all
+    # four targets with the rattler-build version conda-forge uses. conda-forge
+    # itself cross-compiles osx-arm64 without running its tests; this job is
+    # the native check. The recipe's own tests run during the build; then the
+    # package goes into a fresh environment, runs the Python suite against the
+    # native fixtures with its bundled worker, and Linux checks the glibc 2.28
+    # floor and macOS the worker bundle's signature.
+    name: conda package (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2025, ubuntu-24.04, macos-15, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.ref }}
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      - uses: mamba-org/setup-micromamba@add3a49764cedee8ee24e82dfde87f5bc2914462 # v2.0.7
+        with:
+          environment-name: build
+          create-args: rattler-build=0.80.0
+          init-shell: bash
+      - name: Build and test the recipe
+        run: >-
+          rattler-build build --log-style plain
+          --recipe bindings/python/conda/recipe.yaml
+          -m bindings/python/conda/ci-pinning.yaml
+          -m bindings/python/conda/variants.yaml
+          --output-dir "$RUNNER_TEMP/conda"
+      - name: Native fixtures against the installed package
+        run: |
+          set -euo pipefail
+          channel="$RUNNER_TEMP/conda"
+          if [ "$RUNNER_OS" = Windows ]; then channel="file:///$(cygpath -m "$channel")"; else channel="file://$channel"; fi
+          micromamba create -y -n package-test -c "$channel" -c conda-forge vst-audio pytest
+          python=$(micromamba run -n package-test python -c "import sys; print(sys.executable)" | tr -d '\r')
+          python3=python3
+          if [ "$RUNNER_OS" = Windows ]; then python3=python; fi
+          "$python3" bindings/python/conda/run_tests.py --python "$python"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: conda-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/conda/*/vst-audio-*.conda
+            target/conda-test-results.xml
           if-no-files-found: warn
   dotnet-gui:
     # The WPF and WinUI 3 consumers (examples/dotnet) against the packed NuGet

@@ -1,0 +1,115 @@
+context:
+  # Keep this in sync with bindings/python/pyproject.toml.
+  version: "0.1.1"
+
+package:
+  name: vst-audio
+  version: ${{ version }}
+
+source:
+  # The staged-recipes copy replaces this with the python-v${{ version }}
+  # GitHub archive URL and its sha256.
+  path: ../../..
+  # Path sources honor .gitignore by default; the explicit exclusions also keep
+  # multi-gigabyte build products out of rattler-build's work directory.
+  use_gitignore: true
+  filter:
+    exclude:
+      - .git/**
+      - target/**
+      - dist/**
+      - bindings/python/target/**
+
+build:
+  number: 0
+  skip: is_abi3 and not is_python_min
+  python:
+    version_independent: ${{ is_abi3 }}
+  script:
+    interpreter: python
+    file: build.py
+
+requirements:
+  build:
+    - if: build_platform != target_platform
+      then:
+        - python
+        - cross-python_${{ target_platform }}
+        - maturin >=1.16,<2
+    - ${{ compiler('c') }}
+    - ${{ stdlib('c') }}
+    - ${{ compiler('rust') }}
+    - cargo-bundle-licenses
+    - python >=3.11
+  host:
+    - if: is_abi3
+      then: python ${{ python_min }}.*
+      else: python
+    - if: is_abi3
+      then: python-abi3
+    - maturin >=1.16,<2
+    - pip
+  run:
+    - python >=${{ python_min }}
+    - numpy >=1.21
+
+tests:
+  - python:
+      imports:
+        - vst_audio
+      pip_check: true
+      python_version: ${{ python_min }}.*
+  - script:
+      interpreter: python
+      content: |
+        import os
+        from pathlib import Path
+        import subprocess
+        import sys
+        import vst_audio
+
+        worker = vst_audio.Host().worker.resolve()
+        site_packages = Path(os.environ["SP_DIR"]).resolve()
+        assert worker.is_file(), worker
+        assert worker.is_relative_to(site_packages), (worker, site_packages)
+        subprocess.run([worker, "--help"], check=True)
+  - if: is_abi3
+    then:
+      script:
+        interpreter: python
+        content: |
+          import os
+          from pathlib import Path
+          import subprocess
+
+          package = Path(os.environ["SP_DIR"]) / "vst_audio"
+          candidates = list(package.glob("_native*.so")) + list(package.glob("_native*.pyd"))
+          assert len(candidates) == 1, candidates
+          subprocess.run([
+              "abi3audit", str(candidates[0]), "-s", "-v",
+              "--assume-minimum-abi3", "${{ python_min }}",
+          ], check=True)
+      requirements:
+        run:
+          - abi3audit
+
+about:
+  homepage: https://github.com/115dkk/vst-audio
+  repository: https://github.com/115dkk/vst-audio
+  license: (MIT OR Apache-2.0) AND BSD-3-Clause AND ISC
+  license_file:
+    - LICENSE-MIT
+    - LICENSE-APACHE
+    - LICENSE-ISC-DPF
+    - bindings/python/python/vst_audio/_worker/LICENSE-BSD-3-Clause-VST2.txt
+    - THIRDPARTY-worker.yml
+    - bindings/python/THIRDPARTY-extension.yml
+  summary: Isolated-process VST2/VST3 hosting and offline rendering for Python
+  description: |
+    vst-audio hosts VST2 and VST3 plugins in isolated native worker processes.
+    The Python package provides scanning, control, and deterministic offline
+    rendering and carries a matching worker executable for the target platform.
+
+extra:
+  recipe-maintainers:
+    - 115dkk

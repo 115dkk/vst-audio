@@ -81,10 +81,12 @@ def main():
                         help="base interpreter for the venv (default: this one)")
     parser.add_argument("--toolkit", action="append", choices=TOOLKITS,
                         help="run only this toolkit (repeatable)")
+    parser.add_argument("--venv", type=Path, default=ROOT / "target/python-gui-test-venv",
+                        help="where to create the test venv (CI keeps it out of the cached target/)")
     args = parser.parse_args()
     _, vst2, vst3 = prepare()
 
-    environment = ROOT / "target/python-gui-test-venv"
+    environment = args.venv.resolve()
     venv = [args.python, "-m", "venv", "--clear"] + (["--system-site-packages"] if LINUX else [])
     run(*venv, environment)
     python = environment / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")

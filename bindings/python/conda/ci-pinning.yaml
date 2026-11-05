@@ -1,0 +1,36 @@
+# Stand-in for conda-forge's global pinning, for this repository's CI only
+# (staged-recipes and the feedstock use the real pinning). The feedstock's own
+# override, the glibc floor, is in variants.yaml next to the recipe.
+# Source: https://raw.githubusercontent.com/conda-forge/conda-forge-pinning-feedstock/main/recipe/conda_build_config.yaml
+python_min:
+  # CFEP-25 minimum on 2026-11-05 (native linux-64, osx-64, osx-arm64, win-64).
+  - "3.11"
+is_abi3:
+  - true
+is_python_min:
+  - true
+
+c_compiler:
+  - if: linux
+    then: gcc
+  - if: osx
+    then: clang
+  - if: win
+    then: vs2022
+c_compiler_version:
+  - if: linux
+    then: "15"
+  - if: osx
+    then: "21"
+c_stdlib:
+  - if: linux
+    then: sysroot
+  - if: osx
+    then: macosx_deployment_target
+  - if: win
+    then: vs
+c_stdlib_version:
+  - if: osx
+    then: "11.0"
+rust_compiler:
+  - rust
