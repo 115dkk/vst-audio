@@ -66,6 +66,8 @@ class Window:
                                             width=600, height=300)
         self.window.events.loaded += self._on_loaded
         self.window.events.closing += self._closed.set
+        if sys.platform == "darwin":
+            self.window.events.closed += _wake_cocoa_loop
 
     def refresh(self, state: common.State) -> None:
         if not self._closed.is_set():
@@ -98,6 +100,27 @@ class Window:
                 function()
             except Exception:  # report like a GUI toolkit does, and keep serving
                 traceback.print_exc()
+
+
+def _wake_cocoa_loop() -> None:
+    """Let ``webview.start()`` return after a window closed by code.
+
+    pywebview's Cocoa backend calls ``NSApp.stop_`` when the last window
+    closes, and AppKit leaves its run loop only after the next event. A user's
+    click supplies one; ``window.destroy()`` may not, and the loop then waits
+    forever. An application-defined event posted after the stop wakes it.
+    """
+    import AppKit
+    from PyObjCTools import AppHelper
+
+    def post() -> None:
+        kind = getattr(AppKit, "NSEventTypeApplicationDefined", None) or AppKit.NSApplicationDefined
+        event = AppKit.NSEvent.otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2_(
+            kind, AppKit.NSMakePoint(0, 0), 0, 0.0, 0, None, 0, 0, 0)
+        AppKit.NSApp.postEvent_atStart_(event, True)
+
+    # Queued on the main thread, so it runs after windowWillClose_ has called stop_.
+    AppHelper.callAfter(post)
 
 
 def main() -> None:

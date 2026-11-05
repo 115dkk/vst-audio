@@ -13,6 +13,9 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 vst-audio = { path = "../../crates/vst-audio" }
 
+[dev-dependencies]
+assert_no_alloc = { version = "1.1.2", default-features = false }
+
 [workspace]
 
 [lints.rust]

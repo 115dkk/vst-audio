@@ -31,6 +31,9 @@ public sealed class LoadOptions
     public SampleFormat SampleFormat { get; init; } = SampleFormat.Float32;
     /// <summary>Startup deadline. Defaults to 30 seconds; negative values are invalid.</summary>
     public TimeSpan Timeout { get; init; } = TimeSpan.FromSeconds(30);
+    /// <summary>Tell the plugin that it runs in realtime and enable taking its experimental block processor.</summary>
+    [System.Diagnostics.CodeAnalysis.Experimental("VSTA0001")]
+    public bool Realtime { get; init; }
 }
 
 /// <summary>A plugin class discovered in an isolated scan worker.</summary>

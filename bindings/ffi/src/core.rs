@@ -1,4 +1,5 @@
 use std::{
+    cell::Cell,
     collections::VecDeque,
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -14,6 +15,7 @@ pub(crate) enum Error {
     InvalidArgument(String),
     Start(StartError),
     Render(RenderError),
+    RealtimeOwned,
     RequestTimeout,
     Failed(String),
 }
@@ -28,6 +30,7 @@ impl Error {
             Self::InvalidArgument(message) | Self::Failed(message) => message.clone(),
             Self::Start(error) => error.to_string(),
             Self::Render(error) => error.to_string(),
+            Self::RealtimeOwned => "the realtime block endpoint has been taken".into(),
             Self::RequestTimeout => "timed out waiting for a control reply".into(),
         }
     }
@@ -37,6 +40,7 @@ impl Error {
             Self::InvalidArgument(_) => "invalid_argument",
             Self::Start(error) => start_error_kind(error.kind()),
             Self::Render(error) => render_error_kind(*error),
+            Self::RealtimeOwned => "realtime_owned",
             Self::RequestTimeout => "request_timeout",
             Self::Failed(_) => "failed",
         }
@@ -145,6 +149,7 @@ impl HostHandle {
         block_size: u32,
         sample_format_value: i32,
         timeout: Duration,
+        realtime: bool,
     ) -> Result<Plugin, Error> {
         let format = plugin_format(&path, format)?;
         let sample_format = sample_format(sample_format_value)?;
@@ -157,7 +162,7 @@ impl HostHandle {
             sample_rate,
             quantum: block_size,
             sample_format,
-            offline: true,
+            offline: !realtime,
             ..Configuration::default()
         };
         let task = self.host.spawn_async(descriptor, configuration, None);
@@ -167,13 +172,19 @@ impl HostHandle {
                 let blocks = instance
                     .take_blocks()
                     .ok_or_else(|| Error::Failed("new instance has no block endpoint".into()))?;
+                let geometry = blocks.geometry();
+                let latency = blocks.plugin_latency_frames();
                 return Ok(Plugin {
                     instance,
-                    blocks,
+                    blocks: Some(blocks),
                     pending: VecDeque::new(),
+                    input_channels: geometry.input_channels,
+                    output_channels: geometry.output_channels,
                     sample_rate,
                     block_size,
                     sample_format,
+                    latency,
+                    _not_sync: std::marker::PhantomData,
                 });
             }
             if started.elapsed() >= timeout {
@@ -201,11 +212,15 @@ pub(crate) struct PluginInfo {
 #[derive(Debug)]
 pub(crate) struct Plugin {
     instance: Instance,
-    blocks: BlockEndpoint,
+    blocks: Option<BlockEndpoint>,
     pending: VecDeque<HostEvent>,
+    input_channels: u32,
+    output_channels: u32,
     sample_rate: u32,
     block_size: u32,
     sample_format: SampleFormat,
+    latency: u32,
+    _not_sync: std::marker::PhantomData<Cell<()>>,
 }
 
 const _: fn() = || {
@@ -215,15 +230,23 @@ const _: fn() = || {
 
 impl Plugin {
     pub(crate) fn info(&self) -> PluginInfo {
-        let geometry = self.blocks.geometry();
         PluginInfo {
-            input_channels: geometry.input_channels,
-            output_channels: geometry.output_channels,
+            input_channels: self.input_channels,
+            output_channels: self.output_channels,
             sample_rate: self.sample_rate,
             block_size: self.block_size,
             sample_format: self.sample_format,
-            latency: self.blocks.plugin_latency_frames(),
+            latency: self
+                .blocks
+                .as_ref()
+                .map_or(self.latency, BlockEndpoint::plugin_latency_frames),
         }
+    }
+
+    pub(crate) fn take_blocks(&mut self) -> Result<BlockEndpoint, Error> {
+        self.blocks
+            .take()
+            .ok_or_else(|| Error::Failed("the block endpoint has already been taken".into()))
     }
 
     pub(crate) fn process_f32(
@@ -235,6 +258,8 @@ impl Plugin {
         timeout: Duration,
     ) -> Result<(), Error> {
         self.blocks
+            .as_mut()
+            .ok_or(Error::RealtimeOwned)?
             .render(input, frames, tail, output, timeout)
             .map_err(Into::into)
     }
@@ -248,6 +273,8 @@ impl Plugin {
         timeout: Duration,
     ) -> Result<(), Error> {
         self.blocks
+            .as_mut()
+            .ok_or(Error::RealtimeOwned)?
             .render_f64(input, frames, tail, output, timeout)
             .map_err(Into::into)
     }
