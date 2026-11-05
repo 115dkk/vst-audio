@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <IsPackable>false</IsPackable>
+    <Deterministic>true</Deterministic>
+    <ContinuousIntegrationBuild Condition="'$(GITHUB_ACTIONS)' == 'true'">true</ContinuousIntegrationBuild>
+    <!-- VstAudio comes from nuget.org or from a locally packed VstAudio.0.1.0.nupkg. -->
+    <VstAudioPackageDir Condition="'$(VstAudioPackageDir)' == ''">$(MSBuildThisFileDirectory)../../../target/dotnet-pack</VstAudioPackageDir>
+    <RestoreAdditionalProjectSources>$(VstAudioPackageDir)</RestoreAdditionalProjectSources>
+    <RestorePackagesPath Condition="'$(RestorePackagesPath)' == ''">$(MSBuildThisFileDirectory)../../../target/dotnet-packages/$([System.Guid]::NewGuid())</RestorePackagesPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="../Shared/*.cs" LinkBase="Shared" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="VstAudio" Version="0.1.0" />
+  </ItemGroup>
+</Project>

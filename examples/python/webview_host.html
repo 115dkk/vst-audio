@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>vst-audio · pywebview</title>
+<style>
+  body { font: 14px system-ui, sans-serif; margin: 16px; }
+  p { margin: 0 0 12px; }
+  #details { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .actions { display: flex; gap: 8px; margin-top: 16px; }
+</style>
+</head>
+<body>
+<p id="plugin"></p>
+<p id="status"></p>
+<p id="details"></p>
+<div class="actions">
+  <button id="open-editor" disabled>Open editor</button>
+  <button id="close-editor" disabled>Close editor</button>
+  <button id="render" disabled>Render test tone</button>
+</div>
+<script>
+  // webview_host.py replaces the placeholder with common.HEARTBEAT_MS.
+  const HEARTBEAT_MS = __HEARTBEAT_MS__;
+  const buttons = document.querySelectorAll("button");
+  let heartbeat = null;
+
+  // Python pushes every State snapshot here through window.evaluate_js.
+  function showState(state) {
+    document.getElementById("plugin").textContent = state.plugin;
+    document.getElementById("status").textContent = state.status;
+    document.getElementById("details").textContent = state.details;
+    for (const button of buttons) button.disabled = !state.ready;
+  }
+
+  // Python calls this before it closes the window, so the page stops calling it.
+  function stopHeartbeat() {
+    clearInterval(heartbeat);
+    for (const button of buttons) button.disabled = true;
+  }
+
+  window.addEventListener("pywebviewready", () => {
+    const api = window.pywebview.api;
+    document.getElementById("open-editor").addEventListener("click", () => api.open_editor());
+    document.getElementById("close-editor").addEventListener("click", () => api.close_editor());
+    document.getElementById("render").addEventListener("click", () => api.render());
+    heartbeat = setInterval(() => api.heartbeat(), HEARTBEAT_MS);
+  });
+</script>
+</body>
+</html>
