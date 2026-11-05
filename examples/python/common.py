@@ -8,8 +8,11 @@ view with two methods; the controller never touches widgets.
 
 ``--smoke`` runs load, open editor, close editor and one render without input,
 then leaves the event loop with exit code 0, or 1 on the first failure. It also
-requires that the GUI timer called :meth:`Controller.heartbeat` while the
-binding was busy, which shows that the event loop kept running.
+requires that the GUI thread handled a :meth:`Controller.heartbeat` tick while a
+binding call was running on the session thread, which shows that the event loop
+kept running during the blocking call. A fast machine can finish every call
+between two ticks, so the smoke renders again until such a tick lands; a
+blocked event loop never gets one and fails at the smoke deadline.
 """
 from __future__ import annotations
 
@@ -33,6 +36,7 @@ BLOCK_SIZE = 256
 # but still arriving. tools and CI give the process a longer outer timeout.
 SMOKE_DEADLINE = 45.0
 HEARTBEAT_MS = 50
+MAX_EXTRA_RENDERS = 200
 
 
 @dataclass(frozen=True)
@@ -99,6 +103,11 @@ class Controller:
         self._plugin: Any = None  # touched on the session thread only
         self._state = State(plugin=options.plugin.name, status="Opening plugin…")
         self._heartbeats = 0
+        # Binding calls running on the session thread, and the ticks the GUI
+        # handled meanwhile. Both are guarded by the lock.
+        self._running = 0
+        self._busy_heartbeats = 0
+        self._extra_renders = 0
         self._summary: dict = {"toolkit": toolkit, "plugin": options.plugin.name}
         self._finished = False
         self._watchdog: Optional[threading.Timer] = None
@@ -125,6 +134,8 @@ class Controller:
         """Call from a GUI timer every :data:`HEARTBEAT_MS` milliseconds."""
         with self._lock:
             self._heartbeats += 1
+            if self._running:
+                self._busy_heartbeats += 1
 
     def open_editor(self) -> None:
         if self._begin("Opening editor…"):
@@ -159,8 +170,14 @@ class Controller:
     def _submit(self, label: str, work: Callable[[], Any],
                 done: Callable[[Any], None]) -> None:
         def job() -> None:
+            with self._lock:
+                self._running += 1
             try:
-                result = work()
+                try:
+                    result = work()
+                finally:
+                    with self._lock:
+                        self._running -= 1
             except Exception as error:  # every binding error is reported, never hidden
                 # Python unbinds ``error`` when the except block ends, before the
                 # GUI thread runs the callable, so the default argument keeps it.
@@ -241,9 +258,13 @@ class Controller:
 
     def _check_smoke(self, result: dict) -> None:
         with self._lock:
-            beats = self._heartbeats
-        self._summary["heartbeats"] = beats
-        if beats == 0:
+            beats, busy = self._heartbeats, self._busy_heartbeats
+        self._summary.update(heartbeats=beats, busy_heartbeats=busy,
+                             extra_renders=self._extra_renders)
+        if busy == 0 and self._extra_renders < MAX_EXTRA_RENDERS:
+            self._extra_renders += 1
+            self.render()
+        elif busy == 0:
             self._fail("smoke", RuntimeError("the GUI timer never ran while the plugin was busy"))
         elif self._summary["inputs"] and not any(peak > 0 and math.isfinite(peak)
                                                  for peak in result["peaks"]):

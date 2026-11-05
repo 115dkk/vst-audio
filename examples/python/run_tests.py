@@ -64,7 +64,7 @@ def check(summary, environment):
         summary.get("exit") != 0 and f"summary exit {summary.get('exit')}: {summary.get('error')}",
         (summary.get("inputs"), summary.get("outputs")) != (2, 6)
         and f"fixture reported {summary.get('inputs')} in, {summary.get('outputs')} out",
-        not summary.get("heartbeats") and "the GUI timer never ran during the work",
+        not summary.get("busy_heartbeats") and "the GUI timer never ran while a call was in flight",
         not (len(summary.get("peaks", [])) == 6 and min(summary["peaks"]) > 0)
         and f"render peaks {summary.get('peaks')}",
         # The point of the package: its own worker, not one from the build tree.

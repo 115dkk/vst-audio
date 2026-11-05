@@ -376,8 +376,10 @@ jobs:
         if: runner.os == 'Linux'
         # The same private session bus as the Rust GUI job (see
         # tools/gui-session-bus.conf): GTK, wxGTK and WebKitGTK would otherwise
-        # wait for the runner's desktop portal.
-        run: xvfb-run -a -s "-screen 0 1280x800x24" dbus-run-session --config-file=tools/gui-session-bus.conf -- /usr/bin/python3 examples/python/run_tests.py --wheel dist/python/*.whl
+        # wait for the runner's desktop portal. -noreset: wx.App opens and
+        # closes a test connection first; as the server's only client it would
+        # reset Xvfb, and GTK's connection right after it would be refused.
+        run: xvfb-run -a -s "-screen 0 1280x800x24 -noreset" dbus-run-session --config-file=tools/gui-session-bus.conf -- /usr/bin/python3 examples/python/run_tests.py --wheel dist/python/*.whl
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:

@@ -8,6 +8,9 @@ import customtkinter as ctk
 import common
 
 TOOLKIT = "CustomTkinter"
+# How often the Tk thread runs callables other threads queued. It is separate
+# from the heartbeat so a reply does not wait for the next heartbeat.
+POLL_MS = 10
 
 
 class Window:
@@ -15,8 +18,8 @@ class Window:
 
     def __init__(self, options: common.Options) -> None:
         self.code = 0
-        # Tk is not thread-safe: other threads only queue callables, and the
-        # heartbeat timer runs them on the Tk thread.
+        # Tk is not thread-safe: other threads only queue callables, and a
+        # short after() poll runs them on the Tk thread.
         self._posted: "queue.SimpleQueue[Callable[[], None]]" = queue.SimpleQueue()
         self.controller = common.Controller(TOOLKIT, options, self, self._posted.put)
 
@@ -38,7 +41,8 @@ class Window:
             button = ctk.CTkButton(row, text=text, command=action, state="disabled")
             button.pack(side="left", padx=(0, 8))
             self._buttons.append(button)
-        self._tick_id = self.root.after(common.HEARTBEAT_MS, self._tick)
+        self._poll_id = self.root.after(POLL_MS, self._poll)
+        self._beat_id = self.root.after(common.HEARTBEAT_MS, self._beat)
 
     def refresh(self, state: common.State) -> None:
         self._name.configure(text=state.plugin)
@@ -56,20 +60,24 @@ class Window:
         try:
             self.root.mainloop()
         finally:
-            self.root.after_cancel(self._tick_id)
+            self.root.after_cancel(self._poll_id)
+            self.root.after_cancel(self._beat_id)
             self.controller.shutdown()
             self.root.destroy()
         return self.code
 
-    def _tick(self) -> None:
-        self.controller.heartbeat()
+    def _poll(self) -> None:
         while True:
             try:
                 function = self._posted.get_nowait()
             except queue.Empty:
                 break
             function()
-        self._tick_id = self.root.after(common.HEARTBEAT_MS, self._tick)
+        self._poll_id = self.root.after(POLL_MS, self._poll)
+
+    def _beat(self) -> None:
+        self.controller.heartbeat()
+        self._beat_id = self.root.after(common.HEARTBEAT_MS, self._beat)
 
 
 def main() -> None:
