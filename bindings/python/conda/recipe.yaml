@@ -1,3 +1,5 @@
+schema_version: 1
+
 context:
   # Keep this in sync with bindings/python/pyproject.toml.
   version: "0.1.2"
@@ -22,7 +24,10 @@ source:
 
 build:
   number: 0
-  skip: is_abi3 and not is_python_min
+  skip:
+    # The worker exists for these four targets only.
+    - host_platform not in ["linux-64", "osx-64", "osx-arm64", "win-64"]
+    - is_abi3 and not is_python_min
   python:
     version_independent: ${{ is_abi3 }}
   script:
@@ -68,11 +73,18 @@ tests:
         import sys
         import vst_audio
 
+        # Test the shipped worker, not one supplied by the surrounding shell.
+        os.environ.pop("VST_AUDIO_WORKER", None)
         worker = vst_audio.Host().worker.resolve()
         site_packages = Path(os.environ["SP_DIR"]).resolve()
         assert worker.is_file(), worker
         assert worker.is_relative_to(site_packages), (worker, site_packages)
-        subprocess.run([worker, "--help"], check=True)
+        assert os.access(worker, os.X_OK), worker
+        subprocess.run([worker, "--help"], check=True, timeout=30)
+        if sys.platform == "darwin":
+            # The helper bundle keeps the ad-hoc signature upstream gave it.
+            subprocess.run(["codesign", "--verify", "--strict", str(worker.parents[2])],
+                           check=True, timeout=30)
 
         # Start the worker for real: it must reach plugin loading and report
         # the missing file, not die while initialising (exit 101 shows up as

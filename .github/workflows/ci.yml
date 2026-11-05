@@ -420,7 +420,7 @@ jobs:
           rattler-build build --log-style plain
           --recipe bindings/python/conda/recipe.yaml
           -m bindings/python/conda/ci-pinning.yaml
-          -m bindings/python/conda/variants.yaml
+          -m bindings/python/conda/conda_build_config.yaml
           --output-dir "$RUNNER_TEMP/conda"
       - name: Native fixtures against the installed package
         run: |

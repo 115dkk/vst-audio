@@ -30,7 +30,7 @@ CONDA = ROOT / "bindings/python/conda"
 REPOSITORY = "https://github.com/115dkk/vst-audio"
 # Submitted next to recipe.yaml; ci-pinning.yaml stands in for conda-forge's
 # global pinning in this repository's CI only.
-SUBMITTED = ("build.py", "variants.yaml")
+SUBMITTED = ("build.py", "conda_build_config.yaml")
 
 
 def python_version():

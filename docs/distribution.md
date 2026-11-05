@@ -122,7 +122,7 @@ registry before uploading it, it tags the release commit `python-v<version>` or
 `dotnet-v<version>` after the upload (`tools/binding_release.py`). The `pypi`
 job then hashes that tag's GitHub archive and uploads `conda-staged-recipe`:
 `recipes/vst-audio/` with the recipe pointed at the archive, `build.py` and
-`variants.yaml`, ready for a pull request to `conda-forge/staged-recipes`.
+`conda_build_config.yaml`, ready for `conda-forge/staged-recipes`.
 
 The NuGet package contains `lib/net8.0/VstAudio.dll` and its XML API documentation,
 plus the C ABI library, matching worker and the licence notices of both
@@ -180,14 +180,23 @@ GitHub archive URL and sha256, since PyPI has no sdist (ADR 0006).
   licences of the worker and of the extension into the package's licence files.
 - One package per platform serves every Python from conda-forge's
   `python_min` (`python-abi3`), and the recipe test runs `abi3audit`.
-- glibc: `variants.yaml` raises the Linux floor to 2.28, the floor of the PyPI
-  wheel. Built against conda-forge's default 2.17 sysroot, the worker does not
-  link: it uses `memfd_create` (glibc 2.27) and `statx` (2.28).
+- glibc: `conda_build_config.yaml` raises the Linux floor to 2.28, the floor of
+  the PyPI wheel; staged-recipes' CI honours that file. Built against
+  conda-forge's default 2.17 sysroot, the worker does not link: it uses
+  `memfd_create` (glibc 2.27) and `statx` (2.28).
+- macOS: conda-forge's link flags carry `-dead_strip_dylibs`, which removes
+  AppKit from the worker because objc2 looks its classes up by name; the
+  installed worker then panics at start. `build.py` removes the flag.
+  `build.py` also passes conda-forge's Rust target to maturin and sets PyO3's
+  cross-compilation variables when osx-64 builds osx-arm64.
+- Only the four targets the worker supports build.
 - Licence: `(MIT OR Apache-2.0) AND BSD-3-Clause AND ISC`, with `LICENSE-MIT`,
   `LICENSE-APACHE`, `LICENSE-ISC-DPF`, the generated BSD-3-Clause VST2 notice
   and the two dependency licence files.
-- The recipe's own tests import the package, run `pip check`, start the
-  bundled worker (`--help`) and run `abi3audit`. conda-forge has no display and
+- The recipe's own tests import the package, run `pip check`, check that the
+  bundled worker is executable and runs (`--help`), load a missing plugin
+  (the worker must start and report a plugin error, not die), verify the macOS
+  helper bundle's signature and run `abi3audit`. conda-forge has no display and
   no fixtures, so numeric and editor checks stay in this repository's CI.
 - conda-forge cross-compiles `osx-arm64` and does not run its tests there. The
   `conda` job in `ci.yml` therefore builds the recipe natively on all four
