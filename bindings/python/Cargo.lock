@@ -341,7 +341,7 @@ checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
 
 [[package]]
 name = "vst-audio"
-version = "0.11.1"
+version = "0.11.2"
 dependencies = [
  "rtrb",
  "thiserror",
@@ -352,7 +352,7 @@ dependencies = [
 
 [[package]]
 name = "vst-audio-protocol"
-version = "0.11.1"
+version = "0.11.2"
 dependencies = [
  "thiserror",
  "vst-audio-ring",
@@ -370,11 +370,11 @@ dependencies = [
 
 [[package]]
 name = "vst-audio-ring"
-version = "0.11.1"
+version = "0.11.2"
 
 [[package]]
 name = "vst-audio-transport-sys"
-version = "0.11.1"
+version = "0.11.2"
 dependencies = [
  "libc",
  "tempfile",
