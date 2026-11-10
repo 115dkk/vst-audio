@@ -1445,7 +1445,8 @@ impl HostWatch {
 }
 
 /// Two committed state blobs. A failed restore of the newest blob selects the
-/// previous blob without destroying either copy.
+/// previous blob without destroying either copy. Re-reading a state that differs
+/// only in verified ZIP archive timestamps does not replace the fallback.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct StateHistory {
     current: Option<Vec<u8>>,
@@ -1458,7 +1459,11 @@ impl StateHistory {
         Self::default()
     }
     pub fn save(&mut self, blob: Vec<u8>) {
-        if self.current.as_ref() == Some(&blob) {
+        if self
+            .current
+            .as_deref()
+            .is_some_and(|current| state::equivalent(current, &blob))
+        {
             return;
         }
         self.previous = self.current.replace(blob);
@@ -1505,6 +1510,7 @@ pub fn duration_ms(duration: Duration) -> u64 {
 #[cfg(test)]
 mod state_history_tests {
     use super::StateHistory;
+    use super::state::test_zip::{Entry, build};
 
     #[test]
     fn respawn_uses_current_then_previous_after_a_failed_restore() {
@@ -1516,6 +1522,36 @@ mod state_history_tests {
         assert_eq!(history.respawn_state(), Some(vec![1]));
         history.save(vec![3]);
         assert_eq!(history.respawn_state(), Some(vec![3]));
+    }
+
+    #[test]
+    fn archive_timestamp_reread_preserves_restore_fallback() {
+        let state = |content: &'static [u8], time, date| {
+            build(
+                &[Entry {
+                    name: b"state.json",
+                    content,
+                    local_extra: &[],
+                    central_extra: &[],
+                }],
+                time,
+                date,
+                true,
+            )
+        };
+        let state_s = state(b"state-s", 0x1020, 0x3040);
+        let state_t1 = state(b"state-t", 0x1020, 0x3040);
+        let state_t2 = state(b"state-t", 0x5060, 0x7080);
+        let mut history = StateHistory::new();
+
+        history.save(state_s.clone());
+        history.save(state_t1.clone());
+        history.save(state_t2);
+
+        assert_eq!(history.previous(), Some(state_s.as_slice()));
+        assert_eq!(history.current(), Some(state_t1.as_slice()));
+        assert_eq!(history.respawn_state(), Some(state_t1));
+        assert_eq!(history.respawn_state(), Some(state_s));
     }
 }
 
