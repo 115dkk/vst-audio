@@ -47,6 +47,7 @@ run("cargo", "test", "--locked", "-p", "vst-audio", "--test", "features", "--", 
 
 run("cargo", "test", "--locked", "-p", "vst-audio", "--test", "long_callbacks", "--", "--ignored", "--nocapture", "--test-threads=1", env=env)
 run("cargo", "test", "--locked", "-p", "vst-audio", "--test", "stress", "--", "--ignored", "--nocapture", "--test-threads=1", env=env)
+run("cargo", "test", "--locked", "-p", "vst-audio", "--test", "scheduling", "--", "--ignored", "--nocapture", "--test-threads=1", env=env)
 
 run("cargo", "test", "--locked", "-p", "vst-audio", "--test", "embedding",
     "--", "--ignored", "--nocapture", "--test-threads=1", env=env)

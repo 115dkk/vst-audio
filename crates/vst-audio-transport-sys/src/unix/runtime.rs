@@ -839,11 +839,861 @@ impl Drop for ChildProcess {
 }
 
 /// Best-effort scheduling hook. No elevated scheduling promise on Unix.
+#[deprecated(note = "use RealtimeAudio")]
 #[derive(Debug)]
 pub struct Mmcss;
+#[allow(deprecated)]
 impl Mmcss {
     pub fn pro_audio() -> io::Result<Self> {
         Ok(Self)
+    }
+}
+
+/// Cadence of the realtime processing loop a [`RealtimeAudio`] guard serves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AudioPeriod {
+    pub frames: u32,
+    pub sample_rate: u32,
+}
+
+/// SCHED_FIFO priority requested for worker audio threads: low, so device and
+/// application callback threads (and threaded IRQs) keep precedence, while every
+/// SCHED_OTHER thread yields to it.
+#[cfg(target_os = "linux")]
+pub const FIFO_PRIORITY: i32 = 10;
+
+/// Realtime scheduling for the calling thread, restored when dropped.
+/// Not `Send`: it must be dropped on the thread that created it.
+///
+/// Linux applies `SCHED_FIFO` at `FIFO_PRIORITY` (lowered to a smaller
+/// `RLIMIT_RTPRIO`) with `SCHED_RESET_ON_FORK`. A thread that already runs under
+/// `SCHED_FIFO` or `SCHED_RR` at that priority or higher, typically inherited from
+/// an application started under `chrt`, keeps its scheduling untouched. Dropping
+/// restores the previous policy and priority; without `CAP_SYS_NICE` the kernel does not let a thread
+/// clear `SCHED_RESET_ON_FORK`, so that flag can remain on the restored policy.
+/// macOS applies `THREAD_TIME_CONSTRAINT_POLICY` derived from the
+/// [`AudioPeriod`]. Drop best-effort restores all four values of a previously
+/// active time-constraint policy (nested guards must be dropped in reverse order).
+/// Otherwise it selects the standard policy. macOS does not restore requested QoS:
+/// applying a time-constraint policy removes the kernel QoS request, and ordinary
+/// pthreads then reject a new QoS request with `EPERM`, even after returning to
+/// standard scheduling. The pthread QoS getter can still report its cached request;
+/// that is not evidence of kernel QoS restoration.
+/// Legacy fixed-priority/precedence settings and extended realtime priority are
+/// not captured. Drop errors are ignored. Other Unix targets are unsupported.
+/// `Debug` shows the applied values and saved restore state.
+pub struct RealtimeAudio {
+    /// Raw `sched_getscheduler` result before promotion, flags included.
+    #[cfg(target_os = "linux")]
+    previous_policy: libc::c_int,
+    #[cfg(target_os = "linux")]
+    previous_priority: libc::c_int,
+    /// Applied SCHED_FIFO priority, or the kept inherited one.
+    #[cfg(target_os = "linux")]
+    priority: libc::c_int,
+    /// The thread was already realtime at `priority`; nothing was changed.
+    #[cfg(target_os = "linux")]
+    inherited: bool,
+    /// The calling thread's port name, owned by libpthread (no right of ours).
+    #[cfg(target_os = "macos")]
+    port: libc::thread_t,
+    /// Applied policy, in Mach absolute-time units.
+    #[cfg(target_os = "macos")]
+    period: u32,
+    #[cfg(target_os = "macos")]
+    computation: u32,
+    #[cfg(target_os = "macos")]
+    constraint: u32,
+    /// Active time-constraint policy before promotion, if any.
+    #[cfg(target_os = "macos")]
+    previous_time_constraint: Option<libc::thread_time_constraint_policy>,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl std::fmt::Debug for RealtimeAudio {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = f.debug_struct("RealtimeAudio");
+        #[cfg(target_os = "linux")]
+        debug
+            .field(
+                "policy",
+                &if self.inherited {
+                    "inherited realtime"
+                } else {
+                    "SCHED_FIFO | SCHED_RESET_ON_FORK"
+                },
+            )
+            .field("priority", &self.priority)
+            .field("previous_policy", &self.previous_policy)
+            .field("previous_priority", &self.previous_priority);
+        #[cfg(target_os = "macos")]
+        debug
+            .field("policy", &"THREAD_TIME_CONSTRAINT_POLICY")
+            .field("port", &self.port)
+            .field("period_ticks", &self.period)
+            .field("computation_ticks", &self.computation)
+            .field("constraint_ticks", &self.constraint)
+            .field(
+                "restore_policy",
+                &if self.previous_time_constraint.is_some() {
+                    "THREAD_TIME_CONSTRAINT_POLICY"
+                } else {
+                    "THREAD_STANDARD_POLICY (QoS not restored)"
+                },
+            )
+            .field(
+                "previous_time_constraint",
+                &self.previous_time_constraint.as_ref().map(|policy| {
+                    (
+                        policy.period,
+                        policy.computation,
+                        policy.constraint,
+                        policy.preemptible,
+                    )
+                }),
+            );
+        debug.finish_non_exhaustive()
+    }
+}
+
+fn validate_period(period: AudioPeriod) -> io::Result<()> {
+    if period.frames == 0 || period.sample_rate == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "audio period needs non-zero frames and sample rate",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn rtprio_soft_limit() -> io::Result<libc::rlim_t> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: limit points to writable initialized storage for one rlimit.
+    if unsafe { libc::getrlimit(libc::RLIMIT_RTPRIO, &mut limit) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(limit.rlim_cur)
+}
+
+/// [`FIFO_PRIORITY`], lowered to a finite non-zero soft `RLIMIT_RTPRIO` and kept in
+/// the kernel's SCHED_FIFO range. A zero limit keeps the default: the request can
+/// still succeed under CAP_SYS_NICE.
+#[cfg(target_os = "linux")]
+fn fifo_priority(limit: libc::rlim_t) -> io::Result<libc::c_int> {
+    let wanted = if limit == 0 || limit == libc::RLIM_INFINITY {
+        FIFO_PRIORITY
+    } else {
+        FIFO_PRIORITY.min(libc::c_int::try_from(limit).unwrap_or(libc::c_int::MAX))
+    };
+    // SAFETY: scalar-only query of a valid policy constant.
+    let min = unsafe { libc::sched_get_priority_min(libc::SCHED_FIFO) };
+    // SAFETY: scalar-only query of a valid policy constant.
+    let max = unsafe { libc::sched_get_priority_max(libc::SCHED_FIFO) };
+    if min < 0 || max < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(wanted.max(min).min(max))
+}
+
+#[cfg(target_os = "linux")]
+impl RealtimeAudio {
+    /// Best effort. An error explains why the OS refused; the caller keeps
+    /// processing at normal priority.
+    ///
+    /// Linux ignores the period beyond validating it: SCHED_FIFO has no notion of
+    /// cadence, only priority.
+    pub fn promote(period: AudioPeriod) -> io::Result<Self> {
+        validate_period(period)?;
+        // SAFETY: scalar-only query. On Linux pid 0 names the calling thread (the
+        // kernel schedules threads, not processes), so this reads this thread only.
+        let previous_policy = unsafe { libc::sched_getscheduler(0) };
+        if previous_policy < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut previous = libc::sched_param { sched_priority: 0 };
+        // SAFETY: previous is writable initialized storage for one sched_param; pid
+        // 0 names the calling thread on Linux.
+        if unsafe { libc::sched_getparam(0, &mut previous) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let limit = rtprio_soft_limit()?;
+        let priority = fifo_priority(limit)?;
+        let current = previous_policy & !libc::SCHED_RESET_ON_FORK;
+        if (current == libc::SCHED_FIFO || current == libc::SCHED_RR)
+            && previous.sched_priority >= priority
+        {
+            // Lowering an inherited realtime priority would put the audio thread
+            // below the worker's other threads; keep it as it is.
+            return Ok(Self {
+                previous_policy,
+                previous_priority: previous.sched_priority,
+                priority: previous.sched_priority,
+                inherited: true,
+                _thread: std::marker::PhantomData,
+            });
+        }
+        let param = libc::sched_param {
+            sched_priority: priority,
+        };
+        // SAFETY: param is initialized and outlives the call; pid 0 names the
+        // calling thread on Linux, so only this thread's policy changes.
+        // SCHED_RESET_ON_FORK keeps processes a plugin forks from inheriting it.
+        let result = unsafe {
+            libc::sched_setscheduler(0, libc::SCHED_FIFO | libc::SCHED_RESET_ON_FORK, &param)
+        };
+        if result != 0 {
+            let cause = io::Error::last_os_error();
+            let limit = if limit == libc::RLIM_INFINITY {
+                "unlimited".to_owned()
+            } else {
+                limit.to_string()
+            };
+            return Err(io::Error::new(
+                cause.kind(),
+                format!(
+                    "SCHED_FIFO priority {priority} refused ({cause}); RLIMIT_RTPRIO soft \
+                     limit {limit}; raise RLIMIT_RTPRIO or grant CAP_SYS_NICE"
+                ),
+            ));
+        }
+        Ok(Self {
+            previous_policy,
+            previous_priority: previous.sched_priority,
+            priority,
+            inherited: false,
+            _thread: std::marker::PhantomData,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for RealtimeAudio {
+    fn drop(&mut self) {
+        if self.inherited {
+            return;
+        }
+        let param = libc::sched_param {
+            sched_priority: self.previous_priority,
+        };
+        // SAFETY: param is initialized and outlives the call. The guard is not
+        // Send, so pid 0 still names the thread that promote changed.
+        let restored = unsafe { libc::sched_setscheduler(0, self.previous_policy, &param) } == 0;
+        if !restored && (self.previous_policy & libc::SCHED_RESET_ON_FORK) == 0 {
+            // Without CAP_SYS_NICE the kernel refuses to clear SCHED_RESET_ON_FORK
+            // (user_check_sched_setscheduler; sched(7)), so a thread promoted through
+            // RLIMIT_RTPRIO alone keeps the flag but still leaves SCHED_FIFO.
+            // SAFETY: as above; only the requested flags differ.
+            let _ = unsafe {
+                libc::sched_setscheduler(
+                    0,
+                    self.previous_policy | libc::SCHED_RESET_ON_FORK,
+                    &param,
+                )
+            };
+        }
+    }
+}
+
+// XNU bounds for THREAD_TIME_CONSTRAINT_POLICY, verified against
+// apple-oss-distributions/xnu main (fetched 2026-11-19):
+// - osfmk/kern/thread_policy.c, thread_policy_set_internal (~line 408): rejects
+//   `constraint < computation`, `computation > max_rt_quantum` and
+//   `computation < min_rt_quantum` with KERN_INVALID_ARGUMENT; it then raises a
+//   computation below constraint / 2 to constraint / 2, capped at max_rt_quantum.
+//   No other bound applies to period or constraint.
+// - osfmk/kern/sched_rt.c, sched_realtime_timebase_init (~lines 102-112):
+//   min_rt_quantum = 50 us and max_rt_quantum = 50 ms, converted to absolute time
+//   by clock_interval_to_absolutetime_interval.
+// - osfmk/kern/sched.h (~line 295): RT_CONSTRAINT_NONE is UINT32_MAX, the run
+//   queue's "no constraint" marker, so a real constraint stays below it.
+#[cfg(target_os = "macos")]
+const MIN_RT_QUANTUM_NS: u64 = 50_000;
+#[cfg(target_os = "macos")]
+const MAX_RT_QUANTUM_NS: u64 = 50_000_000;
+#[cfg(target_os = "macos")]
+const MAX_RT_CONSTRAINT: u32 = u32::MAX - 1;
+
+/// Mach absolute time runs at `numer / denom` nanoseconds per tick.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug)]
+struct Timebase {
+    numer: u128,
+    denom: u128,
+}
+
+#[cfg(target_os = "macos")]
+impl Timebase {
+    // libc deprecates its Mach declarations in favour of the mach2 crate; this
+    // crate adds no dependency for one call whose ABI is fixed.
+    #[allow(deprecated)]
+    fn current() -> io::Result<Self> {
+        let mut info = libc::mach_timebase_info { numer: 0, denom: 0 };
+        // SAFETY: info points to writable initialized storage for one
+        // mach_timebase_info; the call only fills it.
+        let result = unsafe { libc::mach_timebase_info(&mut info) };
+        if result != libc::KERN_SUCCESS || info.numer == 0 || info.denom == 0 {
+            return Err(io::Error::other(format!(
+                "mach_timebase_info failed (kern_return {result})"
+            )));
+        }
+        Ok(Self {
+            numer: info.numer.into(),
+            denom: info.denom.into(),
+        })
+    }
+
+    /// Ticks in `ns` nanoseconds, rounded down.
+    fn ticks_floor(self, ns: u128) -> u128 {
+        ns * self.denom / self.numer
+    }
+
+    /// Ticks in `ns` nanoseconds, rounded up.
+    fn ticks_ceil(self, ns: u128) -> u128 {
+        (ns * self.denom).div_ceil(self.numer)
+    }
+}
+
+/// `(period, computation, constraint)` in ticks for one audio period.
+///
+/// The period and constraint round down, so the deadline is never later than the
+/// buffer really lasts; computation is half of that. The quantum bounds round
+/// inward (minimum up, maximum down), so the result stays inside the kernel's
+/// limits whichever way its own conversion rounds. Periods shorter than the
+/// minimum quantum relax the constraint to it, since the kernel rejects a
+/// constraint below the computation.
+#[cfg(target_os = "macos")]
+fn time_constraint(period: AudioPeriod, timebase: Timebase) -> (u32, u32, u32) {
+    // u32 frames * 1e9 * u32 denominator stays below 2^94: no u128 overflow.
+    let ticks = u128::from(period.frames) * 1_000_000_000 * timebase.denom
+        / (u128::from(period.sample_rate) * timebase.numer);
+    let min = timebase.ticks_ceil(MIN_RT_QUANTUM_NS.into());
+    let max = timebase.ticks_floor(MAX_RT_QUANTUM_NS.into());
+    let computation = (ticks / 2).max(min).min(max);
+    let constraint = ticks.max(computation).min(u128::from(MAX_RT_CONSTRAINT));
+    let saturate = |value: u128| u32::try_from(value).unwrap_or(u32::MAX);
+    (saturate(ticks), saturate(computation), saturate(constraint))
+}
+
+#[cfg(target_os = "macos")]
+impl RealtimeAudio {
+    /// Best effort. An error explains why the OS refused; the caller keeps
+    /// processing at normal priority.
+    ///
+    /// The period sets the time-constraint policy: constraint one period,
+    /// computation half of it, preemptible, clamped to the kernel's bounds.
+    pub fn promote(period: AudioPeriod) -> io::Result<Self> {
+        validate_period(period)?;
+        let timebase = Timebase::current()?;
+        let (ticks, computation, constraint) = time_constraint(period, timebase);
+        // SAFETY: no preconditions; returns the calling thread's handle.
+        let thread = unsafe { libc::pthread_self() };
+        // pthread_mach_thread_np(pthread_self()) returns the port name libpthread
+        // cached for this thread (libpthread src/inline_internal.h
+        // _pthread_is_valid, ~line 226) and adds no right. mach_thread_self() would
+        // copy out a new send right each call (xnu osfmk/kern/ipc_tt.c
+        // thread_self_trap, ~line 1294) that needs mach_port_deallocate, which
+        // libc does not even declare.
+        // SAFETY: thread is the live calling thread, so libpthread knows its port.
+        let port = unsafe { libc::pthread_mach_thread_np(thread) };
+        let mut previous = libc::thread_time_constraint_policy {
+            period: 0,
+            computation: 0,
+            constraint: 0,
+            preemptible: 0,
+        };
+        let mut count = libc::THREAD_TIME_CONSTRAINT_POLICY_COUNT;
+        let mut get_default: libc::boolean_t = 0;
+        // XNU osfmk/kern/thread_policy.c (~1337-1385, main fetched 2026-11-19)
+        // returns the active/saved realtime policy, or sets get_default to TRUE.
+        // SAFETY: port names the live calling thread; previous, count and
+        // get_default are distinct writable objects. count gives previous's size
+        // in integer_t words, and all storage remains valid for this call.
+        let result = unsafe {
+            libc::thread_policy_get(
+                port,
+                libc::THREAD_TIME_CONSTRAINT_POLICY as libc::thread_policy_flavor_t,
+                (&raw mut previous).cast::<libc::integer_t>(),
+                &mut count,
+                &mut get_default,
+            )
+        };
+        if result != libc::KERN_SUCCESS {
+            // Do not change scheduling if the restoration snapshot is unavailable.
+            return Err(io::Error::other(format!(
+                "THREAD_TIME_CONSTRAINT_POLICY query failed (kern_return {result})"
+            )));
+        }
+        let previous_time_constraint = (get_default == 0).then_some(previous);
+        // XNU osfmk/kern/thread_policy.c (~311-329) removes requested QoS before
+        // changing Mach policy; STANDARD/EXTENDED (~357-386) only restores mode.
+        // bsd/pthread/pthread_workqueue.c (~2417-2424) rejects a new QoS request
+        // with EPERM on ordinary pthreads once thread_has_qos_policy is false.
+        // libpthread src/qos.c (~172-176) reads cached TSD, not kernel QoS, so its
+        // getter can still report the old class while realtime or after Drop.
+        // No QoS restore is attempted: that cached value cannot undo the opt-out.
+        let mut policy = libc::thread_time_constraint_policy {
+            period: ticks,
+            computation,
+            constraint,
+            preemptible: 1,
+        };
+        // SAFETY: port names the calling, live thread. policy is initialized,
+        // writable and exactly THREAD_TIME_CONSTRAINT_POLICY_COUNT integer_t words;
+        // the kernel only reads it during the call.
+        let result = unsafe {
+            libc::thread_policy_set(
+                port,
+                libc::THREAD_TIME_CONSTRAINT_POLICY as libc::thread_policy_flavor_t,
+                (&raw mut policy).cast::<libc::integer_t>(),
+                libc::THREAD_TIME_CONSTRAINT_POLICY_COUNT,
+            )
+        };
+        if result != libc::KERN_SUCCESS {
+            let ns = u128::from(period.frames) * 1_000_000_000 / u128::from(period.sample_rate);
+            return Err(io::Error::other(format!(
+                "THREAD_TIME_CONSTRAINT_POLICY refused (kern_return {result}); period {ns} ns"
+            )));
+        }
+        Ok(Self {
+            port,
+            previous_time_constraint,
+            period: ticks,
+            computation,
+            constraint,
+            _thread: std::marker::PhantomData,
+        })
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for RealtimeAudio {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous_time_constraint.as_mut() {
+            // Best effort: restore the prior realtime policy, including all four
+            // fields. Drop cannot report a refused restoration.
+            // SAFETY: this !Send guard still belongs to the live calling thread.
+            // previous holds the initialized snapshot with exactly COUNT words
+            // and stays valid throughout this synchronous call.
+            let _ = unsafe {
+                libc::thread_policy_set(
+                    self.port,
+                    libc::THREAD_TIME_CONSTRAINT_POLICY as libc::thread_policy_flavor_t,
+                    (previous as *mut libc::thread_time_constraint_policy)
+                        .cast::<libc::integer_t>(),
+                    libc::THREAD_TIME_CONSTRAINT_POLICY_COUNT,
+                )
+            };
+            return;
+        }
+        // No prior realtime policy: attempt standard scheduling. Errors are
+        // ignored in Drop; this does not restore QoS (see promote's source notes).
+        let mut standard = libc::thread_standard_policy { no_data: 0 };
+        // SAFETY: the guard is not Send, so port still names the live calling
+        // thread whose right libpthread holds. THREAD_STANDARD_POLICY_COUNT is 0,
+        // so the kernel reads nothing through the valid pointer.
+        let _ = unsafe {
+            libc::thread_policy_set(
+                self.port,
+                libc::THREAD_STANDARD_POLICY as libc::thread_policy_flavor_t,
+                (&raw mut standard).cast::<libc::integer_t>(),
+                libc::THREAD_STANDARD_POLICY_COUNT as libc::mach_msg_type_number_t,
+            )
+        };
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+impl RealtimeAudio {
+    /// Best effort. An error explains why the OS refused; the caller keeps
+    /// processing at normal priority. This target has no implementation.
+    pub fn promote(period: AudioPeriod) -> io::Result<Self> {
+        validate_period(period)?;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "realtime audio scheduling is implemented on Linux and macOS only",
+        ))
+    }
+}
+
+#[cfg(test)]
+mod realtime_tests {
+    use super::*;
+
+    #[test]
+    fn zero_period_is_invalid_input() {
+        for period in [
+            AudioPeriod {
+                frames: 0,
+                sample_rate: 48_000,
+            },
+            AudioPeriod {
+                frames: 128,
+                sample_rate: 0,
+            },
+        ] {
+            let error = RealtimeAudio::promote(period).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{error}");
+        }
+    }
+
+    /// CI sets this after raising RLIMIT_RTPRIO, so a refused promotion fails
+    /// instead of taking the unprivileged branch unnoticed.
+    #[cfg(target_os = "linux")]
+    fn realtime_required() -> bool {
+        std::env::var_os("VST_AUDIO_REQUIRE_REALTIME").is_some_and(|value| value == "1")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn current_policy() -> (libc::c_int, libc::c_int) {
+        // SAFETY: scalar-only query; pid 0 names the calling thread on Linux.
+        let policy = unsafe { libc::sched_getscheduler(0) };
+        assert!(policy >= 0, "{}", io::Error::last_os_error());
+        let mut param = libc::sched_param { sched_priority: 0 };
+        // SAFETY: param is writable storage for one sched_param; pid 0 names the
+        // calling thread on Linux.
+        let result = unsafe { libc::sched_getparam(0, &mut param) };
+        assert_eq!(result, 0, "{}", io::Error::last_os_error());
+        (policy, param.sched_priority)
+    }
+
+    /// The documented priority rule, computed independently of `fifo_priority`.
+    #[cfg(target_os = "linux")]
+    fn expected_priority() -> libc::c_int {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: limit is writable storage for one rlimit.
+        let result = unsafe { libc::getrlimit(libc::RLIMIT_RTPRIO, &mut limit) };
+        assert_eq!(result, 0, "{}", io::Error::last_os_error());
+        let limit = limit.rlim_cur;
+        let wanted = if limit == 0 || limit == libc::RLIM_INFINITY {
+            FIFO_PRIORITY
+        } else {
+            limit.min(FIFO_PRIORITY as libc::rlim_t) as libc::c_int
+        };
+        // SAFETY: scalar-only query.
+        let min = unsafe { libc::sched_get_priority_min(libc::SCHED_FIFO) };
+        // SAFETY: scalar-only query.
+        let max = unsafe { libc::sched_get_priority_max(libc::SCHED_FIFO) };
+        wanted.clamp(min, max)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn promote_applies_fifo_or_reports_permission() {
+        std::thread::spawn(|| {
+            let before = current_policy();
+            match RealtimeAudio::promote(AudioPeriod {
+                frames: 128,
+                sample_rate: 48_000,
+            }) {
+                Ok(guard) => {
+                    let (policy, priority) = current_policy();
+                    assert_eq!(policy, libc::SCHED_FIFO | libc::SCHED_RESET_ON_FORK);
+                    assert_eq!(priority, expected_priority());
+                    eprintln!("promoted: {guard:?}");
+                    drop(guard);
+                    // Promotion through RLIMIT_RTPRIO alone (no CAP_SYS_NICE) cannot
+                    // clear SCHED_RESET_ON_FORK again; the policy itself must return.
+                    let (policy, priority) = current_policy();
+                    assert_eq!(
+                        (policy & !libc::SCHED_RESET_ON_FORK, priority),
+                        (before.0 & !libc::SCHED_RESET_ON_FORK, before.1),
+                        "drop did not restore"
+                    );
+                }
+                Err(error) => {
+                    assert!(
+                        !realtime_required(),
+                        "VST_AUDIO_REQUIRE_REALTIME=1 but promotion was refused: {error}"
+                    );
+                    eprintln!("refused: {error}");
+                    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+                    assert!(error.to_string().contains("RLIMIT_RTPRIO"), "{error}");
+                    assert_eq!(current_policy(), before, "refusal changed the policy");
+                }
+            }
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// Clears CAP_SYS_NICE from the calling thread's effective set (capabilities
+    /// are per thread on Linux), modelling a thread promoted through
+    /// RLIMIT_RTPRIO alone.
+    #[cfg(target_os = "linux")]
+    fn drop_sys_nice() {
+        const VERSION_3: u32 = 0x2008_0522;
+        const CAP_SYS_NICE: u32 = 23;
+        let mut header = [VERSION_3, 0];
+        // Two { effective, permitted, inheritable } words, low then high.
+        let mut data = [0u32; 6];
+        // SAFETY: header is a valid v3 header naming the calling thread (pid 0) and
+        // data is writable storage for the two structures v3 fills.
+        let result =
+            unsafe { libc::syscall(libc::SYS_capget, header.as_mut_ptr(), data.as_mut_ptr()) };
+        assert_eq!(result, 0, "{}", io::Error::last_os_error());
+        data[0] &= !(1 << CAP_SYS_NICE);
+        // SAFETY: as above; only the calling thread's effective set shrinks.
+        let result = unsafe { libc::syscall(libc::SYS_capset, header.as_mut_ptr(), data.as_ptr()) };
+        assert_eq!(result, 0, "{}", io::Error::last_os_error());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn drop_restores_policy_without_cap_sys_nice() {
+        std::thread::spawn(|| {
+            let (before, priority) = current_policy();
+            let guard = match RealtimeAudio::promote(AudioPeriod {
+                frames: 128,
+                sample_rate: 48_000,
+            }) {
+                Ok(guard) => guard,
+                Err(error) => {
+                    // Unprivileged runs: promote_applies_fifo_or_reports_permission
+                    // covers the refusal.
+                    assert!(
+                        !realtime_required(),
+                        "VST_AUDIO_REQUIRE_REALTIME=1 but promotion was refused: {error}"
+                    );
+                    eprintln!("skipped, promotion refused: {error}");
+                    return;
+                }
+            };
+            drop_sys_nice();
+            drop(guard);
+            let (policy, restored) = current_policy();
+            assert_eq!(policy & !libc::SCHED_RESET_ON_FORK, before);
+            assert_eq!(restored, priority);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inherited_higher_realtime_priority_is_kept() {
+        std::thread::spawn(|| {
+            let inherited = libc::sched_param {
+                sched_priority: FIFO_PRIORITY + 10,
+            };
+            // SAFETY: inherited is initialized and outlives the call; pid 0 names
+            // this test thread only.
+            if unsafe { libc::sched_setscheduler(0, libc::SCHED_RR, &inherited) } != 0 {
+                let error = io::Error::last_os_error();
+                assert!(
+                    !realtime_required(),
+                    "VST_AUDIO_REQUIRE_REALTIME=1 but SCHED_RR was refused: {error}"
+                );
+                eprintln!("skipped, cannot set up SCHED_RR: {error}");
+                return;
+            }
+            let guard = RealtimeAudio::promote(AudioPeriod {
+                frames: 128,
+                sample_rate: 48_000,
+            })
+            .unwrap();
+            assert_eq!(current_policy(), (libc::SCHED_RR, FIFO_PRIORITY + 10));
+            drop(guard);
+            assert_eq!(current_policy(), (libc::SCHED_RR, FIFO_PRIORITY + 10));
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn time_constraint_now() -> (libc::thread_time_constraint_policy, libc::boolean_t) {
+        let mut policy = libc::thread_time_constraint_policy {
+            period: 0,
+            computation: 0,
+            constraint: 0,
+            preemptible: 0,
+        };
+        let mut count = libc::THREAD_TIME_CONSTRAINT_POLICY_COUNT;
+        let mut get_default: libc::boolean_t = 0;
+        // SAFETY: no preconditions; returns the calling thread's handle.
+        let thread = unsafe { libc::pthread_self() };
+        // SAFETY: thread is the live calling thread.
+        let port = unsafe { libc::pthread_mach_thread_np(thread) };
+        // SAFETY: port names the live calling thread; policy, count and
+        // get_default are writable and count states the policy's size in words.
+        let result = unsafe {
+            libc::thread_policy_get(
+                port,
+                libc::THREAD_TIME_CONSTRAINT_POLICY as libc::thread_policy_flavor_t,
+                (&raw mut policy).cast::<libc::integer_t>(),
+                &mut count,
+                &mut get_default,
+            )
+        };
+        assert_eq!(result, libc::KERN_SUCCESS);
+        (policy, get_default)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn assert_applied(frames: u32, sample_rate: u32) -> libc::thread_time_constraint_policy {
+        let guard = RealtimeAudio::promote(AudioPeriod {
+            frames,
+            sample_rate,
+        })
+        .unwrap_or_else(|error| panic!("{frames} frames at {sample_rate} Hz: {error}"));
+        let (policy, get_default) = time_constraint_now();
+        assert_eq!(
+            get_default, 0,
+            "{frames} frames at {sample_rate} Hz: {guard:?}"
+        );
+        let timebase = Timebase::current().unwrap();
+        let min = timebase.ticks_ceil(MIN_RT_QUANTUM_NS.into());
+        let max = timebase.ticks_floor(MAX_RT_QUANTUM_NS.into());
+        let computation = u128::from(policy.computation);
+        assert!(
+            (min..=max).contains(&computation),
+            "computation {computation} outside [{min}, {max}]: {guard:?}"
+        );
+        assert!(policy.constraint >= policy.computation, "{guard:?}");
+        assert_ne!(policy.preemptible, 0);
+        drop(guard);
+        let (_, get_default) = time_constraint_now();
+        assert_ne!(get_default, 0, "drop did not restore the standard policy");
+        policy
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn promote_sets_time_constraint_and_drop_restores() {
+        std::thread::spawn(|| {
+            let policy = assert_applied(128, 48_000);
+            let timebase = Timebase::current().unwrap();
+            let ns = u128::from(policy.period) * timebase.numer / timebase.denom;
+            // One tick of rounding either way, plus integer truncation.
+            let tick = timebase.numer.div_ceil(timebase.denom) + 1;
+            let expected = 2_666_666u128;
+            assert!(
+                ns.abs_diff(expected) <= tick,
+                "period {ns} ns, expected about {expected} ns"
+            );
+            assert_eq!(policy.constraint, policy.period);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn assert_same_time_constraint(
+        actual: &libc::thread_time_constraint_policy,
+        expected: &libc::thread_time_constraint_policy,
+    ) {
+        assert_eq!(actual.period, expected.period, "period");
+        assert_eq!(actual.computation, expected.computation, "computation");
+        assert_eq!(actual.constraint, expected.constraint, "constraint");
+        assert_eq!(actual.preemptible, expected.preemptible, "preemptible");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn drop_restores_existing_time_constraint() {
+        std::thread::spawn(|| {
+            let (period, computation, constraint) = time_constraint(
+                AudioPeriod {
+                    frames: 256,
+                    sample_rate: 48_000,
+                },
+                Timebase::current().unwrap(),
+            );
+            let mut original = libc::thread_time_constraint_policy {
+                period,
+                computation,
+                constraint,
+                // Unlike promote's policy, also exercise restoring false.
+                preemptible: 0,
+            };
+            // SAFETY: no preconditions; retrieves this test thread's handle.
+            let thread = unsafe { libc::pthread_self() };
+            // SAFETY: thread is the live calling thread.
+            let port = unsafe { libc::pthread_mach_thread_np(thread) };
+            // SAFETY: port names this live thread; original is initialized and
+            // writable, contains COUNT integer_t words and outlives the call.
+            let result = unsafe {
+                libc::thread_policy_set(
+                    port,
+                    libc::THREAD_TIME_CONSTRAINT_POLICY as libc::thread_policy_flavor_t,
+                    (&raw mut original).cast::<libc::integer_t>(),
+                    libc::THREAD_TIME_CONSTRAINT_POLICY_COUNT,
+                )
+            };
+            assert_eq!(result, libc::KERN_SUCCESS);
+            let (before, get_default) = time_constraint_now();
+            assert_eq!(get_default, 0);
+            assert_same_time_constraint(&before, &original);
+            let guard = RealtimeAudio::promote(AudioPeriod {
+                frames: 128,
+                sample_rate: 48_000,
+            })
+            .unwrap();
+            let (promoted, get_default) = time_constraint_now();
+            assert_eq!(get_default, 0);
+            assert_ne!(promoted.period, before.period);
+            assert_eq!(promoted.preemptible, 1);
+            drop(guard);
+            let (restored, get_default) = time_constraint_now();
+            assert_eq!(get_default, 0, "drop removed the original realtime policy");
+            assert_same_time_constraint(&restored, &before);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn nested_guards_restore_outer_time_constraint() {
+        std::thread::spawn(|| {
+            assert_ne!(time_constraint_now().1, 0, "fresh thread was realtime");
+            let outer = RealtimeAudio::promote(AudioPeriod {
+                frames: 256,
+                sample_rate: 48_000,
+            })
+            .unwrap();
+            let (outer_policy, get_default) = time_constraint_now();
+            assert_eq!(get_default, 0);
+            let inner = RealtimeAudio::promote(AudioPeriod {
+                frames: 128,
+                sample_rate: 48_000,
+            })
+            .unwrap();
+            let (inner_policy, get_default) = time_constraint_now();
+            assert_eq!(get_default, 0);
+            assert_ne!(inner_policy.period, outer_policy.period);
+            drop(inner);
+            let (restored, get_default) = time_constraint_now();
+            assert_eq!(get_default, 0, "inner drop removed outer realtime policy");
+            assert_same_time_constraint(&restored, &outer_policy);
+            drop(outer);
+            assert_ne!(
+                time_constraint_now().1,
+                0,
+                "outer drop did not restore standard"
+            );
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn long_and_short_periods_are_accepted() {
+        std::thread::spawn(|| {
+            // About 186 ms: computation must be capped at the maximum quantum.
+            assert_applied(8192, 44_100);
+            // About 83 us: computation must be raised to the minimum quantum.
+            assert_applied(16, 192_000);
+        })
+        .join()
+        .unwrap();
     }
 }
 

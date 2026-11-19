@@ -10,6 +10,7 @@ from this repository. Required CI executes the implementation on Windows x64, Li
 | Isolation | One worker per instance; crash/hang A while parent and B keep processing. Windows creates workers without a console window (`CREATE_NO_WINDOW`), so a GUI application does not open one per instance |
 | Sandbox | Opt-in, off by default, fail-closed setup: Linux Landlock + seccomp, Windows AppContainer (network capabilities only when allowed) + job, macOS Seatbelt. VST2/VST3 native probes for TCP, writes outside the allowed folders and process creation, plus audio, editor and scan, run on Linux, Windows and macOS CI runners for every policy. On Windows a network-allowed worker reaches loopback only after an administrator exempts the `vst-audio.worker.network` profile (`CheckNetIsolation LoopbackExempt`) |
 | Audio | Planar f32/f64, callbacks up to configured `max_callback_frames`, `Configuration::slots` (2, 4, 8 or 16) per lane, modulo-2^32 ring sequences, `BlockEndpoint`/ring-only `BlockLane`, fixed-depth preallocated reblocking, explicit realtime fallback and timeout-bounded lossless offline block calls; allocator guards cover realtime block and callback paths, and native tests cover offline delivery plus 480-frame callbacks over a 128-frame quantum |
+| Audio thread scheduling | Each worker's audio thread is scheduled by the OS independently of the others; nothing pins workers to cores. For realtime (non-offline) processing it requests a realtime policy: Windows MMCSS "Pro Audio", macOS `THREAD_TIME_CONSTRAINT_POLICY` derived from quantum ÷ sample rate, Linux `SCHED_FIFO` priority 10 with reset-on-fork (lowered to a smaller nonzero `RLIMIT_RTPRIO` soft limit). Offline processing keeps normal scheduling on every OS. A refusal is printed once on the worker's stderr and processing continues at normal priority. The VST2 fixture records the policy of its own processing thread; native tests require the time-constraint policy on both macOS runners, `SCHED_FIFO` on Linux with `RLIMIT_RTPRIO` raised and normal scheduling without it, normal scheduling offline, and the same results under the default sandbox. Windows MMCSS registration has no reliable observation and is not asserted |
 | Events | Sample offsets and bus indices, MIDI channel messages and owned SysEx (up to 256 bytes); bounded 256-event packets and explicit host overflow |
 | Automation / transport | VST3 parameter queues retain offsets; VST2 splits at automation boundaries; in-block transport changes split both formats |
 | Buses | Multiple buses, sidechains, auxiliary outputs, active flags and general speaker masks; declared bus kind, name and default-active flag; activation chosen after loading (`BusSelector`, `BusSelector::main_only`); native order retained and negotiated layouts read back |
@@ -55,6 +56,42 @@ isolate same-session window messages/input, or protect against kernel vulnerabil
 does not replay old MIDI notes; applications can send current musical state
 after `Recovered`.
 A changed layout requires a newly prepared application audio endpoint.
+
+## Audio thread scheduling
+
+Linux grants `SCHED_FIFO` only to a process with a nonzero `RLIMIT_RTPRIO` or
+`CAP_SYS_NICE`. Many desktop installations give neither to ordinary users unless
+they belong to a group that `limits.conf` grants a realtime priority (often
+`audio` or `realtime`). Without it the worker reports the refusal and runs its
+audio thread at normal priority, as all Linux workers did before. Requesting
+realtime scheduling from rtkit over D-Bus is planned, not implemented. The
+priority is fixed at 10 so that device, audio-server and application callback
+threads, which usually run higher, keep precedence; it is not configurable yet.
+An audio thread that already runs under `SCHED_FIFO` or `SCHED_RR` at that
+priority or higher, as when the application itself was started under `chrt`,
+keeps its scheduling. Without `CAP_SYS_NICE` the kernel does not let a thread
+clear `SCHED_RESET_ON_FORK`, so a thread that returns to normal scheduling keeps
+that flag.
+
+macOS workers set a time-constraint policy but do not join the application's
+audio device workgroup (`os_workgroup`); joining across processes is planned.
+The time units of an x86_64 worker under Rosetta are not verified.
+On every OS the outcome is visible only on the worker's stderr; reporting it
+through the application API is planned.
+
+Windows workers registered MMCSS for offline processing too; since realtime
+scheduling became conditional, offline workers keep normal scheduling there as
+well.
+
+Rendering faster than real time on a non-offline instance (for example
+`BlockEndpoint::render` without `Configuration::offline`) keeps a promoted
+audio thread busy without sleeping. On Linux it then preempts every normal
+thread on its CPU, and a process with a finite `RLIMIT_RTTIME` receives
+`SIGXCPU` and then `SIGKILL` from the kernel. Use `offline: true` for batch
+rendering. A plugin that spins forever under a realtime policy stops the worker
+heartbeat, and supervision terminates it as it does any hung worker; Linux
+realtime throttling (by default 0.95 s per second) leaves the rest of that CPU
+to other threads until then.
 
 ## Editor scaling
 

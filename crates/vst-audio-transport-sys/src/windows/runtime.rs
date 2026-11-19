@@ -489,11 +489,13 @@ impl ChildProcess {
     }
 }
 
+#[deprecated(note = "use RealtimeAudio")]
 #[derive(Debug)]
 pub struct Mmcss {
     handle: HANDLE,
     _thread: std::marker::PhantomData<std::rc::Rc<()>>,
 }
+#[allow(deprecated)]
 impl Mmcss {
     pub fn pro_audio() -> windows::core::Result<Self> {
         let mut index = 0;
@@ -506,9 +508,75 @@ impl Mmcss {
         })
     }
 }
+#[allow(deprecated)]
 impl Drop for Mmcss {
     fn drop(&mut self) {
         // SAFETY: registration was created on this thread and the guard is not Send.
+        let _ = unsafe { AvRevertMmThreadCharacteristics(self.handle) };
+    }
+}
+
+/// Cadence of the realtime processing loop a [`RealtimeAudio`] guard serves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AudioPeriod {
+    pub frames: u32,
+    pub sample_rate: u32,
+}
+
+/// Realtime scheduling for the calling thread, restored when dropped.
+/// Not `Send`: it must be dropped on the thread that created it.
+///
+/// Windows registers the thread with the MMCSS "Pro Audio" task. `Debug` shows
+/// the registration.
+pub struct RealtimeAudio {
+    handle: HANDLE,
+    /// MMCSS task index the registration received.
+    task_index: u32,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl std::fmt::Debug for RealtimeAudio {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RealtimeAudio")
+            .field("mmcss_task", &"Pro Audio")
+            .field("task_index", &self.task_index)
+            .field("handle", &self.handle)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RealtimeAudio {
+    /// Best effort. An error explains why the OS refused; the caller keeps
+    /// processing at normal priority.
+    ///
+    /// Windows ignores the period beyond validating it: MMCSS "Pro Audio"
+    /// schedules by task, not by cadence.
+    pub fn promote(period: AudioPeriod) -> std::io::Result<Self> {
+        if period.frames == 0 || period.sample_rate == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "audio period needs non-zero frames and sample rate",
+            ));
+        }
+        let mut task_index = 0;
+        // SAFETY: constant terminated task name and valid task-index pointer; the
+        // registration applies to the calling thread.
+        let handle = unsafe {
+            AvSetMmThreadCharacteristicsW(windows::core::w!("Pro Audio"), &mut task_index)
+        }
+        .map_err(std::io::Error::from)?;
+        Ok(Self {
+            handle,
+            task_index,
+            _thread: std::marker::PhantomData,
+        })
+    }
+}
+
+impl Drop for RealtimeAudio {
+    fn drop(&mut self) {
+        // SAFETY: the registration was created on this thread and the guard is not
+        // Send, so the handle is reverted on the thread that owns it.
         let _ = unsafe { AvRevertMmThreadCharacteristics(self.handle) };
     }
 }
@@ -635,6 +703,23 @@ fn environment(temporary: &Path) -> windows::core::Result<Vec<u16>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zero_audio_period_is_invalid_input() {
+        for period in [
+            AudioPeriod {
+                frames: 0,
+                sample_rate: 48_000,
+            },
+            AudioPeriod {
+                frames: 128,
+                sample_rate: 0,
+            },
+        ] {
+            let error = RealtimeAudio::promote(period).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{error}");
+        }
+    }
 
     fn assert_not_inheritable(value: usize) {
         let mut flags = 0;

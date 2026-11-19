@@ -21,7 +21,7 @@ use vst_audio_protocol::{
 use vst_audio_ring::{Consumer, Geometry, Signal, State, Wait, Waited};
 use vst_audio_transport_sys::{
     Event, SharedRegion,
-    runtime::{self, Mmcss},
+    runtime::{self, AudioPeriod, RealtimeAudio},
 };
 use vst_audio_worker_sys::plugin::{Vst2Plugin, Vst2Processor};
 #[derive(Debug, thiserror::Error)]
@@ -345,16 +345,30 @@ fn start_audio(
     stop: Arc<AtomicBool>,
     mut scratch: AudioBuffer,
     mut processor: Box<dyn Processor>,
+    schedule: Option<AudioPeriod>,
+    trace: bool,
 ) -> Result<thread::JoinHandle<()>, StartError> {
     let (validated, validation) = mpsc::sync_channel(1);
     let audio = thread::spawn(move || {
-        let _mmcss = match Mmcss::pro_audio() {
-            Ok(mmcss) => Some(mmcss),
+        // Held for the whole loop; dropping it restores normal scheduling.
+        let _realtime = schedule.and_then(|period| match RealtimeAudio::promote(period) {
+            Ok(guard) => {
+                if trace {
+                    eprintln!(
+                        "worker {}: realtime audio scheduling applied: {guard:?}",
+                        std::process::id()
+                    );
+                }
+                Some(guard)
+            }
             Err(failure) => {
-                eprintln!("failed to enable Pro Audio MMCSS: {failure}");
+                eprintln!(
+                    "worker {}: realtime audio scheduling unavailable: {failure}",
+                    std::process::id()
+                );
                 None
             }
-        };
+        });
         let view = region.region();
         let mut consumer = Consumer::new(view, &*ready, [Some(&*done), None]);
         let result = consumer.validate_and_ready(std::process::id());
@@ -732,6 +746,12 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
                                 let scratch = AudioBuffer::new(geometry)
                                     .map_err(|e| error(format!("{e:?}")))?;
                                 let processor = plugin.take_processor().map_err(error)?;
+                                // Offline rendering is faster-than-realtime batch
+                                // work and must not hold a realtime policy.
+                                let schedule = (!setup.offline).then_some(AudioPeriod {
+                                    frames: max_frames,
+                                    sample_rate: rate,
+                                });
                                 audio = Some(start_audio(
                                     geometry,
                                     region.clone(),
@@ -741,6 +761,8 @@ pub fn host_main(args: Args) -> Result<(), StartError> {
                                     stop.clone(),
                                     scratch,
                                     processor,
+                                    schedule,
+                                    trace,
                                 )?);
                                 Ok(Message::Ack)
                             }

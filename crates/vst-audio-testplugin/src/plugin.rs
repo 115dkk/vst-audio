@@ -49,7 +49,24 @@ mod observation {
     pub const AUDIO_OUTPUT_COUNT_CHANGED: usize = 9;
     pub const CLOSE_RESIZE_ACCEPTED: usize = 10;
     pub const EDITOR_SCALE_BITS: usize = 11;
-    // Slots 12..24 remain zero and are still serialized in observation chunks.
+    // Slots 12..16 are written only where they are observed; they stay zero
+    // elsewhere (Windows and other OSes leave all four at 0).
+    /// Scheduling of the latest `process` call's thread: 0 unobserved (Windows,
+    /// other OSes, or a failed macOS query), 1 normal, 2 realtime.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub const SCHEDULING: usize = 12;
+    /// Linux: raw `sched_getscheduler` result, including SCHED_RESET_ON_FORK.
+    /// macOS: time-constraint period in ns, or the failing `kern_return_t`
+    /// while SCHEDULING stays 0.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub const SCHEDULING_DETAIL_A: usize = 13;
+    /// Linux: `sched_getparam` priority. macOS: computation in ns.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub const SCHEDULING_DETAIL_B: usize = 14;
+    /// macOS: constraint in ns. Linux leaves it at 0.
+    #[cfg(target_os = "macos")]
+    pub const SCHEDULING_DETAIL_C: usize = 15;
+    // Slots 16..24 remain zero and are still serialized in observation chunks.
     pub const COUNT: usize = 24;
 }
 
@@ -443,7 +460,7 @@ unsafe extern "C" fn dispatch(
             // Mode 12 returns 8 stored bytes without rewriting them; an 8-byte
             // SSV3-prefixed SET_CHUNK payload therefore round-trips exactly.
             // Other modes >= 7 return 98 bytes: header + 24 little-endian u32 slots
-            // (slot i occupies 2 + i*4 .. 6 + i*4; unused slots remain zero).
+            // (slot i occupies 2 + i*4 .. 6 + i*4; slots 16..24 remain zero).
             // All remaining modes return just the 2-byte header.
             if pointer.is_null() {
                 return 0;
@@ -561,6 +578,94 @@ unsafe extern "C" fn get_parameter(effect: *mut AEffect, index: u32) -> f32 {
     // SAFETY: atomic parameter is live throughout the call.
     f32::from_bits(unsafe { &(*effect.cast::<Instance>()).width }.load(Ordering::Relaxed))
 }
+/// Records the calling thread's scheduling class on the audio path: two
+/// syscalls into stack locals, no allocation and no locks. SCHEDULING is stored
+/// last with Release so a reader that sees it also sees its details.
+#[cfg(target_os = "linux")]
+fn observe_scheduling(observations: &[AtomicU32; observation::COUNT]) {
+    // SAFETY: pid 0 names the calling thread; the call takes no pointers.
+    let raw = unsafe { libc::sched_getscheduler(0) };
+    let mut param = libc::sched_param { sched_priority: 0 };
+    // SAFETY: pid 0 names the calling thread; `param` is a live, writable
+    // sched_param for the duration of the call. On failure it stays 0.
+    unsafe { libc::sched_getparam(0, &mut param) };
+    let policy = raw & !libc::SCHED_RESET_ON_FORK;
+    let realtime = policy == libc::SCHED_FIFO || policy == libc::SCHED_RR;
+    observations[observation::SCHEDULING_DETAIL_A].store(raw as u32, Ordering::Relaxed);
+    observations[observation::SCHEDULING_DETAIL_B]
+        .store(param.sched_priority as u32, Ordering::Relaxed);
+    observations[observation::SCHEDULING].store(if realtime { 2 } else { 1 }, Ordering::Release);
+}
+/// Records whether the calling thread runs under THREAD_TIME_CONSTRAINT_POLICY.
+/// One MIG call plus a cached timebase read, into stack locals; no allocation.
+#[cfg(target_os = "macos")]
+fn observe_scheduling(observations: &[AtomicU32; observation::COUNT]) {
+    // SAFETY: pthread_self has no preconditions and returns the calling thread.
+    let thread = unsafe { libc::pthread_self() };
+    // SAFETY: `thread` is the live calling thread. For the calling thread
+    // libpthread returns the port cached in its MACH_THREAD_SELF TSD slot
+    // without taking a lock or adding a right, so nothing must be released.
+    let port = unsafe { libc::pthread_mach_thread_np(thread) };
+    let mut policy = libc::thread_time_constraint_policy {
+        period: 0,
+        computation: 0,
+        constraint: 0,
+        preemptible: 0,
+    };
+    let mut count = libc::THREAD_TIME_CONSTRAINT_POLICY_COUNT;
+    let mut get_default: libc::boolean_t = 0;
+    // SAFETY: `port` names the calling thread. `policy` is a live, writable
+    // thread_time_constraint_policy, exactly `count` integer_t words long;
+    // `count` and `get_default` are live and writable for the call.
+    let result = unsafe {
+        libc::thread_policy_get(
+            port,
+            libc::THREAD_TIME_CONSTRAINT_POLICY as libc::thread_policy_flavor_t,
+            (&raw mut policy).cast(),
+            &mut count,
+            &mut get_default,
+        )
+    };
+    if result != libc::KERN_SUCCESS {
+        observations[observation::SCHEDULING_DETAIL_A].store(result as u32, Ordering::Relaxed);
+        observations[observation::SCHEDULING].store(0, Ordering::Release);
+        return;
+    }
+    if get_default != 0 {
+        observations[observation::SCHEDULING].store(1, Ordering::Release);
+        return;
+    }
+    let (numer, denom) = timebase();
+    let nanoseconds = |ticks: u32| {
+        if denom == 0 {
+            return 0;
+        }
+        let ns = u128::from(ticks) * u128::from(numer) / u128::from(denom);
+        u32::try_from(ns).unwrap_or(u32::MAX)
+    };
+    observations[observation::SCHEDULING_DETAIL_A]
+        .store(nanoseconds(policy.period), Ordering::Relaxed);
+    observations[observation::SCHEDULING_DETAIL_B]
+        .store(nanoseconds(policy.computation), Ordering::Relaxed);
+    observations[observation::SCHEDULING_DETAIL_C]
+        .store(nanoseconds(policy.constraint), Ordering::Relaxed);
+    observations[observation::SCHEDULING].store(2, Ordering::Release);
+}
+/// Mach absolute-time to nanosecond ratio; (0, 0) if the query fails.
+#[cfg(target_os = "macos")]
+#[allow(deprecated)] // libc points to mach2 for these; the ABI is unchanged.
+fn timebase() -> (u32, u32) {
+    let mut info = libc::mach_timebase_info { numer: 0, denom: 0 };
+    // SAFETY: `info` is a live, writable mach_timebase_info for the call.
+    if unsafe { libc::mach_timebase_info(&mut info) } == libc::KERN_SUCCESS {
+        (info.numer, info.denom)
+    } else {
+        (0, 0)
+    }
+}
+/// Windows (MMCSS) and other OSes leave SCHEDULING at 0, "unobserved".
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn observe_scheduling(_observations: &[AtomicU32; observation::COUNT]) {}
 unsafe extern "C" fn process(
     effect: *mut AEffect,
     inputs: *const *const f32,
@@ -629,6 +734,7 @@ unsafe extern "C" fn process(
         unsafe { host(effect, 23, 0, 0, std::ptr::null_mut()) } as u32,
         Ordering::Relaxed,
     );
+    observe_scheduling(observations);
     match mode {
         mode::CRASH_PROCESS => std::process::abort(),
         mode::HANG_PROCESS => loop {
