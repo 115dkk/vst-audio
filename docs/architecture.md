@@ -215,6 +215,16 @@ both pipeline and reported plugin latency from the result. They allocate two
 block buffers per call and are likewise control-thread-only. The existing
 `process` calls remain non-waiting and realtime-safe.
 
+Workers are not pinned to cores. Each worker's audio thread is scheduled by the
+OS independently, so N instances can process on N cores; a worker inherits the
+CPU affinity of the application thread that spawns it. For realtime processing
+(not `offline`) that thread holds `vst_audio_transport_sys::runtime::RealtimeAudio`
+for its lifetime: MMCSS "Pro Audio" on Windows, a time-constraint policy derived
+from the quantum and sample rate on macOS, and low-priority `SCHED_FIFO` with
+reset-on-fork on Linux. A refusal is not a startup error: the worker reports it
+once on stderr and processes at normal priority. See `support.md` for the Linux
+permission requirement and the planned rtkit and workgroup support.
+
 Native pointer/lifetime operations are audited in sys crates. For loading a
 plugin, crash isolation does not make unknown native code memory-safe inside the
 worker. Safe application APIs must not expose in-process loaders.

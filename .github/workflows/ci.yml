@@ -62,6 +62,14 @@ jobs:
       - name: Native worker and editor (Linux X11)
         if: runner.os == 'Linux'
         run: xvfb-run -a python3 tools/native_tests.py
+      - name: Realtime audio scheduling with RLIMIT_RTPRIO (Linux)
+        if: runner.os == 'Linux'
+        # The suite above runs with the runner's own limits (the refusal path when
+        # it has no realtime allowance). Raising this shell's limit executes the
+        # SCHED_FIFO path; VST_AUDIO_REQUIRE_REALTIME fails the test if it did not take.
+        run: |
+          sudo prlimit --pid $$ --rtprio=95:95
+          VST_AUDIO_REQUIRE_REALTIME=1 python3 tools/scheduling_tests.py
       - name: Native editor (Linux Wayland)
         if: runner.os == 'Linux'
         run: python3 tools/wayland_tests.py
