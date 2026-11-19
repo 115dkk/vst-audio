@@ -872,8 +872,16 @@ pub const FIFO_PRIORITY: i32 = 10;
 /// restores the previous policy and priority; without `CAP_SYS_NICE` the kernel does not let a thread
 /// clear `SCHED_RESET_ON_FORK`, so that flag can remain on the restored policy.
 /// macOS applies `THREAD_TIME_CONSTRAINT_POLICY` derived from the
-/// [`AudioPeriod`]. Other Unix targets are unsupported. `Debug` shows the applied
-/// values.
+/// [`AudioPeriod`]. Drop best-effort restores all four values of a previously
+/// active time-constraint policy (nested guards must be dropped in reverse order).
+/// Otherwise it selects the standard policy. macOS does not restore requested QoS:
+/// applying a time-constraint policy removes the kernel QoS request, and ordinary
+/// pthreads then reject a new QoS request with `EPERM`, even after returning to
+/// standard scheduling. The pthread QoS getter can still report its cached request;
+/// that is not evidence of kernel QoS restoration.
+/// Legacy fixed-priority/precedence settings and extended realtime priority are
+/// not captured. Drop errors are ignored. Other Unix targets are unsupported.
+/// `Debug` shows the applied values and saved restore state.
 pub struct RealtimeAudio {
     /// Raw `sched_getscheduler` result before promotion, flags included.
     #[cfg(target_os = "linux")]
@@ -896,6 +904,9 @@ pub struct RealtimeAudio {
     computation: u32,
     #[cfg(target_os = "macos")]
     constraint: u32,
+    /// Active time-constraint policy before promotion, if any.
+    #[cfg(target_os = "macos")]
+    previous_time_constraint: Option<libc::thread_time_constraint_policy>,
     _thread: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
@@ -921,7 +932,26 @@ impl std::fmt::Debug for RealtimeAudio {
             .field("port", &self.port)
             .field("period_ticks", &self.period)
             .field("computation_ticks", &self.computation)
-            .field("constraint_ticks", &self.constraint);
+            .field("constraint_ticks", &self.constraint)
+            .field(
+                "restore_policy",
+                &if self.previous_time_constraint.is_some() {
+                    "THREAD_TIME_CONSTRAINT_POLICY"
+                } else {
+                    "THREAD_STANDARD_POLICY (QoS not restored)"
+                },
+            )
+            .field(
+                "previous_time_constraint",
+                &self.previous_time_constraint.as_ref().map(|policy| {
+                    (
+                        policy.period,
+                        policy.computation,
+                        policy.constraint,
+                        policy.preemptible,
+                    )
+                }),
+            );
         debug.finish_non_exhaustive()
     }
 }
@@ -1169,6 +1199,42 @@ impl RealtimeAudio {
         // libc does not even declare.
         // SAFETY: thread is the live calling thread, so libpthread knows its port.
         let port = unsafe { libc::pthread_mach_thread_np(thread) };
+        let mut previous = libc::thread_time_constraint_policy {
+            period: 0,
+            computation: 0,
+            constraint: 0,
+            preemptible: 0,
+        };
+        let mut count = libc::THREAD_TIME_CONSTRAINT_POLICY_COUNT;
+        let mut get_default: libc::boolean_t = 0;
+        // XNU osfmk/kern/thread_policy.c (~1337-1385, main fetched 2026-11-19)
+        // returns the active/saved realtime policy, or sets get_default to TRUE.
+        // SAFETY: port names the live calling thread; previous, count and
+        // get_default are distinct writable objects. count gives previous's size
+        // in integer_t words, and all storage remains valid for this call.
+        let result = unsafe {
+            libc::thread_policy_get(
+                port,
+                libc::THREAD_TIME_CONSTRAINT_POLICY as libc::thread_policy_flavor_t,
+                (&raw mut previous).cast::<libc::integer_t>(),
+                &mut count,
+                &mut get_default,
+            )
+        };
+        if result != libc::KERN_SUCCESS {
+            // Do not change scheduling if the restoration snapshot is unavailable.
+            return Err(io::Error::other(format!(
+                "THREAD_TIME_CONSTRAINT_POLICY query failed (kern_return {result})"
+            )));
+        }
+        let previous_time_constraint = (get_default == 0).then_some(previous);
+        // XNU osfmk/kern/thread_policy.c (~311-329) removes requested QoS before
+        // changing Mach policy; STANDARD/EXTENDED (~357-386) only restores mode.
+        // bsd/pthread/pthread_workqueue.c (~2417-2424) rejects a new QoS request
+        // with EPERM on ordinary pthreads once thread_has_qos_policy is false.
+        // libpthread src/qos.c (~172-176) reads cached TSD, not kernel QoS, so its
+        // getter can still report the old class while realtime or after Drop.
+        // No QoS restore is attempted: that cached value cannot undo the opt-out.
         let mut policy = libc::thread_time_constraint_policy {
             period: ticks,
             computation,
@@ -1194,6 +1260,7 @@ impl RealtimeAudio {
         }
         Ok(Self {
             port,
+            previous_time_constraint,
             period: ticks,
             computation,
             constraint,
@@ -1205,6 +1272,25 @@ impl RealtimeAudio {
 #[cfg(target_os = "macos")]
 impl Drop for RealtimeAudio {
     fn drop(&mut self) {
+        if let Some(previous) = self.previous_time_constraint.as_mut() {
+            // Best effort: restore the prior realtime policy, including all four
+            // fields. Drop cannot report a refused restoration.
+            // SAFETY: this !Send guard still belongs to the live calling thread.
+            // previous holds the initialized snapshot with exactly COUNT words
+            // and stays valid throughout this synchronous call.
+            let _ = unsafe {
+                libc::thread_policy_set(
+                    self.port,
+                    libc::THREAD_TIME_CONSTRAINT_POLICY as libc::thread_policy_flavor_t,
+                    (previous as *mut libc::thread_time_constraint_policy)
+                        .cast::<libc::integer_t>(),
+                    libc::THREAD_TIME_CONSTRAINT_POLICY_COUNT,
+                )
+            };
+            return;
+        }
+        // No prior realtime policy: attempt standard scheduling. Errors are
+        // ignored in Drop; this does not restore QoS (see promote's source notes).
         let mut standard = libc::thread_standard_policy { no_data: 0 };
         // SAFETY: the guard is not Send, so port still names the live calling
         // thread whose right libpthread holds. THREAD_STANDARD_POLICY_COUNT is 0,
@@ -1492,6 +1578,106 @@ mod realtime_tests {
                 "period {ns} ns, expected about {expected} ns"
             );
             assert_eq!(policy.constraint, policy.period);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn assert_same_time_constraint(
+        actual: &libc::thread_time_constraint_policy,
+        expected: &libc::thread_time_constraint_policy,
+    ) {
+        assert_eq!(actual.period, expected.period, "period");
+        assert_eq!(actual.computation, expected.computation, "computation");
+        assert_eq!(actual.constraint, expected.constraint, "constraint");
+        assert_eq!(actual.preemptible, expected.preemptible, "preemptible");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn drop_restores_existing_time_constraint() {
+        std::thread::spawn(|| {
+            let (period, computation, constraint) = time_constraint(
+                AudioPeriod {
+                    frames: 256,
+                    sample_rate: 48_000,
+                },
+                Timebase::current().unwrap(),
+            );
+            let mut original = libc::thread_time_constraint_policy {
+                period,
+                computation,
+                constraint,
+                // Unlike promote's policy, also exercise restoring false.
+                preemptible: 0,
+            };
+            // SAFETY: no preconditions; retrieves this test thread's handle.
+            let thread = unsafe { libc::pthread_self() };
+            // SAFETY: thread is the live calling thread.
+            let port = unsafe { libc::pthread_mach_thread_np(thread) };
+            // SAFETY: port names this live thread; original is initialized and
+            // writable, contains COUNT integer_t words and outlives the call.
+            let result = unsafe {
+                libc::thread_policy_set(
+                    port,
+                    libc::THREAD_TIME_CONSTRAINT_POLICY as libc::thread_policy_flavor_t,
+                    (&raw mut original).cast::<libc::integer_t>(),
+                    libc::THREAD_TIME_CONSTRAINT_POLICY_COUNT,
+                )
+            };
+            assert_eq!(result, libc::KERN_SUCCESS);
+            let (before, get_default) = time_constraint_now();
+            assert_eq!(get_default, 0);
+            assert_same_time_constraint(&before, &original);
+            let guard = RealtimeAudio::promote(AudioPeriod {
+                frames: 128,
+                sample_rate: 48_000,
+            })
+            .unwrap();
+            let (promoted, get_default) = time_constraint_now();
+            assert_eq!(get_default, 0);
+            assert_ne!(promoted.period, before.period);
+            assert_eq!(promoted.preemptible, 1);
+            drop(guard);
+            let (restored, get_default) = time_constraint_now();
+            assert_eq!(get_default, 0, "drop removed the original realtime policy");
+            assert_same_time_constraint(&restored, &before);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn nested_guards_restore_outer_time_constraint() {
+        std::thread::spawn(|| {
+            assert_ne!(time_constraint_now().1, 0, "fresh thread was realtime");
+            let outer = RealtimeAudio::promote(AudioPeriod {
+                frames: 256,
+                sample_rate: 48_000,
+            })
+            .unwrap();
+            let (outer_policy, get_default) = time_constraint_now();
+            assert_eq!(get_default, 0);
+            let inner = RealtimeAudio::promote(AudioPeriod {
+                frames: 128,
+                sample_rate: 48_000,
+            })
+            .unwrap();
+            let (inner_policy, get_default) = time_constraint_now();
+            assert_eq!(get_default, 0);
+            assert_ne!(inner_policy.period, outer_policy.period);
+            drop(inner);
+            let (restored, get_default) = time_constraint_now();
+            assert_eq!(get_default, 0, "inner drop removed outer realtime policy");
+            assert_same_time_constraint(&restored, &outer_policy);
+            drop(outer);
+            assert_ne!(
+                time_constraint_now().1,
+                0,
+                "outer drop did not restore standard"
+            );
         })
         .join()
         .unwrap();
