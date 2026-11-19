@@ -1254,6 +1254,13 @@ mod realtime_tests {
         }
     }
 
+    /// CI sets this after raising RLIMIT_RTPRIO, so a refused promotion fails
+    /// instead of taking the unprivileged branch unnoticed.
+    #[cfg(target_os = "linux")]
+    fn realtime_required() -> bool {
+        std::env::var_os("VST_AUDIO_REQUIRE_REALTIME").is_some_and(|value| value == "1")
+    }
+
     #[cfg(target_os = "linux")]
     fn current_policy() -> (libc::c_int, libc::c_int) {
         // SAFETY: scalar-only query; pid 0 names the calling thread on Linux.
@@ -1315,6 +1322,10 @@ mod realtime_tests {
                     );
                 }
                 Err(error) => {
+                    assert!(
+                        !realtime_required(),
+                        "VST_AUDIO_REQUIRE_REALTIME=1 but promotion was refused: {error}"
+                    );
                     eprintln!("refused: {error}");
                     assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
                     assert!(error.to_string().contains("RLIMIT_RTPRIO"), "{error}");
@@ -1358,8 +1369,12 @@ mod realtime_tests {
             }) {
                 Ok(guard) => guard,
                 Err(error) => {
-                    // Unprivileged CI: promote_applies_fifo_or_reports_permission
+                    // Unprivileged runs: promote_applies_fifo_or_reports_permission
                     // covers the refusal.
+                    assert!(
+                        !realtime_required(),
+                        "VST_AUDIO_REQUIRE_REALTIME=1 but promotion was refused: {error}"
+                    );
                     eprintln!("skipped, promotion refused: {error}");
                     return;
                 }
@@ -1384,10 +1399,12 @@ mod realtime_tests {
             // SAFETY: inherited is initialized and outlives the call; pid 0 names
             // this test thread only.
             if unsafe { libc::sched_setscheduler(0, libc::SCHED_RR, &inherited) } != 0 {
-                eprintln!(
-                    "skipped, cannot set up SCHED_RR: {}",
-                    io::Error::last_os_error()
+                let error = io::Error::last_os_error();
+                assert!(
+                    !realtime_required(),
+                    "VST_AUDIO_REQUIRE_REALTIME=1 but SCHED_RR was refused: {error}"
                 );
+                eprintln!("skipped, cannot set up SCHED_RR: {error}");
                 return;
             }
             let guard = RealtimeAudio::promote(AudioPeriod {
