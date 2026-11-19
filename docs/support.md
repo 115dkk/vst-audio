@@ -67,9 +67,15 @@ audio thread at normal priority, as all Linux workers did before. Requesting
 realtime scheduling from rtkit over D-Bus is planned, not implemented. The
 priority is fixed at 10 so that device, audio-server and application callback
 threads, which usually run higher, keep precedence; it is not configurable yet.
+An audio thread that already runs under `SCHED_FIFO` or `SCHED_RR` at that
+priority or higher, as when the application itself was started under `chrt`,
+keeps its scheduling. Without `CAP_SYS_NICE` the kernel does not let a thread
+clear `SCHED_RESET_ON_FORK`, so a thread that returns to normal scheduling keeps
+that flag.
 
 macOS workers set a time-constraint policy but do not join the application's
 audio device workgroup (`os_workgroup`); joining across processes is planned.
+The time units of an x86_64 worker under Rosetta are not verified.
 On every OS the outcome is visible only on the worker's stderr; reporting it
 through the application API is planned.
 
