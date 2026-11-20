@@ -214,6 +214,7 @@ dependencies = [
  "libc",
  "tempfile",
  "vst-audio-ring",
+ "win-custody",
  "windows",
 ]
 
@@ -224,6 +225,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e31e3fe7a6f028ded8c5a9984cf283319e6dc63572c9b71da1d4ee9d71d3b6bf"
 dependencies = [
  "com-scrape-types",
+]
+
+[[package]]
+name = "win-custody"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a3ac317571806f48e6b0131e06cd9047c942a5db502c633efedf0e13a832b121"
+dependencies = [
+ "windows-sys",
 ]
 
 [[package]]
