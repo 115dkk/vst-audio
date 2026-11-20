@@ -235,18 +235,20 @@ unsandboxed fallback.
   separate profile keeps such an exemption away from network-denied workers.
   Read/execute ACEs are added to the worker/plugin and containing directories
   for sibling DLLs and resources; writable directories and private temporary
-  storage receive modify ACEs and inheritable Low integrity labels. Existing ALL
-  APPLICATION PACKAGES read/execute grants are reused. Added ACEs and labels are
-  **not removed**. Thus each fixed container SID shares grants across instances
-  and runs; previously allowed directories remain accessible. AppContainer's own
-  storage and paths already granting package access are OS exceptions, not an
-  exact per-instance filesystem allowlist. The worker verifies its own token:
-  AppContainer, and network capabilities exactly when the policy allows network.
-  A restricted Low-integrity token was tried for the network-allowed case and
-  abandoned: on Windows Server 2025 CI it could not read files whose DACL granted
-  the user. The one-active-process job blocks children when `processes` is false.
-  Inherited IPC handles retain their granted access. GUI, inherited-handle
-  behavior and ACL propagation are exercised by Windows CI.
+  storage receive modify ACEs. These ACEs are added only where the directory
+  does not already allow that access to the worker's profile or to ALL APPLICATION
+  PACKAGES. Added ACEs are **not removed**. Thus each fixed container SID shares
+  grants across instances and runs; previously allowed directories remain
+  accessible. AppContainer's own storage and paths already granting package access
+  are OS exceptions, not an exact per-instance filesystem allowlist. The worker
+  verifies its own token: AppContainer, and network capabilities exactly when the
+  policy allows network. A restricted Low-integrity token was tried for the
+  network-allowed case and abandoned: on Windows Server 2025 CI it could not read
+  files whose DACL granted the user. The worker process is created inside its
+  kill-on-close job through win-custody rather than assigned to the job afterwards.
+  The one-active-process job blocks children when `processes` is false. Inherited
+  IPC handles retain their granted access. GUI, inherited-handle behavior and ACL
+  propagation are exercised by Windows CI.
 - **macOS:** uses the deprecated but available `sandbox_init` SBPL API. Reads
   remain unrestricted, IP outbound/bind and exec/fork are denied as requested,
   and writes outside canonical allowed paths and `/dev/null` are denied. The
